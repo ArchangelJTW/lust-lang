@@ -6,26 +6,29 @@ pub use jit_engine::{
     ic_invalidate, ic_invalidate_all, ic_probe, ic_register_site, ic_reset, ic_site_stats,
     ic_update, is_loop_backedge, lust_mir_abs_int, lust_mir_alloc_array,
     lust_mir_alloc_array_typed, lust_mir_alloc_cflat_struct, lust_mir_alloc_enum,
-    lust_mir_alloc_map, lust_mir_alloc_struct, lust_mir_alloc_struct_named,
+    lust_mir_alloc_enum2, lust_mir_alloc_map, lust_mir_alloc_struct, lust_mir_alloc_struct_named,
     lust_mir_alloc_tuple, lust_mir_alloc_tuple_typed, lust_mir_array_get, lust_mir_array_len,
     lust_mir_array_len_checked, lust_mir_array_push, lust_mir_array_set, MirArrayHeader,
     mir_array_elem_tag, MIR_ARRAY_ELEM_TAG_BOOL, MIR_ARRAY_ELEM_TAG_FLOAT,
     MIR_ARRAY_ELEM_TAG_INT, MIR_ARRAY_ELEM_TAG_STRING,
     lust_mir_charge_gas, lust_mir_clamp_int, lust_mir_div_int, lust_mir_enum_payload,
-    lust_mir_enum_tag, lust_mir_floordiv_float, lust_mir_floordiv_int, lust_mir_gas_fast_ptr,
-    lust_mir_gas_slow, lust_mir_get_gas,
+    lust_mir_enum_payload_at, lust_mir_enum_tag, lust_mir_floordiv_float, lust_mir_floordiv_int,
+    lust_mir_gas_fast_ptr, lust_mir_gas_slow, lust_mir_get_gas,
     lust_mir_get_memory_used, lust_mir_get_status, lust_mir_ic_dispatch, lust_mir_ic_miss,
-    lust_mir_ic_probe, lust_mir_init_deopt, lust_mir_init_deopt_at_terminator, lust_mir_map_get, lust_mir_map_len,
-    lust_mir_map_set, lust_mir_max_int, lust_mir_min_int, lust_mir_pow_float,
-    lust_mir_pow_int, lust_mir_print_bool_part, lust_mir_print_float_part, lust_mir_print_int,
-    lust_mir_print_int_part, lust_mir_print_nl, lust_mir_print_sep, lust_mir_print_string_part,
-    lust_mir_record_deopt,
+    lust_mir_ic_probe, lust_mir_init_deopt, lust_mir_init_deopt_at_terminator, lust_mir_map_get,
+    lust_mir_map_get_int_unwrap, lust_mir_map_get_typed, lust_mir_map_has_typed, lust_mir_map_len,
+    lust_mir_map_set, lust_mir_map_set_typed, lust_mir_max_int, lust_mir_min_int,
+    lust_mir_pow_float, lust_mir_pow_int, lust_mir_print_bool_part, lust_mir_print_float_part,
+    lust_mir_print_int, lust_mir_print_int_part, lust_mir_print_nl, lust_mir_print_sep,
+    lust_mir_print_string_part, lust_mir_record_deopt,
     lust_mir_record_deopt_local,
     lust_mir_record_native_entry, lust_mir_rem_float, lust_mir_rem_int, lust_mir_safepoint,
     lust_mir_safepoint_slow, lust_mir_safepoint_state_ptr,
     lust_mir_set_gas, lust_mir_set_max_memory, lust_mir_set_memory_limit, lust_mir_set_status,
-    lust_mir_string_append_inplace, lust_mir_string_concat, lust_mir_string_eq,
-    lust_mir_string_len, lust_mir_tostring_bool, lust_mir_tostring_float, lust_mir_tostring_int,
+    lust_mir_string_append_inplace, lust_mir_string_byte, lust_mir_string_byte_at,
+    lust_mir_string_concat, lust_mir_string_eq, lust_mir_string_find, lust_mir_string_gsub,
+    lust_mir_string_len, lust_mir_string_split, lust_mir_string_sub, lust_mir_tostring_bool,
+    lust_mir_tostring_float, lust_mir_tostring_int,
     lust_mir_struct_decode_binary, lust_mir_struct_decode_contiguous, publish_deopt_payload,
     publish_deopt_payload_with_func, publish_deopt_payload_name_only,
     publish_deopt_payload_at_terminator, publish_deopt_payload_with_site_kind,
@@ -1525,95 +1528,156 @@ pub mod jit_engine {
         });
     }
 
-    pub fn find_loop_headers(blocks: &[BasicBlock]) -> hashbrown::HashSet<usize> {
-        let mut loop_headers = hashbrown::HashSet::new();
-        for (src_idx, block) in blocks.iter().enumerate() {
-            if let Some(term) = &block.terminator {
-                match term {
-                    Terminator::Goto(target, _) => {
-                        if target.0 <= src_idx {
-                            loop_headers.insert(target.0);
-                        }
-                    }
-                    Terminator::Cond { then_block, else_block, .. } => {
-                        if then_block.0 <= src_idx {
-                            loop_headers.insert(then_block.0);
-                        }
-                        if else_block.0 <= src_idx {
-                            loop_headers.insert(else_block.0);
-                        }
-                    }
-                    Terminator::Switch { cases, default, .. } => {
-                        for (_, target) in cases {
-                            if target.0 <= src_idx {
-                                loop_headers.insert(target.0);
-                            }
-                        }
-                        if default.0 <= src_idx {
-                            loop_headers.insert(default.0);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+    /// Materializes a handle-backed `Value::Array` (returned by `lust_mir_string_gsub`,
+    /// `lust_mir_string_split`, `lust_mir_string_byte`, `lust_mir_string_find`) into a
+    /// Cranelift `*mut MirArrayHeader` pointer so `array.len` and `arr[idx]` execute natively.
+    fn materialize_handle_array_to_mir_ptr(handle: i64, elem_tag: i64) -> i64 {
+        if handle == 0 {
+            return 0;
         }
-        loop_headers
+        let arr_val = with_current_mir_context(|ctx| ctx.get_handle(handle));
+        let Some(crate::bytecode::Value::Array(arr)) = arr_val else {
+            return 0;
+        };
+        let elems: Vec<i64> = with_current_mir_context(|ctx| {
+            arr.borrow()
+                .iter()
+                .map(|v| match elem_tag {
+                    MIR_ARRAY_ELEM_TAG_INT => match v {
+                        crate::bytecode::Value::Int(n) => *n,
+                        crate::bytecode::Value::Bool(b) => i64::from(*b),
+                        crate::bytecode::Value::Float(f) => *f as i64,
+                        _ => 0,
+                    },
+                    MIR_ARRAY_ELEM_TAG_BOOL => match v {
+                        crate::bytecode::Value::Bool(b) => i64::from(*b),
+                        crate::bytecode::Value::Int(n) => i64::from(*n != 0),
+                        _ => 0,
+                    },
+                    MIR_ARRAY_ELEM_TAG_FLOAT => match v {
+                        crate::bytecode::Value::Float(f) => f.to_bits() as i64,
+                        crate::bytecode::Value::Int(n) => (*n as f64).to_bits() as i64,
+                        _ => 0,
+                    },
+                    MIR_ARRAY_ELEM_TAG_STRING => match v {
+                        crate::bytecode::Value::String(_) => ctx.register_handle(v.clone()),
+                        crate::bytecode::Value::Int(n) => {
+                            ctx.register_handle(crate::bytecode::Value::string(alloc::format!("{n}")))
+                        }
+                        crate::bytecode::Value::Bool(b) => ctx.register_handle(
+                            crate::bytecode::Value::string(if *b { "true" } else { "false" }),
+                        ),
+                        crate::bytecode::Value::Float(f) => {
+                            ctx.register_handle(crate::bytecode::Value::string(alloc::format!("{f}")))
+                        }
+                        _ => ctx.register_handle(v.clone()),
+                    },
+                    _ => ctx.register_handle(v.clone()),
+                })
+                .collect()
+        });
+        let ptr = if elem_tag > 0 {
+            lust_mir_alloc_array_typed(elems.len() as i64, elem_tag)
+        } else {
+            lust_mir_alloc_array(elems.len() as i64)
+        };
+        if ptr.is_null() {
+            return 0;
+        }
+        for (idx, val) in elems.into_iter().enumerate() {
+            lust_mir_array_set(ptr, idx as i64, val);
+        }
+        ptr as i64
+    }
+
+    extern "C" fn lust_mir_clif_string_gsub(
+        vm_ctx: i64,
+        handle: i64,
+        pattern: i64,
+        replacement: i64,
+        elem_tag: i64,
+    ) -> i64 {
+        let arr_handle = lust_mir_string_gsub(vm_ctx, handle, pattern, replacement);
+        if elem_tag == -1 {
+            if arr_handle == 0 {
+                return 0;
+            }
+            return with_current_mir_context(|ctx| {
+                let Some(crate::bytecode::Value::Array(arr)) = ctx.get_handle(arr_handle) else {
+                    return 0;
+                };
+                let first = arr.borrow().first().cloned().unwrap_or_else(|| crate::bytecode::Value::string(""));
+                ctx.register_handle(first)
+            });
+        }
+        materialize_handle_array_to_mir_ptr(arr_handle, elem_tag)
+    }
+
+    extern "C" fn lust_mir_clif_string_split(
+        vm_ctx: i64,
+        handle: i64,
+        separator: i64,
+        elem_tag: i64,
+    ) -> i64 {
+        let arr_handle = lust_mir_string_split(vm_ctx, handle, separator);
+        materialize_handle_array_to_mir_ptr(arr_handle, elem_tag)
+    }
+
+    extern "C" fn lust_mir_clif_string_byte(
+        vm_ctx: i64,
+        handle: i64,
+        start: i64,
+        end: i64,
+        elem_tag: i64,
+    ) -> i64 {
+        let arr_handle = lust_mir_string_byte(vm_ctx, handle, start, end);
+        materialize_handle_array_to_mir_ptr(arr_handle, elem_tag)
+    }
+
+    extern "C" fn lust_mir_clif_string_find(
+        vm_ctx: i64,
+        handle: i64,
+        pattern: i64,
+        start: i64,
+        plain: i64,
+        elem_tag: i64,
+    ) -> i64 {
+        let arr_handle = lust_mir_string_find(vm_ctx, handle, pattern, start, plain);
+        if elem_tag == -2 {
+            if arr_handle == 0 {
+                return 0;
+            }
+            return with_current_mir_context(|ctx| {
+                let Some(crate::bytecode::Value::Array(arr)) = ctx.get_handle(arr_handle) else {
+                    return 0;
+                };
+                match arr.borrow().first() {
+                    Some(crate::bytecode::Value::Int(n)) => *n,
+                    _ => 0,
+                }
+            });
+        }
+        materialize_handle_array_to_mir_ptr(arr_handle, elem_tag)
+    }
+
+    pub fn find_loop_headers(blocks: &[BasicBlock]) -> hashbrown::HashSet<usize> {
+        crate::mir::opt::Safepoints::find_loop_headers(blocks)
+            .into_iter()
+            .map(|b| b.0)
+            .collect()
     }
 
     pub fn find_loop_backedges(blocks: &[BasicBlock]) -> Vec<(usize, usize)> {
-        let mut backedges = Vec::new();
-        for (src_idx, block) in blocks.iter().enumerate() {
-            if let Some(term) = &block.terminator {
-                match term {
-                    Terminator::Goto(target, _) => {
-                        if target.0 <= src_idx {
-                            backedges.push((src_idx, target.0));
-                        }
-                    }
-                    Terminator::Cond { then_block, else_block, .. } => {
-                        if then_block.0 <= src_idx {
-                            backedges.push((src_idx, then_block.0));
-                        }
-                        if else_block.0 <= src_idx {
-                            backedges.push((src_idx, else_block.0));
-                        }
-                    }
-                    Terminator::Switch { cases, default, .. } => {
-                        for (_, target) in cases {
-                            if target.0 <= src_idx {
-                                backedges.push((src_idx, target.0));
-                            }
-                        }
-                        if default.0 <= src_idx {
-                            backedges.push((src_idx, default.0));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        backedges
+        crate::mir::opt::Safepoints::find_loop_backedges(blocks)
+            .into_iter()
+            .map(|(from, to)| (from.0, to.0))
+            .collect()
     }
 
     pub fn is_loop_backedge(blocks: &[BasicBlock], from: usize, to: usize) -> bool {
-        if to > from {
-            return false;
-        }
-        if let Some(block) = blocks.get(from) {
-            if let Some(term) = &block.terminator {
-                return match term {
-                    Terminator::Goto(target, _) => target.0 == to,
-                    Terminator::Cond { then_block, else_block, .. } => {
-                        then_block.0 == to || else_block.0 == to
-                    }
-                    Terminator::Switch { cases, default, .. } => {
-                        cases.iter().any(|(_, target)| target.0 == to) || default.0 == to
-                    }
-                    _ => false,
-                };
-            }
-        }
-        false
+        crate::mir::opt::Safepoints::find_loop_backedges(blocks)
+            .into_iter()
+            .any(|(f, t)| f.0 == from && t.0 == to)
     }
 
     #[derive(Debug, Clone)]
@@ -2327,7 +2391,9 @@ pub mod jit_engine {
         else {
             return false;
         };
-        if mir_array_elem_tag(&elem_ty).is_none() {
+        if mir_array_elem_tag(&elem_ty).is_none()
+            && !matches!(&*elem_ty, MirType::Struct(name) if !name.is_empty())
+        {
             return false;
         }
         let Ok(val_ty) = try_operand_type(&args[1], &mir_fn.locals, struct_layouts) else {
@@ -3714,6 +3780,16 @@ pub mod jit_engine {
             builder.symbol("lust_mir_string_append_inplace", lust_mir_string_append_inplace as *const u8);
             builder.symbol("lust_mir_string_eq", lust_mir_string_eq as *const u8);
             builder.symbol("lust_mir_string_len", lust_mir_string_len as *const u8);
+            builder.symbol("lust_mir_string_sub", lust_mir_string_sub as *const u8);
+            builder.symbol("lust_mir_string_byte", lust_mir_string_byte as *const u8);
+            builder.symbol("lust_mir_string_byte_at", lust_mir_string_byte_at as *const u8);
+            builder.symbol("lust_mir_string_gsub", lust_mir_string_gsub as *const u8);
+            builder.symbol("lust_mir_string_find", lust_mir_string_find as *const u8);
+            builder.symbol("lust_mir_string_split", lust_mir_string_split as *const u8);
+            builder.symbol("lust_mir_clif_string_gsub", lust_mir_clif_string_gsub as *const u8);
+            builder.symbol("lust_mir_clif_string_split", lust_mir_clif_string_split as *const u8);
+            builder.symbol("lust_mir_clif_string_byte", lust_mir_clif_string_byte as *const u8);
+            builder.symbol("lust_mir_clif_string_find", lust_mir_clif_string_find as *const u8);
             builder.symbol("lust_mir_tostring_int", lust_mir_tostring_int as *const u8);
             builder.symbol("lust_mir_tostring_float", lust_mir_tostring_float as *const u8);
             builder.symbol("lust_mir_tostring_bool", lust_mir_tostring_bool as *const u8);
@@ -3723,11 +3799,17 @@ pub mod jit_engine {
             builder.symbol("lust_mir_map_get", lust_mir_map_get as *const u8);
             builder.symbol("lust_mir_map_set", lust_mir_map_set as *const u8);
             builder.symbol("lust_mir_map_len", lust_mir_map_len as *const u8);
+            builder.symbol("lust_mir_map_set_typed", lust_mir_map_set_typed as *const u8);
+            builder.symbol("lust_mir_map_get_typed", lust_mir_map_get_typed as *const u8);
+            builder.symbol("lust_mir_map_has_typed", lust_mir_map_has_typed as *const u8);
+            builder.symbol("lust_mir_map_get_int_unwrap", lust_mir_map_get_int_unwrap as *const u8);
 
             // Enum helpers
             builder.symbol("lust_mir_alloc_enum", lust_mir_alloc_enum as *const u8);
+            builder.symbol("lust_mir_alloc_enum2", lust_mir_alloc_enum2 as *const u8);
             builder.symbol("lust_mir_enum_tag", lust_mir_enum_tag as *const u8);
             builder.symbol("lust_mir_enum_payload", lust_mir_enum_payload as *const u8);
+            builder.symbol("lust_mir_enum_payload_at", lust_mir_enum_payload_at as *const u8);
 
             // Safepoint and deopt helpers
             builder.symbol("lust_mir_safepoint", lust_mir_safepoint as *const u8);
@@ -5430,6 +5512,11 @@ pub mod jit_engine {
             alloc_typed_sig.params.push(AbiParam::new(types::I64));
             alloc_typed_sig.returns.push(AbiParam::new(types::I64));
 
+                    let alloc_array_callee = self
+                .module
+                .declare_function("lust_mir_alloc_array", Linkage::Import, &sig1)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
             let alloc_array_typed_callee = self
                 .module
                 .declare_function("lust_mir_alloc_array_typed", Linkage::Import, &alloc_typed_sig)
@@ -5679,9 +5766,90 @@ pub mod jit_engine {
                 .declare_function("lust_mir_alloc_map", Linkage::Import, &sig0_ret)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
+            let mut sig4 = self.module.make_signature();
+            for _ in 0..4 {
+                sig4.params.push(AbiParam::new(types::I64));
+            }
+            sig4.returns.push(AbiParam::new(types::I64));
+
+            let mut sig5 = self.module.make_signature();
+            for _ in 0..5 {
+                sig5.params.push(AbiParam::new(types::I64));
+            }
+            sig5.returns.push(AbiParam::new(types::I64));
+
+            let mut sig6 = self.module.make_signature();
+            for _ in 0..6 {
+                sig6.params.push(AbiParam::new(types::I64));
+            }
+            sig6.returns.push(AbiParam::new(types::I64));
+
+            let string_sub_callee = self
+                .module
+                .declare_function("lust_mir_string_sub", Linkage::Import, &sig4)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let string_byte_callee = self
+                .module
+                .declare_function("lust_mir_string_byte", Linkage::Import, &sig4)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let string_byte_at_callee = self
+                .module
+                .declare_function("lust_mir_string_byte_at", Linkage::Import, &sig3)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let string_gsub_callee = self
+                .module
+                .declare_function("lust_mir_string_gsub", Linkage::Import, &sig4)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let string_find_callee = self
+                .module
+                .declare_function("lust_mir_string_find", Linkage::Import, &sig5)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let string_split_callee = self
+                .module
+                .declare_function("lust_mir_string_split", Linkage::Import, &sig3)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let clif_string_gsub_callee = self
+                .module
+                .declare_function("lust_mir_clif_string_gsub", Linkage::Import, &sig5)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let clif_string_split_callee = self
+                .module
+                .declare_function("lust_mir_clif_string_split", Linkage::Import, &sig4)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let clif_string_byte_callee = self
+                .module
+                .declare_function("lust_mir_clif_string_byte", Linkage::Import, &sig5)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let clif_string_find_callee = self
+                .module
+                .declare_function("lust_mir_clif_string_find", Linkage::Import, &sig6)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let map_set_typed_callee = self
+                .module
+                .declare_function("lust_mir_map_set_typed", Linkage::Import, &sig6)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let map_get_typed_callee = self
+                .module
+                .declare_function("lust_mir_map_get_typed", Linkage::Import, &sig4)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let map_has_typed_callee = self
+                .module
+                .declare_function("lust_mir_map_has_typed", Linkage::Import, &sig4)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let map_get_int_unwrap_callee = self
+                .module
+                .declare_function("lust_mir_map_get_int_unwrap", Linkage::Import, &sig5)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
             let alloc_enum_callee = self
                 .module
                 .declare_function("lust_mir_alloc_enum", Linkage::Import, &binop_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let alloc_enum2_callee = self
+                .module
+                .declare_function("lust_mir_alloc_enum2", Linkage::Import, &sig5)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
             let enum_tag_callee = self
@@ -5692,6 +5860,11 @@ pub mod jit_engine {
             let enum_payload_callee = self
                 .module
                 .declare_function("lust_mir_enum_payload", Linkage::Import, &sig1)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let enum_payload_at_callee = self
+                .module
+                .declare_function("lust_mir_enum_payload_at", Linkage::Import, &sig3)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
             // Declare J-IC dispatch callee
@@ -5748,6 +5921,7 @@ pub mod jit_engine {
 
             {
                 let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_ctx);
+                let alloc_array_fn = self.module.declare_func_in_func(alloc_array_callee, &mut builder.func);
                 let alloc_array_typed_fn = self.module.declare_func_in_func(alloc_array_typed_callee, &mut builder.func);
                 let _alloc_tuple_fn = self.module.declare_func_in_func(alloc_tuple_callee, &mut builder.func);
                 let alloc_tuple_typed_fn = self.module.declare_func_in_func(alloc_tuple_typed_callee, &mut builder.func);
@@ -5773,6 +5947,22 @@ pub mod jit_engine {
                 let string_append_inplace_fn = self.module.declare_func_in_func(string_append_inplace_callee, &mut builder.func);
                 let string_eq_fn = self.module.declare_func_in_func(string_eq_callee, &mut builder.func);
                 let string_len_fn = self.module.declare_func_in_func(string_len_callee, &mut builder.func);
+                let string_sub_fn = self.module.declare_func_in_func(string_sub_callee, &mut builder.func);
+                let string_byte_fn = self.module.declare_func_in_func(string_byte_callee, &mut builder.func);
+                let string_byte_at_fn = self.module.declare_func_in_func(string_byte_at_callee, &mut builder.func);
+                let string_gsub_fn = self.module.declare_func_in_func(string_gsub_callee, &mut builder.func);
+                let string_find_fn = self.module.declare_func_in_func(string_find_callee, &mut builder.func);
+                let string_split_fn = self.module.declare_func_in_func(string_split_callee, &mut builder.func);
+                let clif_string_gsub_fn = self.module.declare_func_in_func(clif_string_gsub_callee, &mut builder.func);
+                let clif_string_split_fn = self.module.declare_func_in_func(clif_string_split_callee, &mut builder.func);
+                let clif_string_byte_fn = self.module.declare_func_in_func(clif_string_byte_callee, &mut builder.func);
+                let clif_string_find_fn = self.module.declare_func_in_func(clif_string_find_callee, &mut builder.func);
+                let map_set_typed_fn = self.module.declare_func_in_func(map_set_typed_callee, &mut builder.func);
+                let map_get_typed_fn = self.module.declare_func_in_func(map_get_typed_callee, &mut builder.func);
+                let map_has_typed_fn = self.module.declare_func_in_func(map_has_typed_callee, &mut builder.func);
+                let map_get_int_unwrap_fn = self.module.declare_func_in_func(map_get_int_unwrap_callee, &mut builder.func);
+                let alloc_enum2_fn = self.module.declare_func_in_func(alloc_enum2_callee, &mut builder.func);
+                let enum_payload_at_fn = self.module.declare_func_in_func(enum_payload_at_callee, &mut builder.func);
                 let tostring_int_fn = self.module.declare_func_in_func(tostring_int_callee, &mut builder.func);
                 let tostring_float_fn = self.module.declare_func_in_func(tostring_float_callee, &mut builder.func);
                 let tostring_bool_fn = self.module.declare_func_in_func(tostring_bool_callee, &mut builder.func);
@@ -5862,7 +6052,11 @@ pub mod jit_engine {
                     pow2_mod_defs: &empty_pow2_mod_defs,
                 };
 
-                let loop_headers = find_loop_headers(&mir_fn.blocks);
+                let loop_headers: hashbrown::HashSet<usize> =
+                    crate::mir::opt::Safepoints::find_loop_headers_in_fn(mir_fn)
+                        .into_iter()
+                        .map(|b| b.0)
+                        .collect();
                 let prov_plan = compute_array_len_provenance_plan(mir_fn, &loop_headers, osr_info);
                 let mut pre_header_blocks: hashbrown::HashMap<usize, Block> =
                     hashbrown::HashMap::new();
@@ -6391,6 +6585,13 @@ pub mod jit_engine {
                 for (hl_idx, hspec) in promo_plan.hoist_loops.iter().enumerate() {
                     let cl_opt = promo_plan.block_to_counter_loop.get(&hspec.hdr).copied();
                     let iq_opt = promo_plan.block_to_inner_quantized.get(&hspec.hdr).copied();
+                    // NG-W15-6: `peeled_header_bb` runs a 1-iteration inline check and leaves
+                    // `quantum_rem == 0` (deferring Q=64 arming to backedge header `clif_blocks[hspec.hdr]`).
+                    // For a peeled inner quantized loop header, `peeled_header_bb` & `guarded_preheader_bb`
+                    // belong strictly to the enclosing outer counter-promoted loop (zero cold refill and
+                    // zero `iq_exit_bb` reconcile on 0-trip inner loops such as `sieve.lust`).
+                    let is_peeled_iq_hdr = iq_opt
+                        .is_some_and(|iqi| promo_plan.inner_quantized_loops[iqi].hdr == hspec.hdr);
                     let blocks_before: hashbrown::HashSet<Block> = if cl_opt.is_some() || iq_opt.is_some() {
                         builder.func.layout.blocks().collect()
                     } else {
@@ -6408,7 +6609,11 @@ pub mod jit_engine {
                             outer_hoisted_structs.extend(hl_states[other_idx].hoisted_structs.iter().map(|(&k, &v)| (k, v)));
                         }
                     }
-                    let active_emergency_bb = if let Some(iqi) = iq_opt {
+                    let active_emergency_bb = if is_peeled_iq_hdr {
+                        cl_opt
+                            .map(|ci| cl_states[ci].emergency_flush_bb)
+                            .unwrap_or(emergency_exit_bb)
+                    } else if let Some(iqi) = iq_opt {
                         iq_states[iqi].emergency_flush_bb
                     } else if let Some(ci) = cl_opt {
                         cl_states[ci].emergency_flush_bb
@@ -6424,7 +6629,9 @@ pub mod jit_engine {
                         const_int_locals: &const_int_locals,
                         pow2_mod_defs: &empty_pow2_mod_defs,
                     };
-                    let active_promoted = if let Some(iqi) = iq_opt {
+                    let active_promoted = if is_peeled_iq_hdr {
+                        cl_opt.map(|ci| cl_states[ci].counters)
+                    } else if let Some(iqi) = iq_opt {
                         Some(iq_states[iqi].counters)
                     } else {
                         cl_opt.map(|ci| cl_states[ci].counters)
@@ -6433,7 +6640,7 @@ pub mod jit_engine {
                     builder.switch_to_block(hl_states[hl_idx].peeled_header_bb);
                     let mut cur_validated = prov_plan.validated_in[hspec.hdr].clone();
 
-                    let mut skip_first_header_gas_check = false;
+                    let skip_first_header_gas_check = false;
                     if loop_headers.contains(&hspec.hdr) {
                         let proven_entry_storage;
                         let locals_to_record = if let Some((_, live_locals)) = osr_info {
@@ -6454,65 +6661,25 @@ pub mod jit_engine {
                         };
                         let (sp_ptr_var, _, sp_slow_fn) =
                             safepoint_ctx.expect("loop header implies needs_safepoint");
-                        let quantized_amt = iq_opt
-                            .and_then(|iqi| {
-                                let iq_spec = &promo_plan.inner_quantized_loops[iqi];
-                                if iq_spec.hdr == hspec.hdr {
-                                    Some(iq_spec.header_gas_amt)
-                                } else {
-                                    None
-                                }
-                            })
-                            .or_else(|| {
-                                cl_opt.and_then(|ci| {
-                                    let spec = &promo_plan.counter_loops[ci];
-                                    if spec.hdr == hspec.hdr {
-                                        spec.quantized_header_gas_amt
-                                    } else {
-                                        None
-                                    }
-                                })
-                            });
-                        if let Some(q_amt) = quantized_amt {
-                            let (_, _, gas_slow_fn) =
-                                gas_ctx.expect("quantized loop header implies gas_ctx");
-                            emit_quantized_loop_header_check(
-                                &mut builder,
-                                sp_ptr_var,
-                                sp_slow_fn,
-                                gas_slow_fn,
-                                init_deopt_fn,
-                                record_deopt_local_fn,
-                                hspec.hdr,
-                                q_amt,
-                                locals_to_record,
-                                &local_vars,
-                                &stack_slots,
-                                &mir_fn.locals,
-                                emergency_exit_bb,
-                                active_promoted.expect("quantized loop header implies promoted counters"),
-                                cl_opt.map(|ci| &mut cfg_records[ci]),
-                                iq_opt.map(|iqi| &mut iq_cfg_records[iqi]),
-                            );
-                            skip_first_header_gas_check = true;
-                        } else {
-                            emit_safepoint_check(
-                                &mut builder,
-                                sp_ptr_var,
-                                sp_slow_fn,
-                                init_deopt_fn,
-                                record_deopt_local_fn,
-                                hspec.hdr,
-                                locals_to_record,
-                                &local_vars,
-                                &stack_slots,
-                                &mir_fn.locals,
-                                emergency_exit_bb,
-                                None,
-                                active_promoted,
-                                cl_opt.map(|ci| &mut cfg_records[ci]),
-                            );
-                        }
+                        // NG-W15-6: Always emit inline 1-iteration safepoint check in `peeled_header_bb`
+                        // (statement 0 then runs `emit_inline_gas_check`), deferring Q=64 quantum arming
+                        // to backedge header `clif_blocks[hspec.hdr]`.
+                        emit_safepoint_check(
+                            &mut builder,
+                            sp_ptr_var,
+                            sp_slow_fn,
+                            init_deopt_fn,
+                            record_deopt_local_fn,
+                            hspec.hdr,
+                            locals_to_record,
+                            &local_vars,
+                            &stack_slots,
+                            &mir_fn.locals,
+                            emergency_exit_bb,
+                            None,
+                            active_promoted,
+                            cl_opt.map(|ci| &mut cfg_records[ci]),
+                        );
                     }
 
                     let mut peeled_pow2_mod_defs: hashbrown::HashMap<usize, (ClifValue, i64)> =
@@ -6598,6 +6765,7 @@ pub mod jit_engine {
                                     &stack_slots,
                                     &mir_fn.locals,
                                     &self.struct_layouts,
+                                    alloc_array_fn,
                                     alloc_array_typed_fn,
                                     alloc_tuple_typed_fn,
                                     alloc_struct_named_fn,
@@ -6649,6 +6817,7 @@ pub mod jit_engine {
                                     &stack_slots,
                                     &mir_fn.locals,
                                     &self.struct_layouts,
+                                    alloc_array_fn,
                                     alloc_array_typed_fn,
                                     alloc_tuple_typed_fn,
                                     alloc_struct_named_fn,
@@ -6702,6 +6871,7 @@ pub mod jit_engine {
                                     &stack_slots,
                                     &mir_fn.locals,
                                     &self.struct_layouts,
+                                    alloc_array_fn,
                                     alloc_array_typed_fn,
                                     alloc_tuple_typed_fn,
                                     alloc_struct_named_fn,
@@ -6764,7 +6934,22 @@ pub mod jit_engine {
                         &self.struct_layouts,
                         peeled_bc_ctx,
                     )?;
-                    let exit_bb = resolve_target_bb(Some(hspec.hdr), hspec.loop_exit)?;
+                    let exit_bb = if is_peeled_iq_hdr {
+                        if let Some(ci) = cl_opt
+                            && !promo_plan.counter_loops[ci]
+                                .loop_blocks
+                                .contains(&hspec.loop_exit)
+                        {
+                            exit_flush_by_edge
+                                .get(&(ci, hspec.loop_exit))
+                                .copied()
+                                .unwrap_or(resolve_dest_entry_bb(Some(hspec.hdr), hspec.loop_exit)?)
+                        } else {
+                            resolve_dest_entry_bb(Some(hspec.hdr), hspec.loop_exit)?
+                        }
+                    } else {
+                        resolve_target_bb(Some(hspec.hdr), hspec.loop_exit)?
+                    };
                     let guard_bb = hl_states[hl_idx].guarded_preheader_bb;
                     if hspec.then_is_body {
                         builder.ins().brif(c_val, guard_bb, &[], exit_bb, &[]);
@@ -6841,7 +7026,9 @@ pub mod jit_engine {
                             }
                         }
                     }
-                    if let Some(iqi) = iq_opt {
+                    if !is_peeled_iq_hdr
+                        && let Some(iqi) = iq_opt
+                    {
                         let iq_rec = &mut iq_cfg_records[iqi];
                         for bb in builder.func.layout.blocks() {
                             if !blocks_before.contains(&bb)
@@ -7158,19 +7345,78 @@ pub mod jit_engine {
                         &bounds_excluded_locals,
                         &loop_bounds_analysis.non_neg_locals_in[b_idx],
                     );
+                    // NG-W15-6: Pre-identify proven-in-bounds `UnsignedRangeCheck`s so both their
+                    // preceding `Len(arr)` statement and their `icmp ult` + `brif` can be folded.
+                    let mut folded_range_checks: hashbrown::HashSet<usize> =
+                        hashbrown::HashSet::new();
+                    let mut folded_len_skip_stmts: hashbrown::HashSet<usize> =
+                        hashbrown::HashSet::new();
+                    let mut proven_true_cond_locals: hashbrown::HashSet<usize> =
+                        hashbrown::HashSet::new();
+                    for (&rc_stmt_idx, rc) in &block_range_fusion.fused_checks {
+                        let Some(arr_loc) = rc.arr_local else {
+                            continue;
+                        };
+                        let proven_at_stmt = loop_bounds_analysis
+                            .proven_in_bounds_at_stmt
+                            .get(&(b_idx, rc_stmt_idx))
+                            .is_some_and(|v| v.contains(&(arr_loc, rc.idx_local)));
+                        let proven_from_entry = if cur_proven_in_bounds
+                            .contains(&(arr_loc, rc.idx_local))
+                        {
+                            !mir_block.statements[..rc_stmt_idx].iter().any(|s| match s {
+                                Statement::Assign(Place::Local(d), _, _) => {
+                                    *d == arr_loc || *d == rc.idx_local
+                                }
+                                Statement::StorageDead(d, _) => {
+                                    *d == arr_loc || *d == rc.idx_local
+                                }
+                                _ => false,
+                            })
+                        } else {
+                            false
+                        };
+                        if proven_at_stmt || proven_from_entry {
+                            folded_range_checks.insert(rc_stmt_idx);
+                            if let Some(s_len_idx) = rc.s_len
+                                && (cur_validated.contains(&arr_loc.0)
+                                    || active_hoisted_arrays.contains_key(&arr_loc.0))
+                            {
+                                folded_len_skip_stmts.insert(s_len_idx);
+                            }
+                        }
+                    }
                     for (stmt_idx, stmt) in mir_block.statements.iter().enumerate() {
                         if stmt_idx == 0 && skip_first_header_gas_check {
                             continue;
                         }
-                        if block_range_fusion.skip_stmts.contains(&stmt_idx) {
+                        if block_range_fusion.skip_stmts.contains(&stmt_idx)
+                            || folded_len_skip_stmts.contains(&stmt_idx)
+                        {
                             continue;
                         }
+                        let stmt_proven_storage: Vec<(LocalId, LocalId)>;
+                        let stmt_proven_slice: &[(LocalId, LocalId)] =
+                            if let Some(extra) =
+                                loop_bounds_analysis.proven_in_bounds_at_stmt.get(&(b_idx, stmt_idx))
+                            {
+                                let mut combined = cur_proven_in_bounds.clone();
+                                for &pair in extra {
+                                    if !combined.contains(&pair) {
+                                        combined.push(pair);
+                                    }
+                                }
+                                stmt_proven_storage = combined;
+                                &stmt_proven_storage
+                            } else {
+                                &cur_proven_in_bounds
+                            };
                         let stmt_bc_ctx = BoundsCheckCtx {
                             status_set_fn,
                             emergency_exit_bb: active_emergency_bb,
                             hoisted_arrays: &active_hoisted_arrays,
                             hoisted_structs: &active_hoisted_structs,
-                            proven_in_bounds: &cur_proven_in_bounds,
+                            proven_in_bounds: stmt_proven_slice,
                             const_int_locals: &const_int_locals,
                             pow2_mod_defs: &cur_pow2_mod_defs,
                         };
@@ -7181,30 +7427,38 @@ pub mod jit_engine {
                                     rc.dst
                                 ))
                             })?;
-                            let idx_val = load_local_i64(
-                                rc.idx_local,
-                                &mut builder,
-                                &local_vars,
-                                &stack_slots,
-                            )?;
-                            let mut len_val = lower_operand(
-                                &rc.len_op,
-                                &mut builder,
-                                &local_vars,
-                                &stack_slots,
-                                &mir_fn.locals,
-                                &self.struct_layouts,
-                                stmt_bc_ctx,
-                            )?;
-                            if builder.func.dfg.value_type(len_val) != types::I64 {
-                                len_val = cast_clif_type(&mut builder, len_val, types::I64);
-                            }
-                            let in_bounds = builder
-                                .ins()
-                                .icmp(IntCC::UnsignedLessThan, idx_val, len_val);
                             let target_ty = mir_to_clif_type(&dst_decl.ty)?;
-                            let val = cast_clif_type(&mut builder, in_bounds, target_ty);
-                            store_local_val(rc.dst, val, &mut builder, &local_vars, &stack_slots)?;
+                            if folded_range_checks.contains(&stmt_idx) {
+                                let one = builder.ins().iconst(types::I64, 1);
+                                let val = cast_clif_type(&mut builder, one, target_ty);
+                                store_local_val(rc.dst, val, &mut builder, &local_vars, &stack_slots)?;
+                                proven_true_cond_locals.insert(rc.dst.0);
+                            } else {
+                                let idx_val = load_local_i64(
+                                    rc.idx_local,
+                                    &mut builder,
+                                    &local_vars,
+                                    &stack_slots,
+                                )?;
+                                let mut len_val = lower_operand(
+                                    &rc.len_op,
+                                    &mut builder,
+                                    &local_vars,
+                                    &stack_slots,
+                                    &mir_fn.locals,
+                                    &self.struct_layouts,
+                                    stmt_bc_ctx,
+                                )?;
+                                if builder.func.dfg.value_type(len_val) != types::I64 {
+                                    len_val = cast_clif_type(&mut builder, len_val, types::I64);
+                                }
+                                let in_bounds = builder
+                                    .ins()
+                                    .icmp(IntCC::UnsignedLessThan, idx_val, len_val);
+                                let val = cast_clif_type(&mut builder, in_bounds, target_ty);
+                                store_local_val(rc.dst, val, &mut builder, &local_vars, &stack_slots)?;
+                                proven_true_cond_locals.remove(&rc.dst.0);
+                            }
                             cur_pow2_mod_defs.remove(&rc.dst.0);
                             cur_proven_in_bounds
                                 .retain(|&(arr_l, idx_l)| arr_l != rc.dst && idx_l != rc.dst);
@@ -7235,6 +7489,7 @@ pub mod jit_engine {
                                     &stack_slots,
                                     &mir_fn.locals,
                                     &self.struct_layouts,
+                                    alloc_array_fn,
                                     alloc_array_typed_fn,
                                     alloc_tuple_typed_fn,
                                     alloc_struct_named_fn,
@@ -7263,6 +7518,17 @@ pub mod jit_engine {
                                 cur_proven_in_bounds
                                     .retain(|&(arr_l, idx_l)| arr_l != *dst && idx_l != *dst);
                                 match rvalue {
+                                    Rvalue::Use(
+                                        Operand::Copy(Place::Local(src))
+                                        | Operand::Move(Place::Local(src)),
+                                    ) if proven_true_cond_locals.contains(&src.0) => {
+                                        proven_true_cond_locals.insert(dst.0);
+                                    }
+                                    _ => {
+                                        proven_true_cond_locals.remove(&dst.0);
+                                    }
+                                }
+                                match rvalue {
                                     Rvalue::Aggregate(MirType::Array(_), _) => {
                                         cur_validated.insert(dst.0);
                                     }
@@ -7288,6 +7554,7 @@ pub mod jit_engine {
                                     &stack_slots,
                                     &mir_fn.locals,
                                     &self.struct_layouts,
+                                    alloc_array_fn,
                                     alloc_array_typed_fn,
                                     alloc_tuple_typed_fn,
                                     alloc_struct_named_fn,
@@ -7341,6 +7608,7 @@ pub mod jit_engine {
                                     &stack_slots,
                                     &mir_fn.locals,
                                     &self.struct_layouts,
+                                    alloc_array_fn,
                                     alloc_array_typed_fn,
                                     alloc_tuple_typed_fn,
                                     alloc_struct_named_fn,
@@ -7385,6 +7653,9 @@ pub mod jit_engine {
                                     active_promoted,
                                     cl_opt.map(|ci| &mut cfg_records[ci]),
                                 );
+                            }
+                            Statement::StorageDead(loc, _) => {
+                                proven_true_cond_locals.remove(&loc.0);
                             }
                             _ => {}
                         }
@@ -7519,10 +7790,20 @@ pub mod jit_engine {
                                 builder.ins().jump(target_bb, &[]);
                             }
                             Terminator::Cond { cond, then_block, else_block, .. } => {
-                                let c_val = lower_operand(cond, &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, active_bc_ctx)?;
-                                let then_bb = resolve_target_bb(Some(b_idx), then_block.0)?;
-                                let else_bb = resolve_target_bb(Some(b_idx), else_block.0)?;
-                                builder.ins().brif(c_val, then_bb, &[], else_bb, &[]);
+                                let is_proven_true = matches!(
+                                    cond,
+                                    Operand::Copy(Place::Local(d)) | Operand::Move(Place::Local(d))
+                                        if proven_true_cond_locals.contains(&d.0)
+                                );
+                                if is_proven_true {
+                                    let then_bb = resolve_target_bb(Some(b_idx), then_block.0)?;
+                                    builder.ins().jump(then_bb, &[]);
+                                } else {
+                                    let c_val = lower_operand(cond, &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, active_bc_ctx)?;
+                                    let then_bb = resolve_target_bb(Some(b_idx), then_block.0)?;
+                                    let else_bb = resolve_target_bb(Some(b_idx), else_block.0)?;
+                                    builder.ins().brif(c_val, then_bb, &[], else_bb, &[]);
+                                }
                             }
                             Terminator::Switch { discr, cases, default, .. } => {
                                 let d_val = lower_operand(discr, &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, active_bc_ctx)?;
@@ -8547,7 +8828,9 @@ pub mod jit_engine {
                                             "Call to '{callee}' requires Array first argument, got '{arr_ty}'"
                                         )));
                                     };
-                                    if mir_array_elem_tag(&elem_ty).is_none() {
+                                    if mir_array_elem_tag(&elem_ty).is_none()
+                                        && !matches!(&*elem_ty, MirType::Struct(name) if !name.is_empty())
+                                    {
                                         return Err(MirCraneliftBackendError::UnsupportedType(*elem_ty));
                                     }
                                     let val_ty = try_operand_type(&args[1], &mir_fn.locals, &self.struct_layouts)?;
@@ -8833,6 +9116,491 @@ pub mod jit_engine {
                                             )?;
                                             builder.ins().store(MemFlagsData::trusted(), res_val, dst_addr, 0);
                                         }
+                                    }
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
+                                } else if callee == "map.set" {
+                                    if args.len() != 3 {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to 'map.set' arity mismatch: got {} arguments, expected 3",
+                                            args.len()
+                                        )));
+                                    }
+                                    let key_ty = try_operand_type(&args[1], &mir_fn.locals, &self.struct_layouts)?;
+                                    let val_ty = try_operand_type(&args[2], &mir_fn.locals, &self.struct_layouts)?;
+                                    let map_val = lower_operand(&args[0], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let key_val = lower_operand(&args[1], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let val_val = lower_operand(&args[2], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let key_raw = clif_val_to_raw_i64(&mut builder, key_val);
+                                    let val_raw = clif_val_to_raw_i64(&mut builder, val_val);
+                                    let zero_ctx = builder.ins().iconst(types::I64, 0);
+                                    let key_tag = builder.ins().iconst(types::I64, mir_type_to_map_operand_tag(&key_ty));
+                                    let val_tag = builder.ins().iconst(types::I64, mir_type_to_map_operand_tag(&val_ty));
+                                    let set_call = builder.ins().call(
+                                        map_set_typed_fn,
+                                        &[zero_ctx, map_val, key_raw, val_raw, key_tag, val_tag],
+                                    );
+                                    let set_status = builder.inst_results(set_call)[0];
+                                    if let Place::Local(loc) = destination {
+                                        let loc_decl = mir_fn.locals.get(loc.0).ok_or_else(|| {
+                                            MirCraneliftBackendError::CodegenError(format!(
+                                                "Call destination local {loc:?} out of bounds"
+                                            ))
+                                        })?;
+                                        let target_ty = mir_to_clif_type(&loc_decl.ty)?;
+                                        let zero = builder.ins().iconst(types::I64, 0);
+                                        let zero_val = cast_clif_type(&mut builder, zero, target_ty);
+                                        store_local_val(*loc, zero_val, &mut builder, &local_vars, &stack_slots)?;
+                                    }
+                                    let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, set_status, 0);
+                                    let ok_bb = builder.create_block();
+                                    builder.ins().brif(is_err, emergency_exit_bb, &[], ok_bb, &[]);
+                                    builder.switch_to_block(ok_bb);
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
+                                } else if callee == "map.get" || callee == "map.has" {
+                                    if args.len() != 2 {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to '{callee}' arity mismatch: got {} arguments, expected 2",
+                                            args.len()
+                                        )));
+                                    }
+                                    let key_ty = try_operand_type(&args[1], &mir_fn.locals, &self.struct_layouts)?;
+                                    let map_val = lower_operand(&args[0], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let key_val = lower_operand(&args[1], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let key_raw = clif_val_to_raw_i64(&mut builder, key_val);
+                                    let zero_ctx = builder.ins().iconst(types::I64, 0);
+                                    let key_tag = builder.ins().iconst(types::I64, mir_type_to_map_operand_tag(&key_ty));
+                                    let target_fn = if callee == "map.has" { map_has_typed_fn } else { map_get_typed_fn };
+                                    let call_inst = builder.ins().call(target_fn, &[zero_ctx, map_val, key_raw, key_tag]);
+                                    let res_val = builder.inst_results(call_inst)[0];
+                                    if let Place::Local(loc) = destination {
+                                        let loc_decl = mir_fn.locals.get(loc.0).ok_or_else(|| {
+                                            MirCraneliftBackendError::CodegenError(format!(
+                                                "Call destination local {loc:?} out of bounds"
+                                            ))
+                                        })?;
+                                        let target_ty = mir_to_clif_type(&loc_decl.ty)?;
+                                        let res_cast = cast_clif_type(&mut builder, res_val, target_ty);
+                                        store_local_val(*loc, res_cast, &mut builder, &local_vars, &stack_slots)?;
+                                    }
+                                    emit_status_check(&mut builder, status_fn, emergency_exit_bb);
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
+                                } else if callee == "map.get_unwrap" || callee == "map.get_unwrap_or" {
+                                    let expected_arity = if callee == "map.get_unwrap_or" { 3 } else { 2 };
+                                    if args.len() != expected_arity {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to '{callee}' arity mismatch: got {} arguments, expected {expected_arity}",
+                                            args.len()
+                                        )));
+                                    }
+                                    let key_ty = try_operand_type(&args[1], &mir_fn.locals, &self.struct_layouts)?;
+                                    let dst_mir_ty = match destination {
+                                        Place::Local(loc) => mir_fn
+                                            .locals
+                                            .get(loc.0)
+                                            .map(|d| d.ty.clone())
+                                            .unwrap_or(MirType::Int),
+                                        _ => MirType::Int,
+                                    };
+                                    let map_val = lower_operand(&args[0], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let key_val = lower_operand(&args[1], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let key_raw = clif_val_to_raw_i64(&mut builder, key_val);
+                                    let zero_ctx = builder.ins().iconst(types::I64, 0);
+                                    let key_tag = builder.ins().iconst(types::I64, mir_type_to_map_operand_tag(&key_ty));
+                                    let res_val = if dst_mir_ty == MirType::Int && callee == "map.get_unwrap" {
+                                        let trap_sentinel = builder.ins().iconst(types::I64, i64::MIN);
+                                        let call_inst = builder.ins().call(
+                                            map_get_int_unwrap_fn,
+                                            &[zero_ctx, map_val, key_raw, key_tag, trap_sentinel],
+                                        );
+                                        let v = builder.inst_results(call_inst)[0];
+                                        emit_status_check(&mut builder, status_fn, emergency_exit_bb);
+                                        v
+                                    } else if dst_mir_ty == MirType::Int && callee == "map.get_unwrap_or" {
+                                        let def_val = lower_operand(&args[2], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                        let def_i64 = cast_clif_type(&mut builder, def_val, types::I64);
+                                        let is_sentinel = builder.ins().icmp_imm_s(IntCC::Equal, def_i64, i64::MIN);
+                                        let slow_bb = builder.create_block();
+                                        let fast_bb = builder.create_block();
+                                        let merge_bb = builder.create_block();
+                                        let merged_param = builder.append_block_param(merge_bb, types::I64);
+                                        builder.set_cold_block(slow_bb);
+                                        builder.ins().brif(is_sentinel, slow_bb, &[], fast_bb, &[]);
+
+                                        builder.switch_to_block(fast_bb);
+                                        let fast_call = builder.ins().call(
+                                            map_get_int_unwrap_fn,
+                                            &[zero_ctx, map_val, key_raw, key_tag, def_i64],
+                                        );
+                                        let fast_v = builder.inst_results(fast_call)[0];
+                                        emit_status_check(&mut builder, status_fn, emergency_exit_bb);
+                                        builder.ins().jump(merge_bb, &[BlockArg::Value(fast_v)]);
+
+                                        builder.switch_to_block(slow_bb);
+                                        let opt_call = builder.ins().call(
+                                            map_get_typed_fn,
+                                            &[zero_ctx, map_val, key_raw, key_tag],
+                                        );
+                                        let opt_h = builder.inst_results(opt_call)[0];
+                                        emit_status_check(&mut builder, status_fn, emergency_exit_bb);
+                                        let is_none = builder.ins().icmp_imm_s(IntCC::Equal, opt_h, 0);
+                                        let some_bb = builder.create_block();
+                                        builder.ins().brif(is_none, merge_bb, &[BlockArg::Value(def_i64)], some_bb, &[]);
+                                        builder.switch_to_block(some_bb);
+                                        let f0 = builder.ins().iconst(types::I64, 0);
+                                        let pay_call = builder.ins().call(enum_payload_at_fn, &[zero_ctx, opt_h, f0]);
+                                        let pay_v = builder.inst_results(pay_call)[0];
+                                        builder.ins().jump(merge_bb, &[BlockArg::Value(pay_v)]);
+
+                                        builder.switch_to_block(merge_bb);
+                                        merged_param
+                                    } else {
+                                        let opt_call = builder.ins().call(
+                                            map_get_typed_fn,
+                                            &[zero_ctx, map_val, key_raw, key_tag],
+                                        );
+                                        let opt_h = builder.inst_results(opt_call)[0];
+                                        emit_status_check(&mut builder, status_fn, emergency_exit_bb);
+                                        let is_none = builder.ins().icmp_imm_s(IntCC::Equal, opt_h, 0);
+                                        let target_ty = mir_to_clif_type(&dst_mir_ty)?;
+                                        if callee == "map.get_unwrap_or" {
+                                            let def_val = lower_operand(&args[2], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                            let def_cast = cast_clif_type(&mut builder, def_val, target_ty);
+                                            let some_bb = builder.create_block();
+                                            let merge_bb = builder.create_block();
+                                            let merged_param = builder.append_block_param(merge_bb, target_ty);
+                                            builder.ins().brif(is_none, merge_bb, &[BlockArg::Value(def_cast)], some_bb, &[]);
+                                            builder.switch_to_block(some_bb);
+                                            let f0 = builder.ins().iconst(types::I64, 0);
+                                            let pay_call = builder.ins().call(enum_payload_at_fn, &[zero_ctx, opt_h, f0]);
+                                            let pay_raw = builder.inst_results(pay_call)[0];
+                                            let pay_val = if target_ty == types::F64 {
+                                                builder.ins().bitcast(types::F64, MemFlagsData::new(), pay_raw)
+                                            } else {
+                                                cast_clif_type(&mut builder, pay_raw, target_ty)
+                                            };
+                                            builder.ins().jump(merge_bb, &[BlockArg::Value(pay_val)]);
+                                            builder.switch_to_block(merge_bb);
+                                            merged_param
+                                        } else {
+                                            let none_bb = builder.create_block();
+                                            let some_bb = builder.create_block();
+                                            builder.set_cold_block(none_bb);
+                                            builder.ins().brif(is_none, none_bb, &[], some_bb, &[]);
+                                            builder.switch_to_block(none_bb);
+                                            let oob = builder.ins().iconst(types::I64, MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                                            builder.ins().call(status_set_fn, &[oob]);
+                                            builder.ins().jump(emergency_exit_bb, &[]);
+                                            builder.switch_to_block(some_bb);
+                                            let f0 = builder.ins().iconst(types::I64, 0);
+                                            let pay_call = builder.ins().call(enum_payload_at_fn, &[zero_ctx, opt_h, f0]);
+                                            let pay_raw = builder.inst_results(pay_call)[0];
+                                            if target_ty == types::F64 {
+                                                builder.ins().bitcast(types::F64, MemFlagsData::new(), pay_raw)
+                                            } else {
+                                                cast_clif_type(&mut builder, pay_raw, target_ty)
+                                            }
+                                        }
+                                    };
+                                    if let Place::Local(loc) = destination {
+                                        let loc_decl = mir_fn.locals.get(loc.0).ok_or_else(|| {
+                                            MirCraneliftBackendError::CodegenError(format!(
+                                                "Call destination local {loc:?} out of bounds"
+                                            ))
+                                        })?;
+                                        let target_ty = mir_to_clif_type(&loc_decl.ty)?;
+                                        let res_cast = cast_clif_type(&mut builder, res_val, target_ty);
+                                        store_local_val(*loc, res_cast, &mut builder, &local_vars, &stack_slots)?;
+                                    }
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
+                                } else if callee == "string.sub" {
+                                    if args.len() != 2 && args.len() != 3 {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to 'string.sub' arity mismatch: got {} arguments, expected 2 or 3",
+                                            args.len()
+                                        )));
+                                    }
+                                    let zero_ctx = builder.ins().iconst(types::I64, 0);
+                                    let s_val = lower_operand(&args[0], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let start_val = lower_operand(&args[1], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let start_i64 = cast_clif_type(&mut builder, start_val, types::I64);
+                                    let end_i64 = if args.len() == 3 {
+                                        let ev = lower_operand(&args[2], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                        cast_clif_type(&mut builder, ev, types::I64)
+                                    } else {
+                                        builder.ins().iconst(types::I64, -1)
+                                    };
+                                    let call_inst = builder.ins().call(string_sub_fn, &[zero_ctx, s_val, start_i64, end_i64]);
+                                    let res_val = builder.inst_results(call_inst)[0];
+                                    if let Place::Local(loc) = destination {
+                                        let target_ty = mir_to_clif_type(&mir_fn.locals[loc.0].ty)?;
+                                        let res_cast = cast_clif_type(&mut builder, res_val, target_ty);
+                                        store_local_val(*loc, res_cast, &mut builder, &local_vars, &stack_slots)?;
+                                    }
+                                    emit_status_check(&mut builder, status_fn, emergency_exit_bb);
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
+                                } else if callee == "string.byte" || callee == "string.byte_at" {
+                                    if args.is_empty() || args.len() > 3 {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to '{callee}' arity mismatch: got {} arguments",
+                                            args.len()
+                                        )));
+                                    }
+                                    let zero_ctx = builder.ins().iconst(types::I64, 0);
+                                    let s_val = lower_operand(&args[0], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let start_i64 = if args.len() >= 2 {
+                                        let sv = lower_operand(&args[1], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                        cast_clif_type(&mut builder, sv, types::I64)
+                                    } else {
+                                        builder.ins().iconst(types::I64, 1)
+                                    };
+                                    let dst_mir_ty = match destination {
+                                        Place::Local(loc) => mir_fn.locals.get(loc.0).map(|d| d.ty.clone()),
+                                        _ => None,
+                                    };
+                                    let res_val = if callee == "string.byte_at" || matches!(dst_mir_ty, Some(MirType::Int)) {
+                                        let call_inst = builder.ins().call(string_byte_at_fn, &[zero_ctx, s_val, start_i64]);
+                                        builder.inst_results(call_inst)[0]
+                                    } else {
+                                        let end_i64 = if args.len() == 3 {
+                                            let ev = lower_operand(&args[2], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                            cast_clif_type(&mut builder, ev, types::I64)
+                                        } else {
+                                            start_i64
+                                        };
+                                        if let Some(MirType::Array(inner)) = &dst_mir_ty {
+                                            let elem_tag = mir_array_elem_tag(inner).unwrap_or(0);
+                                            let tag_val = builder.ins().iconst(types::I64, elem_tag);
+                                            let call_inst = builder.ins().call(
+                                                clif_string_byte_fn,
+                                                &[zero_ctx, s_val, start_i64, end_i64, tag_val],
+                                            );
+                                            builder.inst_results(call_inst)[0]
+                                        } else {
+                                            let call_inst = builder.ins().call(
+                                                string_byte_fn,
+                                                &[zero_ctx, s_val, start_i64, end_i64],
+                                            );
+                                            builder.inst_results(call_inst)[0]
+                                        }
+                                    };
+                                    if let Place::Local(loc) = destination {
+                                        let target_ty = mir_to_clif_type(&mir_fn.locals[loc.0].ty)?;
+                                        let res_cast = cast_clif_type(&mut builder, res_val, target_ty);
+                                        store_local_val(*loc, res_cast, &mut builder, &local_vars, &stack_slots)?;
+                                    }
+                                    emit_status_check(&mut builder, status_fn, emergency_exit_bb);
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
+                                } else if callee == "string.gsub" {
+                                    if args.len() != 3 {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to 'string.gsub' arity mismatch: got {} arguments, expected 3",
+                                            args.len()
+                                        )));
+                                    }
+                                    let zero_ctx = builder.ins().iconst(types::I64, 0);
+                                    let s_val = lower_operand(&args[0], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let pat_val = lower_operand(&args[1], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let repl_val = lower_operand(&args[2], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let dst_mir_ty = match destination {
+                                        Place::Local(loc) => mir_fn.locals.get(loc.0).map(|d| d.ty.clone()),
+                                        _ => None,
+                                    };
+                                    let res_val = if let Some(MirType::Array(inner)) = &dst_mir_ty {
+                                        let elem_tag = mir_array_elem_tag(inner).unwrap_or(MIR_ARRAY_ELEM_TAG_STRING);
+                                        let tag_val = builder.ins().iconst(types::I64, elem_tag);
+                                        let call_inst = builder.ins().call(
+                                            clif_string_gsub_fn,
+                                            &[zero_ctx, s_val, pat_val, repl_val, tag_val],
+                                        );
+                                        builder.inst_results(call_inst)[0]
+                                    } else if matches!(dst_mir_ty, Some(MirType::String)) {
+                                        let tag_val = builder.ins().iconst(types::I64, -1);
+                                        let call_inst = builder.ins().call(
+                                            clif_string_gsub_fn,
+                                            &[zero_ctx, s_val, pat_val, repl_val, tag_val],
+                                        );
+                                        builder.inst_results(call_inst)[0]
+                                    } else {
+                                        let call_inst = builder.ins().call(
+                                            string_gsub_fn,
+                                            &[zero_ctx, s_val, pat_val, repl_val],
+                                        );
+                                        builder.inst_results(call_inst)[0]
+                                    };
+                                    if let Place::Local(loc) = destination {
+                                        let target_ty = mir_to_clif_type(&mir_fn.locals[loc.0].ty)?;
+                                        let res_cast = cast_clif_type(&mut builder, res_val, target_ty);
+                                        store_local_val(*loc, res_cast, &mut builder, &local_vars, &stack_slots)?;
+                                    }
+                                    emit_status_check(&mut builder, status_fn, emergency_exit_bb);
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
+                                } else if callee == "string.split" {
+                                    if args.len() != 2 {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to 'string.split' arity mismatch: got {} arguments, expected 2",
+                                            args.len()
+                                        )));
+                                    }
+                                    let zero_ctx = builder.ins().iconst(types::I64, 0);
+                                    let s_val = lower_operand(&args[0], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let sep_val = lower_operand(&args[1], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let dst_mir_ty = match destination {
+                                        Place::Local(loc) => mir_fn.locals.get(loc.0).map(|d| d.ty.clone()),
+                                        _ => None,
+                                    };
+                                    let res_val = if let Some(MirType::Array(inner)) = &dst_mir_ty {
+                                        let elem_tag = mir_array_elem_tag(inner).unwrap_or(MIR_ARRAY_ELEM_TAG_STRING);
+                                        let tag_val = builder.ins().iconst(types::I64, elem_tag);
+                                        let call_inst = builder.ins().call(
+                                            clif_string_split_fn,
+                                            &[zero_ctx, s_val, sep_val, tag_val],
+                                        );
+                                        builder.inst_results(call_inst)[0]
+                                    } else {
+                                        let call_inst = builder.ins().call(
+                                            string_split_fn,
+                                            &[zero_ctx, s_val, sep_val],
+                                        );
+                                        builder.inst_results(call_inst)[0]
+                                    };
+                                    if let Place::Local(loc) = destination {
+                                        let target_ty = mir_to_clif_type(&mir_fn.locals[loc.0].ty)?;
+                                        let res_cast = cast_clif_type(&mut builder, res_val, target_ty);
+                                        store_local_val(*loc, res_cast, &mut builder, &local_vars, &stack_slots)?;
+                                    }
+                                    emit_status_check(&mut builder, status_fn, emergency_exit_bb);
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
+                                } else if callee == "string.find" {
+                                    if args.len() < 2 || args.len() > 4 {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to 'string.find' arity mismatch: got {} arguments, expected 2..=4",
+                                            args.len()
+                                        )));
+                                    }
+                                    let zero_ctx = builder.ins().iconst(types::I64, 0);
+                                    let s_val = lower_operand(&args[0], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let pat_val = lower_operand(&args[1], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let start_i64 = if args.len() >= 3 {
+                                        let sv = lower_operand(&args[2], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                        cast_clif_type(&mut builder, sv, types::I64)
+                                    } else {
+                                        builder.ins().iconst(types::I64, 1)
+                                    };
+                                    let plain_i64 = if args.len() == 4 {
+                                        let pv = lower_operand(&args[3], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                        clif_val_to_raw_i64(&mut builder, pv)
+                                    } else {
+                                        builder.ins().iconst(types::I64, 0)
+                                    };
+                                    let dst_mir_ty = match destination {
+                                        Place::Local(loc) => mir_fn.locals.get(loc.0).map(|d| d.ty.clone()),
+                                        _ => None,
+                                    };
+                                    let res_val = if let Some(MirType::Array(inner)) = &dst_mir_ty {
+                                        let elem_tag = mir_array_elem_tag(inner).unwrap_or(0);
+                                        let tag_val = builder.ins().iconst(types::I64, elem_tag);
+                                        let call_inst = builder.ins().call(
+                                            clif_string_find_fn,
+                                            &[zero_ctx, s_val, pat_val, start_i64, plain_i64, tag_val],
+                                        );
+                                        builder.inst_results(call_inst)[0]
+                                    } else if matches!(dst_mir_ty, Some(MirType::Int)) {
+                                        let tag_val = builder.ins().iconst(types::I64, -2);
+                                        let call_inst = builder.ins().call(
+                                            clif_string_find_fn,
+                                            &[zero_ctx, s_val, pat_val, start_i64, plain_i64, tag_val],
+                                        );
+                                        builder.inst_results(call_inst)[0]
+                                    } else {
+                                        let call_inst = builder.ins().call(
+                                            string_find_fn,
+                                            &[zero_ctx, s_val, pat_val, start_i64, plain_i64],
+                                        );
+                                        builder.inst_results(call_inst)[0]
+                                    };
+                                    if let Place::Local(loc) = destination {
+                                        let target_ty = mir_to_clif_type(&mir_fn.locals[loc.0].ty)?;
+                                        let res_cast = cast_clif_type(&mut builder, res_val, target_ty);
+                                        store_local_val(*loc, res_cast, &mut builder, &local_vars, &stack_slots)?;
+                                    }
+                                    emit_status_check(&mut builder, status_fn, emergency_exit_bb);
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
+                                } else if callee == "enum.alloc2"
+                                    || callee == "enum.new2"
+                                    || ((callee == "enum.alloc" || callee == "enum.new") && (args.len() == 1 || args.len() == 3))
+                                {
+                                    if args.is_empty() || args.len() > 4 {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to '{callee}' arity mismatch: got {} arguments",
+                                            args.len()
+                                        )));
+                                    }
+                                    let zero_ctx = builder.ins().iconst(types::I64, 0);
+                                    let tag_v = lower_operand(&args[0], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let tag_i64 = cast_clif_type(&mut builder, tag_v, types::I64);
+                                    let p0_i64 = if args.len() >= 2 {
+                                        let v = lower_operand(&args[1], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                        clif_val_to_raw_i64(&mut builder, v)
+                                    } else {
+                                        builder.ins().iconst(types::I64, 0)
+                                    };
+                                    let p1_i64 = if args.len() >= 3 {
+                                        let v = lower_operand(&args[2], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                        clif_val_to_raw_i64(&mut builder, v)
+                                    } else {
+                                        builder.ins().iconst(types::I64, 0)
+                                    };
+                                    let arity_i64 = if args.len() == 4 {
+                                        let v = lower_operand(&args[3], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                        cast_clif_type(&mut builder, v, types::I64)
+                                    } else {
+                                        builder.ins().iconst(types::I64, (args.len() - 1) as i64)
+                                    };
+                                    let call_inst = builder.ins().call(
+                                        alloc_enum2_fn,
+                                        &[zero_ctx, tag_i64, p0_i64, p1_i64, arity_i64],
+                                    );
+                                    let res_val = builder.inst_results(call_inst)[0];
+                                    if let Place::Local(loc) = destination {
+                                        let target_ty = mir_to_clif_type(&mir_fn.locals[loc.0].ty)?;
+                                        let res_cast = cast_clif_type(&mut builder, res_val, target_ty);
+                                        store_local_val(*loc, res_cast, &mut builder, &local_vars, &stack_slots)?;
+                                    }
+                                    emit_status_check(&mut builder, status_fn, emergency_exit_bb);
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
+                                } else if callee == "enum.payload_at"
+                                    || (callee == "enum.payload" && args.len() == 2)
+                                {
+                                    if args.len() != 2 {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to '{callee}' arity mismatch: got {} arguments, expected 2",
+                                            args.len()
+                                        )));
+                                    }
+                                    let zero_ctx = builder.ins().iconst(types::I64, 0);
+                                    let enum_v = lower_operand(&args[0], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let idx_v = lower_operand(&args[1], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                    let idx_i64 = cast_clif_type(&mut builder, idx_v, types::I64);
+                                    let call_inst = builder.ins().call(enum_payload_at_fn, &[zero_ctx, enum_v, idx_i64]);
+                                    let raw_val = builder.inst_results(call_inst)[0];
+                                    if let Place::Local(loc) = destination {
+                                        let target_ty = mir_to_clif_type(&mir_fn.locals[loc.0].ty)?;
+                                        let res_val = if target_ty == types::F64 {
+                                            builder.ins().bitcast(types::F64, MemFlagsData::new(), raw_val)
+                                        } else {
+                                            cast_clif_type(&mut builder, raw_val, target_ty)
+                                        };
+                                        store_local_val(*loc, res_val, &mut builder, &local_vars, &stack_slots)?;
                                     }
                                     let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
                                     builder.ins().jump(succ_bb, &[]);
@@ -9166,15 +9934,27 @@ pub mod jit_engine {
                     | "table.push"
                     | "array.push"
                     | "string.len"
+                    | "string.sub"
+                    | "string.byte"
+                    | "string.byte_at"
+                    | "string.gsub"
+                    | "string.split"
+                    | "string.find"
                     | "tostring"
                     | "map.len"
                     | "map.get"
                     | "map.set"
+                    | "map.has"
+                    | "map.get_unwrap"
+                    | "map.get_unwrap_or"
                     | "map.new"
                     | "enum.tag"
                     | "enum.payload"
+                    | "enum.payload_at"
                     | "enum.new"
                     | "enum.alloc"
+                    | "enum.new2"
+                    | "enum.alloc2"
             )
     }
 
@@ -9347,7 +10127,7 @@ pub mod jit_engine {
 
         // 1. Direct seed for can_deopt_transitively(F)
         for f in refined_functions {
-            let mut deopt = !find_loop_headers(&f.blocks).is_empty();
+            let mut deopt = !crate::mir::opt::Safepoints::find_loop_headers_in_fn(f).is_empty();
             let mut callees = Vec::new();
             for b in &f.blocks {
                 if let Some(Terminator::Call { callee, .. }) = &b.terminator {
@@ -9497,6 +10277,12 @@ pub mod jit_engine {
             }
             (MirType::Enum(n1), MirType::Enum(n2)) if n2 == "Enum" => {
                 Some(MirType::Enum(n1.clone()))
+            }
+            (MirType::Option(inner), MirType::Enum(n))
+            | (MirType::Enum(n), MirType::Option(inner))
+                if n == "Option" =>
+            {
+                Some(MirType::Option(inner.clone()))
             }
             (MirType::Int, MirType::Enum(n)) | (MirType::Enum(n), MirType::Int)
                 if n == "Option" || n == "Result" =>
@@ -10114,6 +10900,22 @@ pub mod jit_engine {
                              }
                          }
                      }
+                     if callee == "map.set" && args.len() == 3 {
+                         if let Operand::Copy(Place::Local(map_loc)) | Operand::Move(Place::Local(map_loc)) = &args[0] {
+                             if map_loc.0 < lattice.len() && !matches!(lattice[map_loc.0], TypeLattice::Conflict(_)) {
+                                 let k_ty = try_operand_type(&args[1], &inferred, struct_layouts)
+                                     .unwrap_or(MirType::Unknown);
+                                 let v_ty = try_operand_type(&args[2], &inferred, struct_layouts)
+                                     .unwrap_or(MirType::Unknown);
+                                 if k_ty != MirType::Unknown || v_ty != MirType::Unknown {
+                                     let expected_map = MirType::Map(Box::new(k_ty), Box::new(v_ty));
+                                     if lattice[map_loc.0].merge_evidence(&expected_map, "map.set kv type") {
+                                         changed = true;
+                                     }
+                                 }
+                             }
+                         }
+                     }
                      if dst.0 < lattice.len() && !matches!(lattice[dst.0], TypeLattice::Conflict(_)) {
                          let call_ret_ty: Option<MirType> = match callee.as_str() {
                              "math.abs" | "abs" => {
@@ -10124,12 +10926,58 @@ pub mod jit_engine {
                                  let is_float = args.iter().any(|a| try_operand_type(a, &inferred, struct_layouts).ok() == Some(MirType::Float));
                                  if is_float { Some(MirType::Float) } else { Some(MirType::Int) }
                              }
-                             "table.len" | "array.len" | "map.len" | "string.len" | "enum.tag" | "enum.payload" => {
+                             "table.len" | "array.len" | "map.len" | "string.len" | "string.byte_at" | "enum.tag" | "enum.payload" => {
                                  Some(MirType::Int)
                              }
-                             "tostring" => Some(MirType::String),
+                             "enum.payload_at" => {
+                                 if locals.get(dst.0).is_some_and(|l| l.ty == MirType::Unknown) {
+                                     Some(MirType::Int)
+                                 } else {
+                                     None
+                                 }
+                             }
+                             "tostring" | "string.sub" => Some(MirType::String),
+                             "string.gsub" | "string.split" => {
+                                 if matches!(locals.get(dst.0).map(|l| &l.ty), Some(MirType::Array(_))) {
+                                     None
+                                 } else {
+                                     Some(MirType::Array(Box::new(MirType::String)))
+                                 }
+                             }
+                             "string.byte" | "string.find" => {
+                                 if locals.get(dst.0).is_some_and(|l| l.ty == MirType::Unknown) {
+                                     Some(MirType::Array(Box::new(MirType::Int)))
+                                 } else {
+                                     None
+                                 }
+                             }
+                             "map.has" => Some(MirType::Bool),
                              "map.get" => {
-                                 Some(MirType::Enum("Option".to_string()))
+                                 if let Some(Ok(MirType::Map(_, v_ty))) =
+                                     args.first().map(|a| try_operand_type(a, &inferred, struct_layouts))
+                                     && *v_ty != MirType::Unknown
+                                 {
+                                     Some(MirType::Option(v_ty))
+                                 } else {
+                                     Some(MirType::Enum("Option".to_string()))
+                                 }
+                             }
+                             "map.get_unwrap" | "map.get_unwrap_or" => {
+                                 if let Some(Ok(MirType::Map(_, v_ty))) =
+                                     args.first().map(|a| try_operand_type(a, &inferred, struct_layouts))
+                                     && *v_ty != MirType::Unknown
+                                 {
+                                     Some(*v_ty)
+                                 } else if let Some(Ok(def_ty)) =
+                                     args.get(2).map(|a| try_operand_type(a, &inferred, struct_layouts))
+                                     && def_ty != MirType::Unknown
+                                 {
+                                     Some(def_ty)
+                                 } else if locals.get(dst.0).is_some_and(|l| l.ty == MirType::Unknown) {
+                                     Some(MirType::Int)
+                                 } else {
+                                     None
+                                 }
                              }
                              "map.set" | "array.push" | "table.push" => {
                                  Some(MirType::Unit)
@@ -10137,7 +10985,7 @@ pub mod jit_engine {
                              "map.new" => {
                                  Some(MirType::Map(Box::new(MirType::Unknown), Box::new(MirType::Unknown)))
                              }
-                             "enum.new" | "enum.alloc" => {
+                             "enum.new" | "enum.alloc" | "enum.new2" | "enum.alloc2" => {
                                  // Derive enum representation from destination or context without hardcoded "Option"
                                  let target_name = match &lattice[dst.0] {
                                      TypeLattice::Concrete(MirType::Enum(n)) if n != "Enum" => Some(n.clone()),
@@ -10291,13 +11139,40 @@ pub mod jit_engine {
             | MirType::Enum(_)
             | MirType::Effect { .. } => Ok(types::I64),
             MirType::Option(inner)
-                if matches!(&**inner, MirType::Struct(name) if !name.is_empty()) =>
+                if matches!(
+                    &**inner,
+                    MirType::Int
+                        | MirType::Bool
+                        | MirType::Float
+                        | MirType::String
+                        | MirType::Enum(_)
+                ) || matches!(&**inner, MirType::Struct(name) if !name.is_empty()) =>
             {
                 Ok(types::I64)
             }
             MirType::Option(_) => Err(MirCraneliftBackendError::UnsupportedType(ty.clone())),
             MirType::Unknown => Err(MirCraneliftBackendError::UnsupportedType(MirType::Unknown)),
             MirType::Function { .. } => Err(MirCraneliftBackendError::UnsupportedType(ty.clone())),
+        }
+    }
+
+    fn mir_type_to_map_operand_tag(ty: &MirType) -> i64 {
+        match ty {
+            MirType::Int => 0,
+            MirType::Bool => 1,
+            MirType::Float => 2,
+            _ => 3,
+        }
+    }
+
+    fn clif_val_to_raw_i64(builder: &mut FunctionBuilder, val: ClifValue) -> ClifValue {
+        let ty = builder.func.dfg.value_type(val);
+        if ty == types::F64 {
+            builder.ins().bitcast(types::I64, MemFlagsData::new(), val)
+        } else if ty == types::I8 {
+            builder.ins().uextend(types::I64, val)
+        } else {
+            val
         }
     }
 
@@ -11034,7 +11909,11 @@ pub mod jit_engine {
         }
 
         // 2. Natural loop bodies per reachable loop header
-        let backedges = find_loop_backedges(&mir_fn.blocks);
+        let backedges: Vec<(usize, usize)> =
+            crate::mir::opt::Safepoints::find_loop_backedges_in_fn(mir_fn)
+                .into_iter()
+                .map(|(f, t)| (f.0, t.0))
+                .collect();
         let mut loop_bodies: hashbrown::HashMap<usize, hashbrown::HashSet<usize>> =
             hashbrown::HashMap::new();
         for &(tail, hdr) in &backedges {
@@ -11622,7 +12501,18 @@ pub mod jit_engine {
                         destination,
                         ..
                     } => {
-                        if matches!(callee.as_str(), "string.len" | "print" | "println") {
+                        if matches!(
+                            callee.as_str(),
+                            "string.len"
+                                | "string.sub"
+                                | "string.byte"
+                                | "string.byte_at"
+                                | "string.find"
+                                | "string.gsub"
+                                | "string.split"
+                                | "print"
+                                | "println"
+                        ) {
                             // Pure non-escaping string readers.
                         } else if callee == "tostring" {
                             // `tostring(string)` returns the same handle verbatim; mark any
@@ -11739,6 +12629,7 @@ pub mod jit_engine {
         stack_slots: &hashbrown::HashMap<usize, StackSlot>,
         locals: &[LocalDecl],
         struct_layouts: &hashbrown::HashMap<String, MirStructLayout>,
+        alloc_array_fn: FuncRef,
         alloc_array_typed_fn: FuncRef,
         alloc_tuple_typed_fn: FuncRef,
         alloc_struct_named_fn: FuncRef,
@@ -12145,11 +13036,14 @@ pub mod jit_engine {
                 } else {
                     elem_ty.as_ref()
                 };
-                let Some(elem_tag) = mir_array_elem_tag(effective_elem_ty) else {
+                let elem_tag_opt = mir_array_elem_tag(effective_elem_ty);
+                let is_struct_elem =
+                    matches!(effective_elem_ty, MirType::Struct(name) if !name.is_empty());
+                if elem_tag_opt.is_none() && !is_struct_elem {
                     return Err(MirCraneliftBackendError::UnsupportedType(
                         effective_elem_ty.clone(),
                     ));
-                };
+                }
                 for elem in elements {
                     let actual_ty = try_operand_type(elem, locals, struct_layouts)?;
                     if actual_ty != *effective_elem_ty {
@@ -12159,8 +13053,12 @@ pub mod jit_engine {
                     }
                 }
                 let len_val = builder.ins().iconst(types::I64, elements.len() as i64);
-                let tag_val = builder.ins().iconst(types::I64, elem_tag);
-                let call_inst = builder.ins().call(alloc_array_typed_fn, &[len_val, tag_val]);
+                let call_inst = if let Some(elem_tag) = elem_tag_opt {
+                    let tag_val = builder.ins().iconst(types::I64, elem_tag);
+                    builder.ins().call(alloc_array_typed_fn, &[len_val, tag_val])
+                } else {
+                    builder.ins().call(alloc_array_fn, &[len_val])
+                };
                 let array_ptr = builder.inst_results(call_inst)[0];
                 emit_status_check(builder, status_fn, emergency_exit_bb);
                 if *effective_elem_ty == MirType::Bool {

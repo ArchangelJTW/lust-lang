@@ -38,6 +38,7 @@ use core::fmt::Write as _;
 use hashbrown::{HashMap, HashSet};
 
 use crate::data::layout::{CanonicalTypeTag, LogicalLayoutV1};
+use crate::data::materialize::struct_def_to_layout;
 use crate::error::{LustError, Result};
 use crate::mir::cranelift_backend::jit_engine::{
     analyze_module_call_effects, apply_module_callee_return_types,
@@ -188,8 +189,8 @@ fn prepare_mir_module_for_rust_aot_with_extern_rets(
     for (k, v) in extern_ret_types {
         callee_rets.entry(k.clone()).or_insert_with(|| v.clone());
     }
-    // Snapshot concrete declared types of `enum.payload` destinations before Cranelift's
-    // lattice refiner (which hardcodes `enum.payload -> Int` and can conflict Float payloads into Unknown).
+    // Snapshot declared local types for `enum.payload` and builtin/string calls before Cranelift's
+    // lattice refiner (which hardcodes unknown callees -> Int and can conflict declared types into Unknown).
     let pre_refine_enum_payload_tys: Vec<Vec<(LocalId, MirType)>> = opt_module
         .functions
         .iter()
@@ -210,6 +211,27 @@ fn prepare_mir_module_for_rust_aot_with_extern_rets(
                 }
             }
             saved
+        })
+        .collect();
+    let pre_refine_named_container_tys: Vec<Vec<(LocalId, MirType)>> = opt_module
+        .functions
+        .iter()
+        .map(|f| {
+            f.locals
+                .iter()
+                .filter_map(|d| {
+                    if d.name.is_some()
+                        && matches!(
+                            d.ty,
+                            MirType::Array(_) | MirType::Map(_, _) | MirType::String | MirType::Option(_)
+                        )
+                    {
+                        Some((d.id, d.ty.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
         })
         .collect();
 
@@ -233,6 +255,21 @@ fn prepare_mir_module_for_rust_aot_with_extern_rets(
             }
         }
     }
+    for (func, saved) in opt_module
+        .functions
+        .iter_mut()
+        .zip(pre_refine_named_container_tys)
+    {
+        for (loc, ty) in saved {
+            if matches!(func.locals[loc.0].ty, MirType::Unknown | MirType::Int) {
+                func.locals[loc.0].ty = ty;
+            }
+        }
+    }
+
+    // 3a. Normalize built-in `LuaValue` pseudo-struct/enum types to `MirType::Unknown` (`AotValue`)
+    //     whenever `LuaValue` is not a user-declared struct/enum layout (`NG-W15-1`).
+    normalize_builtin_luavalue_types(&mut opt_module);
 
     // 3b. Tier 4 type refinement for Map<K, V>, Enum, Closure, and dynamic AotValue locals
     refine_tier4_types(&mut opt_module);
@@ -241,6 +278,78 @@ fn prepare_mir_module_for_rust_aot_with_extern_rets(
     EscapeAnalysis::run_on_module(&mut opt_module);
 
     opt_module
+}
+
+fn normalize_mir_type_luavalue(
+    ty: &mut MirType,
+    known_structs: &HashSet<String>,
+    known_enums: &HashSet<String>,
+) {
+    match ty {
+        MirType::Struct(name) if name == "LuaValue" && !known_structs.contains(name) => {
+            *ty = MirType::Unknown;
+        }
+        MirType::Enum(name) if name == "LuaValue" && !known_enums.contains(name) => {
+            *ty = MirType::Unknown;
+        }
+        MirType::Array(inner) | MirType::Option(inner) => {
+            normalize_mir_type_luavalue(inner, known_structs, known_enums);
+        }
+        MirType::Map(k, v) => {
+            normalize_mir_type_luavalue(k, known_structs, known_enums);
+            normalize_mir_type_luavalue(v, known_structs, known_enums);
+        }
+        MirType::Tuple(elems) => {
+            for e in elems {
+                normalize_mir_type_luavalue(e, known_structs, known_enums);
+            }
+        }
+        MirType::Function {
+            params,
+            return_type,
+        } => {
+            for p in params {
+                normalize_mir_type_luavalue(p, known_structs, known_enums);
+            }
+            normalize_mir_type_luavalue(return_type, known_structs, known_enums);
+        }
+        _ => {}
+    }
+}
+
+fn normalize_builtin_luavalue_types(module: &mut MirModule) {
+    let known_structs: HashSet<String> = module
+        .struct_layouts
+        .iter()
+        .map(|l| l.type_name.clone())
+        .collect();
+    let known_enums: HashSet<String> = module.enum_defs.iter().map(|e| e.name.clone()).collect();
+    for func in &mut module.functions {
+        for p in &mut func.signature.param_types {
+            normalize_mir_type_luavalue(p, &known_structs, &known_enums);
+        }
+        normalize_mir_type_luavalue(&mut func.signature.return_type, &known_structs, &known_enums);
+        for loc in &mut func.locals {
+            normalize_mir_type_luavalue(&mut loc.ty, &known_structs, &known_enums);
+        }
+        for block in &mut func.blocks {
+            for stmt in &mut block.statements {
+                if let Statement::Assign(_, rval, _) = stmt {
+                    match rval {
+                        Rvalue::Aggregate(agg_ty, _) | Rvalue::Cast(_, agg_ty) => {
+                            normalize_mir_type_luavalue(agg_ty, &known_structs, &known_enums);
+                        }
+                        Rvalue::Closure { captures, .. } => {
+                            for (_, _, cty) in captures {
+                                normalize_mir_type_luavalue(cty, &known_structs, &known_enums);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn extract_cleanup_subgraphs(func: &mut MirFunction) -> Vec<(MirCleanupKind, Vec<BasicBlock>)> {
@@ -609,7 +718,10 @@ fn refine_tier4_types(module: &mut MirModule) {
                             }
                         }
                     }
-                    "map.get" | "map.has" | "map.delete" | "map.remove" if args.len() >= 2 => {
+                    "map.get" | "map.get_unwrap" | "map.get_unwrap_or" | "map.has"
+                    | "map.delete" | "map.remove"
+                        if args.len() >= 2 =>
+                    {
                         if let Some(mloc) = operand_exact_local(&args[0])
                             && matches!(func.locals[mloc.0].ty, MirType::Map(_, _))
                         {
@@ -691,8 +803,24 @@ fn refine_tier4_types(module: &mut MirModule) {
             })
             .collect();
 
-        // Collect all locals assigned directly from a `map.get` temp
+        // Collect all locals assigned directly from a `map.get` temp, and inspect single-copy target types
+        // for polymorphic string/builtin calls (e.g. `local res: Array<string> = string.gsub(...)`).
+        let mut copy_dst_types: HashMap<LocalId, MirType> = HashMap::new();
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if let Statement::Assign(
+                    Place::Local(target),
+                    Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))),
+                    _,
+                ) = stmt
+                    && !matches!(func.locals[target.0].ty, MirType::Unknown | MirType::Int)
+                {
+                    copy_dst_types.insert(*src, func.locals[target.0].ty.clone());
+                }
+            }
+        }
         let mut map_get_val_types: HashMap<LocalId, MirType> = HashMap::new();
+        let mut call_dst_propagated: HashMap<LocalId, MirType> = HashMap::new();
         for block in &func.blocks {
             if let Some(Terminator::Call {
                 callee,
@@ -712,6 +840,101 @@ fn refine_tier4_types(module: &mut MirModule) {
                                 map_get_val_types.insert(*dst, (*v_ty).clone());
                             }
                         }
+                    }
+                    "map.get_unwrap" | "map.get_unwrap_or" if !args.is_empty() => {
+                        if let MirType::Map(_, v_ty) = operand_mir_type(&args[0], func) {
+                            func.locals[dst.0].ty = (*v_ty).clone();
+                            map_get_val_types.insert(*dst, (*v_ty).clone());
+                        }
+                    }
+                    "string.sub" | "string.upper" | "string.lower" | "string.trim"
+                    | "string.concat" => {
+                        func.locals[dst.0].ty = MirType::String;
+                        call_dst_propagated.insert(*dst, MirType::String);
+                    }
+                    "string.contains" | "string.starts_with" | "string.ends_with" => {
+                        func.locals[dst.0].ty = MirType::Bool;
+                        call_dst_propagated.insert(*dst, MirType::Bool);
+                    }
+                    "string.split" => {
+                        let resolved = match copy_dst_types.get(dst) {
+                            Some(MirType::Array(inner)) if matches!(**inner, MirType::Unknown) => {
+                                MirType::Array(Box::new(MirType::Unknown))
+                            }
+                            Some(MirType::Unknown) => MirType::Unknown,
+                            _ => MirType::Array(Box::new(MirType::String)),
+                        };
+                        func.locals[dst.0].ty = resolved.clone();
+                        call_dst_propagated.insert(*dst, resolved);
+                    }
+                    "string.gsub" => {
+                        let resolved = match copy_dst_types.get(dst) {
+                            Some(MirType::Array(inner)) if matches!(**inner, MirType::String) => {
+                                MirType::Array(Box::new(MirType::String))
+                            }
+                            Some(MirType::String) => MirType::String,
+                            Some(MirType::Unknown) => MirType::Unknown,
+                            _ => {
+                                if matches!(func.locals[dst.0].ty, MirType::Array(ref inner) if matches!(**inner, MirType::String))
+                                {
+                                    MirType::Array(Box::new(MirType::String))
+                                } else {
+                                    MirType::Array(Box::new(MirType::Unknown))
+                                }
+                            }
+                        };
+                        func.locals[dst.0].ty = resolved.clone();
+                        call_dst_propagated.insert(*dst, resolved);
+                    }
+                    "string.byte" | "string.find" => {
+                        let resolved = match copy_dst_types.get(dst) {
+                            Some(MirType::Array(inner)) if matches!(**inner, MirType::Int) => {
+                                MirType::Array(Box::new(MirType::Int))
+                            }
+                            Some(MirType::Int) => MirType::Int,
+                            Some(MirType::Unknown) => MirType::Unknown,
+                            _ => {
+                                if matches!(func.locals[dst.0].ty, MirType::Array(ref inner) if matches!(**inner, MirType::Int))
+                                {
+                                    MirType::Array(Box::new(MirType::Int))
+                                } else {
+                                    MirType::Array(Box::new(MirType::Unknown))
+                                }
+                            }
+                        };
+                        func.locals[dst.0].ty = resolved.clone();
+                        call_dst_propagated.insert(*dst, resolved);
+                    }
+                    "__mir_unknown_is_int"
+                    | "__mir_unknown_is_float"
+                    | "__mir_unknown_is_string"
+                    | "__mir_unknown_is_bool" => {
+                        func.locals[dst.0].ty = MirType::Bool;
+                        call_dst_propagated.insert(*dst, MirType::Bool);
+                    }
+                    "__mir_unknown_unwrap_int" => {
+                        func.locals[dst.0].ty = MirType::Int;
+                        call_dst_propagated.insert(*dst, MirType::Int);
+                    }
+                    "__mir_unknown_unwrap_float" => {
+                        func.locals[dst.0].ty = MirType::Float;
+                        call_dst_propagated.insert(*dst, MirType::Float);
+                    }
+                    "__mir_unknown_unwrap_string" => {
+                        func.locals[dst.0].ty = MirType::String;
+                        call_dst_propagated.insert(*dst, MirType::String);
+                    }
+                    "__mir_unknown_unwrap_bool" => {
+                        func.locals[dst.0].ty = MirType::Bool;
+                        call_dst_propagated.insert(*dst, MirType::Bool);
+                    }
+                    "__mir_unknown_get_field"
+                    | "__mir_unknown_call_method"
+                    | "Queue"
+                    | "sync.Queue"
+                    | "@std/sync.Queue" => {
+                        func.locals[dst.0].ty = MirType::Unknown;
+                        call_dst_propagated.insert(*dst, MirType::Unknown);
                     }
                     "map.has" | "map.is_empty" => {
                         func.locals[dst.0].ty = MirType::Bool;
@@ -770,8 +993,14 @@ fn refine_tier4_types(module: &mut MirModule) {
                         }
                     }
                     _ => {
+                        // Direct `StructName.decode(raw)` call
+                        if let Some(sname) = callee.strip_suffix(".decode")
+                            && module_fn_rets.get(callee).is_none()
+                        {
+                            func.locals[dst.0].ty = MirType::Struct(sname.to_string());
+                        }
                         // EnumName.Variant or EnumName::Variant constructor calls
-                        if let Some((ename, _vname)) = callee
+                        else if let Some((ename, _vname)) = callee
                             .split_once("::")
                             .or_else(|| callee.split_once('.'))
                             && enum_names.contains(ename)
@@ -780,6 +1009,25 @@ fn refine_tier4_types(module: &mut MirModule) {
                         } else if let Some(ret_ty) = name_to_fn_ret.get(callee) {
                             func.locals[dst.0].ty = ret_ty.clone();
                         }
+                    }
+                }
+            }
+        }
+
+        // Propagate refined string/builtin/unknown call destination types into direct target copies
+        if !call_dst_propagated.is_empty() {
+            for block in &func.blocks {
+                for stmt in &block.statements {
+                    if let Statement::Assign(
+                        Place::Local(dst),
+                        Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))),
+                        _,
+                    ) = stmt
+                        && let Some(cty) = call_dst_propagated.get(src)
+                        && matches!(func.locals[dst.0].ty, MirType::Int | MirType::Unknown)
+                        && !matches!(cty, MirType::Int)
+                    {
+                        func.locals[dst.0].ty = cty.clone();
                     }
                 }
             }
@@ -860,6 +1108,225 @@ fn refine_tier4_types(module: &mut MirModule) {
     // 4. NG-W13-1B: Refine parameterized `EffectYield<OpArg, ResumeVal, BodyRet>` types
     //    and 3-phase `AotScope` builtin destinations across nested continuations & arms.
     refine_nontail_and_scope_types(module);
+
+    // 5. NG-W15-1: Propagate `MirType::Function` to function-typed parameters & local closures
+    //    (e.g. `apply_twice(f: function(int): int, x: int): int` in `BENCH-NG-04` where
+    //    `mir_type_from_ast` initially lowered `TypeKind::Function` to `MirType::Int`).
+    refine_function_typed_params(module);
+}
+
+fn refine_function_typed_params(module: &mut MirModule) {
+    let module_fn_names: HashSet<String> = module
+        .functions
+        .iter()
+        .map(|f| f.signature.name.clone())
+        .collect();
+
+    // Pass A: Propagate `MirType::Function` from call sites (direct module calls AND local closure
+    // calls like `apply_twice(step_fn, acc)`) into callee parameters.
+    let mut param_updates: HashMap<(String, usize), MirType> = HashMap::new();
+    for func in &module.functions {
+        // Map local variable name -> (lifted_func_name, n_captures) for closures defined in `func`
+        let mut local_closure_target: HashMap<String, (String, usize)> = HashMap::new();
+        let mut local_id_to_closure: HashMap<LocalId, (String, usize)> = HashMap::new();
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if let Statement::Assign(
+                    Place::Local(dst),
+                    Rvalue::Closure {
+                        func_name,
+                        captures,
+                    },
+                    _,
+                ) = stmt
+                {
+                    local_id_to_closure.insert(*dst, (func_name.clone(), captures.len()));
+                    if let Some(n) = &func.locals[dst.0].name {
+                        local_closure_target.insert(n.clone(), (func_name.clone(), captures.len()));
+                    }
+                }
+            }
+        }
+        for _ in 0..3 {
+            for block in &func.blocks {
+                for stmt in &block.statements {
+                    if let Statement::Assign(
+                        Place::Local(dst),
+                        Rvalue::Use(
+                            Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)),
+                        ),
+                        _,
+                    ) = stmt
+                        && let Some(target) = local_id_to_closure.get(src).cloned()
+                    {
+                        local_id_to_closure.insert(*dst, target.clone());
+                        if let Some(n) = &func.locals[dst.0].name {
+                            local_closure_target.insert(n.clone(), target);
+                        }
+                    }
+                }
+            }
+        }
+
+        for block in &func.blocks {
+            if let Some(Terminator::Call { callee, args, .. }) = &block.terminator {
+                if module_fn_names.contains(callee.as_str()) {
+                    for (ai, arg) in args.iter().enumerate() {
+                        let aty = operand_mir_type(arg, func);
+                        if matches!(aty, MirType::Function { .. }) {
+                            param_updates.entry((callee.clone(), ai)).or_insert(aty);
+                        }
+                    }
+                } else if let Some((lifted_name, n_caps)) = local_closure_target.get(callee) {
+                    for (ai, arg) in args.iter().enumerate() {
+                        let aty = operand_mir_type(arg, func);
+                        if matches!(aty, MirType::Function { .. }) {
+                            param_updates
+                                .entry((lifted_name.clone(), n_caps + ai))
+                                .or_insert(aty);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for func in &mut module.functions {
+        let fname = func.signature.name.clone();
+        for (pi, &pid) in func.params.iter().enumerate() {
+            if let Some(new_ty) = param_updates.get(&(fname.clone(), pi))
+                && matches!(func.locals[pid.0].ty, MirType::Int | MirType::Unknown)
+            {
+                func.locals[pid.0].ty = new_ty.clone();
+                if pi < func.signature.param_types.len() {
+                    func.signature.param_types[pi] = new_ty.clone();
+                }
+            }
+        }
+    }
+
+    // Pass B: Infer `MirType::Function` for any remaining local/parameter invoked directly by name
+    // (`Terminator::Call { callee: local_name, .. }`) whose type is still `MirType::Int`.
+    for func in &mut module.functions {
+        let mut inferred: Vec<(LocalId, MirType)> = Vec::new();
+        for block in &func.blocks {
+            if let Some(Terminator::Call {
+                callee,
+                args,
+                destination,
+                ..
+            }) = &block.terminator
+            {
+                if module_fn_names.contains(callee.as_str()) {
+                    continue;
+                }
+                if let Some(decl) = func
+                    .locals
+                    .iter()
+                    .find(|d| d.name.as_deref() == Some(callee.as_str()))
+                    && matches!(decl.ty, MirType::Int)
+                {
+                    let arg_tys: Vec<MirType> = args
+                        .iter()
+                        .map(|a| operand_mir_type(a, func))
+                        .collect();
+                    let ret_ty = match destination {
+                        Place::Local(d) => func.locals[d.0].ty.clone(),
+                        _ => MirType::Int,
+                    };
+                    inferred.push((
+                        decl.id,
+                        MirType::Function {
+                            params: arg_tys,
+                            return_type: Box::new(ret_ty),
+                        },
+                    ));
+                }
+            }
+        }
+        for (loc, fn_ty) in inferred {
+            func.locals[loc.0].ty = fn_ty.clone();
+            if let Some(pi) = func.params.iter().position(|&p| p == loc)
+                && pi < func.signature.param_types.len()
+            {
+                func.signature.param_types[pi] = fn_ty;
+            }
+        }
+    }
+
+    // Pass C: Refresh `Rvalue::Closure` local types and copies in callers so closure `params`
+    // match the updated lifted function parameter types (e.g. `apply_twice`).
+    let lifted_sigs: HashMap<String, (Vec<MirType>, MirType)> = module
+        .functions
+        .iter()
+        .map(|f| {
+            let ptys: Vec<MirType> = f
+                .params
+                .iter()
+                .map(|pid| f.locals[pid.0].ty.clone())
+                .collect();
+            (
+                f.signature.name.clone(),
+                (ptys, f.signature.return_type.clone()),
+            )
+        })
+        .collect();
+
+    for func in &mut module.functions {
+        let mut updated_closures = false;
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if let Statement::Assign(
+                    Place::Local(dst),
+                    Rvalue::Closure {
+                        func_name,
+                        captures,
+                    },
+                    _,
+                ) = stmt
+                    && let Some((all_params, ret_ty)) = lifted_sigs.get(func_name)
+                {
+                    let explicit_params: Vec<MirType> =
+                        all_params.iter().skip(captures.len()).cloned().collect();
+                    let new_fn_ty = MirType::Function {
+                        params: explicit_params,
+                        return_type: Box::new(ret_ty.clone()),
+                    };
+                    if func.locals[dst.0].ty != new_fn_ty
+                        && matches!(func.locals[dst.0].ty, MirType::Function { .. })
+                    {
+                        func.locals[dst.0].ty = new_fn_ty;
+                        updated_closures = true;
+                    }
+                }
+            }
+        }
+        if updated_closures {
+            for _ in 0..4 {
+                let local_tys: Vec<MirType> = func.locals.iter().map(|d| d.ty.clone()).collect();
+                for block in &func.blocks {
+                    for stmt in &block.statements {
+                        if let Statement::Assign(
+                            Place::Local(dst),
+                            Rvalue::Use(
+                                Operand::Copy(Place::Local(src))
+                                | Operand::Move(Place::Local(src)),
+                            ),
+                            _,
+                        ) = stmt
+                            && matches!(local_tys[src.0], MirType::Function { .. })
+                            && matches!(
+                                local_tys[dst.0],
+                                MirType::Function { .. } | MirType::Unknown | MirType::Int
+                            )
+                        {
+                            func.locals[dst.0].ty = local_tys[src.0].clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn trace_mir_closure_and_caps(
@@ -1490,8 +1957,11 @@ pub fn emit_rust_from_mir_with_interop(
     interop: &RustInteropOptions,
 ) -> Result<String> {
     let ast_meta = AstEffectsMetadata::extract(ast_items);
-    let extern_ret_types = build_extern_return_type_map(module, &ast_meta);
-    let prepared = prepare_mir_module_for_rust_aot_with_extern_rets(module, &extern_ret_types);
+    let mut module_with_layouts = module.clone();
+    register_ast_struct_layouts_in_module(&mut module_with_layouts, ast_items);
+    let extern_ret_types = build_extern_return_type_map(&module_with_layouts, &ast_meta);
+    let prepared =
+        prepare_mir_module_for_rust_aot_with_extern_rets(&module_with_layouts, &extern_ret_types);
     let ctx = ModuleEmitContext::analyze(&prepared, opts, interop, ast_meta);
 
     let mut out = String::with_capacity(8192);
@@ -1499,6 +1969,7 @@ pub fn emit_rust_from_mir_with_interop(
     emit_struct_definitions(&mut out, &ctx);
     emit_enum_definitions(&mut out, &ctx);
     emit_trait_and_service_definitions(&mut out, &ctx);
+    emit_suite_v2_runtime_helpers(&mut out, &prepared, &ctx);
 
     for func in &prepared.functions {
         emit_function(&mut out, func, &ctx)?;
@@ -1513,6 +1984,27 @@ pub fn emit_rust_from_mir_with_interop(
     }
 
     Ok(out)
+}
+
+fn register_ast_struct_layouts_in_module(module: &mut MirModule, items: &[crate::ast::Item]) {
+    for item in items {
+        match &item.kind {
+            crate::ast::ItemKind::Struct(def) => {
+                if !module
+                    .struct_layouts
+                    .iter()
+                    .any(|l| l.type_name == def.name)
+                {
+                    let layout = struct_def_to_layout(def);
+                    module.register_struct_layout(MirStructLayout::from(&layout));
+                }
+            }
+            crate::ast::ItemKind::Module { items: sub, .. } => {
+                register_ast_struct_layouts_in_module(module, sub);
+            }
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1596,6 +2088,9 @@ struct FnMeta {
     local_storage: Vec<LocalStorage>,
     /// Locals referenced inside any `cleanup_blocks` entry of this function.
     cleanup_captured: HashSet<LocalId>,
+    /// True when `!can_fail`, all cleanup blocks are `Defer` (no `ErrDefer`), and every
+    /// return block already has the LIFO `AstLowering`-inlined defer suffix (`NG-W15-1`).
+    keep_inlined_defers_direct: bool,
     return_type: MirType,
 }
 
@@ -1628,6 +2123,8 @@ struct ModuleEmitContext<'m> {
     interop: &'m RustInteropOptions,
     ast_meta: AstEffectsMetadata,
     structs: BTreeMap<String, StructMeta>,
+    /// Deterministic `1..=N` struct runtime type IDs for `AotValue::Struct` packing/dispatch (`NG-W15-1`).
+    struct_type_ids: BTreeMap<String, u32>,
     enums: BTreeMap<String, EnumMeta>,
     fn_metas: HashMap<String, FnMeta>,
     /// Lifted body thunks of non-tail `handle..with` returning `EffectYield<OpArg, ResumeVal, BodyRet>` (`NG-W13-1B`).
@@ -1647,6 +2144,10 @@ impl<'m> ModuleEmitContext<'m> {
         ast_meta: AstEffectsMetadata,
     ) -> Self {
         let structs = analyze_structs(module);
+        let mut struct_type_ids = BTreeMap::new();
+        for (idx, sname) in structs.keys().enumerate() {
+            struct_type_ids.insert(sname.clone(), (idx + 1) as u32);
+        }
         let enums = analyze_enums(module, &structs);
         let module_uses_arena = structs.values().any(|s| s.is_cyclic);
 
@@ -1782,32 +2283,76 @@ impl<'m> ModuleEmitContext<'m> {
         //            transitively share mutated scalar locals as `Rc<Cell<T>>` and mutated
         //            non-Copy locals (e.g. `String`) as `Rc<RefCell<T>>` across enclosing
         //            functions and nested/sibling closures (`NG-W13-1A` + `NG-W13-1B`).
+        //            Fast path (`NG-W15-1`, `F-02`): if `func` only invokes direct synchronous
+        //            `__lust_run_sync` thunks (no handlers/scopes/providers) and a captured scalar
+        //            local is not mutated by the lifted thunk, keep it `LocalStorage::Direct` and
+        //            pass it `ByValue` at the call site.
         for _ in 0..4 {
             let mut effect_cap_changed = false;
             for func in &module.functions {
-                let has_effect_or_scope = func.blocks.iter().any(|b| {
-                    matches!(
-                        &b.terminator,
-                        Some(Terminator::Call { callee, .. })
-                            if matches!(
-                                callee.as_str(),
-                                "__lust_handle"
-                                    | "__lust_nontail_handle"
-                                    | "__lust_yield_op"
-                                    | "__lust_scoped"
-                                    | "__lust_scope_finalizer"
-                                    | "__lust_scope_spawn"
-                                    | "__lust_run_sync"
-                            )
-                    )
-                });
+                let mut has_non_run_sync_effect = false;
+                let mut has_any_run_sync = false;
+                let mut all_run_sync_direct = true;
+                let mut direct_run_sync_closures: HashSet<String> = HashSet::new();
+                for b in &func.blocks {
+                    if let Some(Terminator::Call { callee, args, .. }) = &b.terminator {
+                        match callee.as_str() {
+                            "__lust_handle"
+                            | "__lust_nontail_handle"
+                            | "__lust_yield_op"
+                            | "__lust_scoped"
+                            | "__lust_scope_finalizer"
+                            | "__lust_scope_spawn"
+                            | "__lust_provide" => {
+                                has_non_run_sync_effect = true;
+                            }
+                            "__lust_run_sync" => {
+                                has_any_run_sync = true;
+                                if args.len() == 1
+                                    && let Some(tfn) =
+                                        trace_direct_closure_fn_name_in_mir(func, &args[0])
+                                {
+                                    direct_run_sync_closures.insert(tfn);
+                                } else {
+                                    all_run_sync_direct = false;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let has_effect_or_scope = has_non_run_sync_effect || has_any_run_sync;
                 if !has_effect_or_scope {
                     continue;
                 }
+                let direct_run_sync_only =
+                    !has_non_run_sync_effect && has_any_run_sync && all_run_sync_direct;
+
                 let enclosing_name = func.signature.name.clone();
                 let mut mutated_scalar_caps: HashSet<LocalId> = HashSet::new();
                 let mut mutated_noncopy_caps: HashSet<LocalId> = HashSet::new();
                 let mut all_closure_caps: Vec<(String, usize, LocalId, MirType)> = Vec::new();
+                let mut captured_by_non_direct_closure: HashSet<LocalId> = HashSet::new();
+                for block in &func.blocks {
+                    for stmt in &block.statements {
+                        if let Statement::Assign(
+                            _,
+                            Rvalue::Closure {
+                                func_name,
+                                captures,
+                            },
+                            _,
+                        ) = stmt
+                            && !direct_run_sync_closures.contains(func_name)
+                        {
+                            for (_, cap_op, _) in captures {
+                                if let Some(loc) = operand_exact_local(cap_op) {
+                                    captured_by_non_direct_closure.insert(loc);
+                                }
+                            }
+                        }
+                    }
+                }
                 for block in &func.blocks {
                     for stmt in &block.statements {
                         if let Statement::Assign(
@@ -1851,7 +2396,16 @@ impl<'m> ModuleEmitContext<'m> {
                                         .and_then(|v| v.get(loc.0))
                                         .is_some_and(|s| *s != LocalStorage::Direct);
                                     let enclosing_mutates = local_is_mutated_in_fn(func, loc);
-                                    if lifted_mutates || enclosing_mutates || enclosing_already_shared
+                                    let can_keep_direct_scalar = direct_run_sync_only
+                                        && is_scalar
+                                        && direct_run_sync_closures.contains(func_name)
+                                        && !lifted_mutates
+                                        && !enclosing_already_shared
+                                        && !captured_by_non_direct_closure.contains(&loc);
+                                    if !can_keep_direct_scalar
+                                        && (lifted_mutates
+                                            || enclosing_mutates
+                                            || enclosing_already_shared)
                                     {
                                         if is_scalar {
                                             mutated_scalar_caps.insert(loc);
@@ -1941,49 +2495,19 @@ impl<'m> ModuleEmitContext<'m> {
             }
         }
 
-        // 2b. Cleanup block (`defer` / `errdefer`) capture analysis
-        for func in &module.functions {
-            if func.cleanup_blocks.is_empty() {
-                continue;
-            }
-            let captured = collect_cleanup_captured_locals(func);
-            let fname = &func.signature.name;
-            let param_set: HashSet<LocalId> = func.params.iter().copied().collect();
-            for &loc in &captured {
-                let ty = &func.locals[loc.0].ty;
-                let is_copy_scalar =
-                    matches!(ty, MirType::Int | MirType::Float | MirType::Bool);
-                let is_cyclic = matches!(ty, MirType::Struct(sn) if structs.get(sn).is_some_and(|s| s.is_cyclic));
-                if is_cyclic || matches!(ty, MirType::Unit) {
-                    continue;
-                }
-                if param_set.contains(&loc) {
-                    if let Some(pi) = func.params.iter().position(|&p| p == loc) {
-                        if is_copy_scalar && local_is_mutated_in_fn(func, loc) {
-                            if let Some(st) = local_storage_map.get_mut(fname) {
-                                st[loc.0] = LocalStorage::RcCell;
-                            }
-                        } else if matches!(ty, MirType::Array(_) | MirType::Struct(_)) {
-                            if let Some(pms) = param_modes_map.get_mut(fname) {
-                                pms[pi] = ParamMode::RcRefCell;
-                            }
-                            if let Some(st) = local_storage_map.get_mut(fname) {
-                                st[loc.0] = LocalStorage::RcRefCell;
-                            }
-                        }
-                    }
-                } else if let Some(st) = local_storage_map.get_mut(fname) {
-                    if is_copy_scalar {
-                        if st[loc.0] == LocalStorage::Direct {
-                            st[loc.0] = LocalStorage::RcCell;
-                        }
-                    } else {
-                        st[loc.0] = LocalStorage::RcRefCell;
-                    }
-                }
-            }
-            cleanup_captured_map.insert(fname.clone(), captured);
-        }
+        // 2b + 2c + 2d + 3: Monotonic convergence between infallible inlined `Defer` fast path
+        // (`NG-W15-1`, `F-02`) and cleanup-guard `RcCell`/`RcRefCell` promotion.
+        let (nontail_body_metas, nontail_arm_metas) = analyze_nontail_effect_metas(module);
+        let mut direct_defer_candidates: HashSet<String> = module
+            .functions
+            .iter()
+            .filter(|f| {
+                !nontail_body_metas.contains_key(&f.signature.name)
+                    && !nontail_arm_metas.contains_key(&f.signature.name)
+                    && function_inlined_defers_cover_all_returns(f)
+            })
+            .map(|f| f.signature.name.clone())
+            .collect();
 
         // 2c. Local Aliasing Analysis (Hazard 12: `local b = a` on Array or mutable Struct)
         for func in &module.functions {
@@ -2001,169 +2525,238 @@ impl<'m> ModuleEmitContext<'m> {
             }
         }
 
-        // 2d. Propagate ParamMode::RcRefCell if a user function is called with >= 2 RcRefCell args
-        //     of the same type (preventing overlapping RefMut/Ref guards across the call boundary)
-        //     OR if a callee expects RcRefCell and caller passes a local.
-        for _ in 0..3 {
-            let mut changed = false;
+        let mut promoted_cleanup_fns: HashSet<String> = HashSet::new();
+        let mut can_fail_map: HashMap<String, bool> = HashMap::new();
+        let mut needs_ctx_map: HashMap<String, bool> = HashMap::new();
+        let mut needs_alloc_map: HashMap<String, bool> = HashMap::new();
+        let mut needs_arena_map: HashMap<String, bool> = HashMap::new();
+
+        loop {
+            // 2b. Cleanup block (`defer` / `errdefer`) capture analysis for functions that need guards
             for func in &module.functions {
-                let caller_st = local_storage_map[&func.signature.name].clone();
-                for block in &func.blocks {
-                    if let Some(Terminator::Call { callee, args, .. }) = &block.terminator
-                        && let Some(callee_fn) = fn_by_name.get(callee.as_str())
-                    {
-                        // Count RcRefCell args and check whether any sibling arg is a Closure/Effect
-                        // (which could re-entrantly borrow the same RcRefCell during the call).
-                        let mut rc_arg_indices: Vec<usize> = Vec::new();
-                        let mut has_callable_arg = false;
-                        for (ai, arg) in args.iter().enumerate() {
-                            if let Some(loc) = operand_exact_local(arg)
-                                && caller_st.get(loc.0).copied() == Some(LocalStorage::RcRefCell)
-                            {
-                                rc_arg_indices.push(ai);
-                            }
-                            if matches!(
-                                operand_mir_type(arg, func),
-                                MirType::Function { .. } | MirType::Effect { .. } | MirType::Unknown
-                            ) {
-                                has_callable_arg = true;
+                if func.cleanup_blocks.is_empty() {
+                    continue;
+                }
+                let fname = &func.signature.name;
+                if direct_defer_candidates.contains(fname) || promoted_cleanup_fns.contains(fname) {
+                    continue;
+                }
+                promoted_cleanup_fns.insert(fname.clone());
+                let captured = collect_cleanup_captured_locals(func);
+                let param_set: HashSet<LocalId> = func.params.iter().copied().collect();
+                for &loc in &captured {
+                    let ty = &func.locals[loc.0].ty;
+                    let is_copy_scalar =
+                        matches!(ty, MirType::Int | MirType::Float | MirType::Bool);
+                    let is_cyclic = matches!(ty, MirType::Struct(sn) if structs.get(sn).is_some_and(|s| s.is_cyclic));
+                    if is_cyclic || matches!(ty, MirType::Unit) {
+                        continue;
+                    }
+                    if param_set.contains(&loc) {
+                        if let Some(pi) = func.params.iter().position(|&p| p == loc) {
+                            if is_copy_scalar && local_is_mutated_in_fn(func, loc) {
+                                if let Some(st) = local_storage_map.get_mut(fname) {
+                                    st[loc.0] = LocalStorage::RcCell;
+                                }
+                            } else if matches!(ty, MirType::Array(_) | MirType::Struct(_)) {
+                                if let Some(pms) = param_modes_map.get_mut(fname) {
+                                    pms[pi] = ParamMode::RcRefCell;
+                                }
+                                if let Some(st) = local_storage_map.get_mut(fname) {
+                                    st[loc.0] = LocalStorage::RcRefCell;
+                                }
                             }
                         }
-                        if rc_arg_indices.len() >= 2 || (!rc_arg_indices.is_empty() && has_callable_arg) {
-                            for &ai in &rc_arg_indices {
-                                if let Some(pms) = param_modes_map.get_mut(callee)
-                                    && ai < pms.len()
-                                    && matches!(
-                                        pms[ai],
-                                        ParamMode::MutVec
-                                            | ParamMode::RefSlice
-                                            | ParamMode::MutRefStruct
-                                            | ParamMode::RefStruct
-                                    )
+                    } else if let Some(st) = local_storage_map.get_mut(fname) {
+                        if is_copy_scalar {
+                            if st[loc.0] == LocalStorage::Direct {
+                                st[loc.0] = LocalStorage::RcCell;
+                            }
+                        } else {
+                            st[loc.0] = LocalStorage::RcRefCell;
+                        }
+                    }
+                }
+                cleanup_captured_map.insert(fname.clone(), captured);
+            }
+
+            // 2d. Propagate ParamMode::RcRefCell if a user function is called with >= 2 RcRefCell args
+            //     of the same type (preventing overlapping RefMut/Ref guards across the call boundary)
+            //     OR if a callee expects RcRefCell and caller passes a local.
+            for _ in 0..3 {
+                let mut changed = false;
+                for func in &module.functions {
+                    let caller_st = local_storage_map[&func.signature.name].clone();
+                    for block in &func.blocks {
+                        if let Some(Terminator::Call { callee, args, .. }) = &block.terminator
+                            && let Some(callee_fn) = fn_by_name.get(callee.as_str())
+                        {
+                            // Count RcRefCell args and check whether any sibling arg is a Closure/Effect
+                            // (which could re-entrantly borrow the same RcRefCell during the call).
+                            let mut rc_arg_indices: Vec<usize> = Vec::new();
+                            let mut has_callable_arg = false;
+                            for (ai, arg) in args.iter().enumerate() {
+                                if let Some(loc) = operand_exact_local(arg)
+                                    && caller_st.get(loc.0).copied() == Some(LocalStorage::RcRefCell)
                                 {
-                                    pms[ai] = ParamMode::RcRefCell;
-                                    if let Some(&pid) = callee_fn.params.get(ai)
-                                        && let Some(cst) = local_storage_map.get_mut(callee)
+                                    rc_arg_indices.push(ai);
+                                }
+                                if matches!(
+                                    operand_mir_type(arg, func),
+                                    MirType::Function { .. } | MirType::Effect { .. } | MirType::Unknown
+                                ) {
+                                    has_callable_arg = true;
+                                }
+                            }
+                            if rc_arg_indices.len() >= 2
+                                || (!rc_arg_indices.is_empty() && has_callable_arg)
+                            {
+                                for &ai in &rc_arg_indices {
+                                    if let Some(pms) = param_modes_map.get_mut(callee)
+                                        && ai < pms.len()
+                                        && matches!(
+                                            pms[ai],
+                                            ParamMode::MutVec
+                                                | ParamMode::RefSlice
+                                                | ParamMode::MutRefStruct
+                                                | ParamMode::RefStruct
+                                        )
                                     {
-                                        cst[pid.0] = LocalStorage::RcRefCell;
+                                        pms[ai] = ParamMode::RcRefCell;
+                                        if let Some(&pid) = callee_fn.params.get(ai)
+                                            && let Some(cst) = local_storage_map.get_mut(callee)
+                                        {
+                                            cst[pid.0] = LocalStorage::RcRefCell;
+                                        }
+                                        changed = true;
                                     }
-                                    changed = true;
                                 }
                             }
                         }
                     }
                 }
-            }
-            if !changed {
-                break;
-            }
-        }
-
-        // Ensure param_modes::RcRefCell / RcCell agrees with local_storage for every param
-        for func in &module.functions {
-            let fname = &func.signature.name;
-            let pms = &param_modes_map[fname];
-            let st = local_storage_map.get_mut(fname).unwrap();
-            for (pi, &pid) in func.params.iter().enumerate() {
-                match pms[pi] {
-                    ParamMode::RcCell => st[pid.0] = LocalStorage::RcCell,
-                    ParamMode::RcRefCell => st[pid.0] = LocalStorage::RcRefCell,
-                    _ => {}
+                if !changed {
+                    break;
                 }
             }
-        }
 
-        // Third pass: determine local requirements (can_fail, needs_ctx, needs_alloc, needs_arena)
-        let mut can_fail_map: HashMap<String, bool> = HashMap::new();
-        let mut needs_ctx_map: HashMap<String, bool> = HashMap::new();
-        let mut needs_alloc_map: HashMap<String, bool> = HashMap::new();
-        let mut needs_arena_map: HashMap<String, bool> = HashMap::new();
-        let mut direct_callees: HashMap<String, Vec<String>> = HashMap::new();
-
-        for func in &module.functions {
-            let name = &func.signature.name;
-            let cranelift_can_fail = call_effects
-                .get(name)
-                .map(|&(_, fl)| fl)
-                .unwrap_or(true);
-            let pmodes = &param_modes_map[name];
-            let lstorage = &local_storage_map[name];
-
-            let local_reqs = scan_function_local_requirements(
-                func,
-                opts,
-                &structs,
-                &enums,
-                pmodes,
-                lstorage,
-                module,
-            );
-            let has_rc_refcell = lstorage.iter().any(|s| *s == LocalStorage::RcRefCell);
-            let fn_can_fail = local_reqs.can_fail
-                || has_rc_refcell
-                || (gas_active && cranelift_can_fail)
-                || (opts.max_memory_bytes.is_some()
-                    && (local_reqs.needs_alloc
-                        || local_reqs.needs_arena
-                        || local_reqs.allocates_string));
-
-            can_fail_map.insert(name.clone(), fn_can_fail);
-            needs_ctx_map.insert(name.clone(), local_reqs.needs_ctx);
-            needs_alloc_map.insert(name.clone(), local_reqs.needs_alloc);
-            needs_arena_map.insert(name.clone(), local_reqs.needs_arena);
-            direct_callees.insert(name.clone(), local_reqs.user_callees);
-        }
-
-        // Propagate can_fail, needs_ctx, needs_alloc, needs_arena transitively over call graph
-        let fn_names: Vec<String> = module
-            .functions
-            .iter()
-            .map(|f| f.signature.name.clone())
-            .collect();
-        loop {
-            let mut changed = false;
-            for caller in &fn_names {
-                let callees = match direct_callees.get(caller) {
-                    Some(c) => c.clone(),
-                    None => continue,
-                };
-                for callee in &callees {
-                    if let Some(&cf) = can_fail_map.get(callee)
-                        && cf
-                        && !can_fail_map[caller]
-                    {
-                        can_fail_map.insert(caller.clone(), true);
-                        changed = true;
-                    }
-                    if let Some(&nc) = needs_ctx_map.get(callee)
-                        && nc
-                        && !needs_ctx_map[caller]
-                    {
-                        needs_ctx_map.insert(caller.clone(), true);
-                        changed = true;
-                    }
-                    if let Some(&na) = needs_alloc_map.get(callee)
-                        && na
-                        && !needs_alloc_map[caller]
-                    {
-                        needs_alloc_map.insert(caller.clone(), true);
-                        changed = true;
-                    }
-                    if let Some(&nar) = needs_arena_map.get(callee)
-                        && nar
-                        && !needs_arena_map[caller]
-                    {
-                        needs_arena_map.insert(caller.clone(), true);
-                        changed = true;
+            // Ensure param_modes::RcRefCell / RcCell agrees with local_storage for every param
+            for func in &module.functions {
+                let fname = &func.signature.name;
+                let pms = &param_modes_map[fname];
+                let st = local_storage_map.get_mut(fname).unwrap();
+                for (pi, &pid) in func.params.iter().enumerate() {
+                    match pms[pi] {
+                        ParamMode::RcCell => st[pid.0] = LocalStorage::RcCell,
+                        ParamMode::RcRefCell => st[pid.0] = LocalStorage::RcRefCell,
+                        _ => {}
                     }
                 }
             }
-            if !changed {
+
+            // Third pass: determine local requirements (can_fail, needs_ctx, needs_alloc, needs_arena)
+            can_fail_map.clear();
+            needs_ctx_map.clear();
+            needs_alloc_map.clear();
+            needs_arena_map.clear();
+            let mut direct_callees: HashMap<String, Vec<String>> = HashMap::new();
+
+            for func in &module.functions {
+                let name = &func.signature.name;
+                let cranelift_can_fail = call_effects
+                    .get(name)
+                    .map(|&(_, fl)| fl)
+                    .unwrap_or(true);
+                let pmodes = &param_modes_map[name];
+                let lstorage = &local_storage_map[name];
+
+                let local_reqs = scan_function_local_requirements(
+                    func,
+                    opts,
+                    &structs,
+                    &enums,
+                    pmodes,
+                    lstorage,
+                    module,
+                );
+                let has_rc_refcell = lstorage.iter().any(|s| *s == LocalStorage::RcRefCell);
+                let fn_can_fail = local_reqs.can_fail
+                    || has_rc_refcell
+                    || (gas_active && cranelift_can_fail)
+                    || (opts.max_memory_bytes.is_some()
+                        && (local_reqs.needs_alloc
+                            || local_reqs.needs_arena
+                            || local_reqs.allocates_string));
+
+                can_fail_map.insert(name.clone(), fn_can_fail);
+                needs_ctx_map.insert(name.clone(), local_reqs.needs_ctx);
+                needs_alloc_map.insert(name.clone(), local_reqs.needs_alloc);
+                needs_arena_map.insert(name.clone(), local_reqs.needs_arena);
+                direct_callees.insert(name.clone(), local_reqs.user_callees);
+            }
+
+            // Propagate can_fail, needs_ctx, needs_alloc, needs_arena transitively over call graph
+            let fn_names: Vec<String> = module
+                .functions
+                .iter()
+                .map(|f| f.signature.name.clone())
+                .collect();
+            loop {
+                let mut changed = false;
+                for caller in &fn_names {
+                    let callees = match direct_callees.get(caller) {
+                        Some(c) => c.clone(),
+                        None => continue,
+                    };
+                    for callee in &callees {
+                        if let Some(&cf) = can_fail_map.get(callee)
+                            && cf
+                            && !can_fail_map[caller]
+                        {
+                            can_fail_map.insert(caller.clone(), true);
+                            changed = true;
+                        }
+                        if let Some(&nc) = needs_ctx_map.get(callee)
+                            && nc
+                            && !needs_ctx_map[caller]
+                        {
+                            needs_ctx_map.insert(caller.clone(), true);
+                            changed = true;
+                        }
+                        if let Some(&na) = needs_alloc_map.get(callee)
+                            && na
+                            && !needs_alloc_map[caller]
+                        {
+                            needs_alloc_map.insert(caller.clone(), true);
+                            changed = true;
+                        }
+                        if let Some(&nar) = needs_arena_map.get(callee)
+                            && nar
+                            && !needs_arena_map[caller]
+                        {
+                            needs_arena_map.insert(caller.clone(), true);
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+
+            // Disqualify any direct-defer candidate that turned out to be fallible and re-run 2b/2d/3
+            let disqualified: Vec<String> = direct_defer_candidates
+                .iter()
+                .filter(|fname| can_fail_map.get(*fname).copied().unwrap_or(true))
+                .cloned()
+                .collect();
+            if disqualified.is_empty() {
                 break;
             }
+            for fname in disqualified {
+                direct_defer_candidates.remove(&fname);
+            }
         }
-
-        let (nontail_body_metas, nontail_arm_metas) = analyze_nontail_effect_metas(module);
 
         let mut fn_metas = HashMap::new();
         for func in &module.functions {
@@ -2174,17 +2767,21 @@ impl<'m> ModuleEmitContext<'m> {
             let cleanup_captured = cleanup_captured_map.remove(&name).unwrap_or_default();
             let is_nontail_fn =
                 nontail_body_metas.contains_key(&name) || nontail_arm_metas.contains_key(&name);
+            let can_fail = can_fail_map[&name] || is_nontail_fn;
+            let keep_inlined_defers_direct =
+                !can_fail && direct_defer_candidates.contains(&name);
             fn_metas.insert(
                 name.clone(),
                 FnMeta {
                     rust_name,
-                    can_fail: can_fail_map[&name] || is_nontail_fn,
+                    can_fail,
                     needs_ctx: needs_ctx_map[&name] || is_nontail_fn,
                     needs_alloc: needs_alloc_map[&name],
                     needs_arena: needs_arena_map[&name],
                     param_modes,
                     local_storage,
                     cleanup_captured,
+                    keep_inlined_defers_direct,
                     return_type: func.signature.return_type.clone(),
                 },
             );
@@ -2196,6 +2793,7 @@ impl<'m> ModuleEmitContext<'m> {
             interop,
             ast_meta,
             structs,
+            struct_type_ids,
             enums,
             fn_metas,
             nontail_body_metas,
@@ -3146,6 +3744,178 @@ fn local_is_mutated_in_fn(func: &MirFunction, target: LocalId) -> bool {
     false
 }
 
+/// Returns `true` if `src` can be mutated along any CFG path starting strictly after
+/// `(def_bb, def_sidx)` (`dst = Copy/Move(src)`) and reaching a use of `dst` without
+/// re-executing `(def_bb, def_sidx)` (`NG-W15-1`).
+fn is_src_mutated_while_dst_live(
+    func: &MirFunction,
+    src: LocalId,
+    dst: LocalId,
+    def_bb: BlockId,
+    def_sidx: usize,
+    fn_metas: &HashMap<String, FnMeta>,
+) -> bool {
+    let stmt_uses_local = |stmt: &Statement, target: LocalId| -> bool {
+        if let Statement::Assign(place, rval, _) = stmt {
+            let mut tmp = HashSet::new();
+            place.collect_uses(&mut tmp);
+            rval.collect_uses(&mut tmp);
+            tmp.contains(&target.0) || place.root_local() == target
+        } else {
+            false
+        }
+    };
+    let stmt_mutates_src = |stmt: &Statement| -> bool {
+        if let Statement::Assign(place, _, _) = stmt {
+            place.root_local() == src
+        } else {
+            false
+        }
+    };
+    let term_uses_local = |term: &Terminator, target: LocalId| -> bool {
+        let mut tmp = HashSet::new();
+        match term {
+            Terminator::Cond { cond, .. } => cond.collect_uses(&mut tmp),
+            Terminator::Switch { discr, .. } => discr.collect_uses(&mut tmp),
+            Terminator::Call {
+                args, destination, ..
+            } => {
+                if destination.root_local() == target {
+                    return true;
+                }
+                destination.collect_uses(&mut tmp);
+                for a in args {
+                    a.collect_uses(&mut tmp);
+                }
+            }
+            Terminator::Return(Some(op), _) | Terminator::Raise(op, _) => {
+                op.collect_uses(&mut tmp);
+            }
+            _ => {}
+        }
+        tmp.contains(&target.0)
+    };
+    let term_mutates_src = |term: &Terminator| -> bool {
+        if let Terminator::Call {
+            callee,
+            args,
+            destination,
+            ..
+        } = term
+        {
+            if destination.root_local() == src {
+                return true;
+            }
+            if matches!(
+                callee.as_str(),
+                "array.push"
+                    | "table.insert"
+                    | "array.set"
+                    | "map.set"
+                    | "table.set"
+                    | "map.delete"
+                    | "map.remove"
+                    | "map.clear"
+            ) && args.first().and_then(operand_root_local) == Some(src)
+            {
+                return true;
+            }
+            if let Some(meta) = fn_metas.get(callee) {
+                for (ai, arg) in args.iter().enumerate() {
+                    if operand_root_local(arg) == Some(src)
+                        && meta.param_modes.get(ai).is_some_and(|m| {
+                            matches!(
+                                m,
+                                ParamMode::MutVec | ParamMode::MutRefStruct | ParamMode::RcRefCell
+                            )
+                        })
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    };
+
+    // Fast path: if `src` is never mutated in any statement or call, it cannot mutate while `dst` is live.
+    if !local_is_mutated_in_fn(func, src)
+        && !func.blocks.iter().any(|b| {
+            !b.is_cleanup
+                && b.terminator
+                    .as_ref()
+                    .is_some_and(term_mutates_src)
+        })
+    {
+        return false;
+    }
+
+    let mut seen_mut = false;
+    let def_block = &func.blocks[def_bb.0];
+    for stmt in def_block.statements.iter().skip(def_sidx + 1) {
+        if seen_mut && stmt_uses_local(stmt, dst) {
+            return true;
+        }
+        if stmt_mutates_src(stmt) {
+            seen_mut = true;
+        }
+    }
+    let mut visited: HashSet<(BlockId, bool)> = HashSet::new();
+    let mut worklist: VecDeque<(BlockId, bool)> = VecDeque::new();
+    if let Some(term) = &def_block.terminator {
+        if seen_mut && term_uses_local(term, dst) {
+            return true;
+        }
+        if term_mutates_src(term) {
+            seen_mut = true;
+        }
+        for succ in term.successors() {
+            let sb = BlockId(succ);
+            if sb.0 < func.blocks.len() && !func.blocks[sb.0].is_cleanup && visited.insert((sb, seen_mut)) {
+                worklist.push_back((sb, seen_mut));
+            }
+        }
+    }
+
+    while let Some((bb, mut cur_mut)) = worklist.pop_front() {
+        let block = &func.blocks[bb.0];
+        let mut redefined = false;
+        for (sidx, stmt) in block.statements.iter().enumerate() {
+            if bb == def_bb && sidx == def_sidx {
+                redefined = true;
+                break;
+            }
+            if cur_mut && stmt_uses_local(stmt, dst) {
+                return true;
+            }
+            if stmt_mutates_src(stmt) {
+                cur_mut = true;
+            }
+        }
+        if redefined {
+            continue;
+        }
+        if let Some(term) = &block.terminator {
+            if cur_mut && term_uses_local(term, dst) {
+                return true;
+            }
+            if term_mutates_src(term) {
+                cur_mut = true;
+            }
+            for succ in term.successors() {
+                let sb = BlockId(succ);
+                if sb.0 < func.blocks.len()
+                    && !func.blocks[sb.0].is_cleanup
+                    && visited.insert((sb, cur_mut))
+                {
+                    worklist.push_back((sb, cur_mut));
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Collects all non-cleanup-internal locals referenced inside any `cleanup_blocks` subgraph.
 fn collect_cleanup_captured_locals(func: &MirFunction) -> HashSet<LocalId> {
     let mut cleanup_bbs: HashSet<BlockId> = HashSet::new();
@@ -3696,6 +4466,9 @@ fn scan_function_local_requirements(
                 Terminator::Call { callee, args, .. } => {
                     if parse_mir_struct_decode_callee(callee).is_some()
                         || callee.starts_with("__lust_mir_struct_decode_binary:")
+                        || callee
+                            .strip_suffix(".decode")
+                            .is_some_and(|sn| structs.contains_key(sn))
                     {
                         req.needs_ctx = true;
                         req.can_fail = true;
@@ -3734,8 +4507,8 @@ fn scan_function_local_requirements(
                                     req.needs_ctx = true;
                                 }
                             }
-                            "map.get" | "table.get" | "map.has" | "map.len" | "map.is_empty"
-                            | "map.clear" => {
+                            "map.get" | "table.get" | "map.get_unwrap" | "map.get_unwrap_or"
+                            | "map.has" | "map.len" | "map.is_empty" | "map.clear" => {
                                 req.can_fail = true;
                             }
                             "array.len" | "table.len" => {
@@ -3751,27 +4524,68 @@ fn scan_function_local_requirements(
                             "enum.tag" | "enum.payload" | "enum.new" | "enum.alloc" => {
                                 req.can_fail = true;
                             }
-                            "tostring" => {
+                            "tostring" | "string.sub" | "string.upper" | "string.lower"
+                            | "string.trim" | "string.concat" => {
                                 req.allocates_string = true;
                                 if opts.max_memory_bytes.is_some() {
                                     req.needs_alloc = true;
                                     req.can_fail = true;
                                 }
                             }
+                            "string.byte" | "string.split" | "string.gsub" | "string.find" => {
+                                req.needs_alloc = true;
+                                req.allocates_string = true;
+                                req.can_fail = true;
+                            }
+                            "__mir_unknown_unwrap_int"
+                            | "__mir_unknown_unwrap_float"
+                            | "__mir_unknown_unwrap_string"
+                            | "__mir_unknown_unwrap_bool"
+                            | "__mir_unknown_get_field" => {
+                                req.can_fail = true;
+                            }
+                            "__mir_unknown_call_method" => {
+                                req.needs_ctx = true;
+                                req.needs_alloc = true;
+                                req.can_fail = true;
+                                if structs.values().any(|s| s.is_cyclic) {
+                                    req.needs_arena = true;
+                                }
+                            }
+                            "Queue" | "sync.Queue" | "@std/sync.Queue" => {
+                                req.needs_ctx = true;
+                                req.can_fail = true;
+                            }
+                            "__lust_run_sync" => {
+                                if args.len() == 1
+                                    && let Some(body_fn) =
+                                        trace_direct_closure_fn_name_in_mir(func, &args[0])
+                                {
+                                    // Pure direct synchronous thunk: inherit needs_ctx/can_fail
+                                    // strictly from `body_fn` via call-graph propagation (`NG-W15-1`).
+                                    req.user_callees.push(body_fn);
+                                } else {
+                                    req.needs_ctx = true;
+                                    req.can_fail = true;
+                                    if let Some(arg0) = args.first()
+                                        && let Some(body_fn) =
+                                            trace_closure_fn_name_in_mir(func, arg0)
+                                    {
+                                        req.user_callees.push(body_fn);
+                                    }
+                                }
+                            }
                             "__lust_handle" | "__lust_nontail_handle" | "__lust_perform"
                             | "perform" | "__lust_resume" | "resume" | "__lust_nontail_resume"
                             | "__lust_yield_op" | "__lust_yield_completed" | "__lust_provide"
-                            | "__lust_run_sync" | "__lust_scoped" | "__lust_scope_finalizer"
+                            | "__lust_scoped" | "__lust_scope_finalizer"
                             | "__lust_scope_spawn" => {
                                 req.needs_ctx = true;
                                 req.can_fail = true;
                                 // Propagate body thunk requirements directly into enclosing function
                                 if matches!(
                                     callee.as_str(),
-                                    "__lust_handle"
-                                        | "__lust_nontail_handle"
-                                        | "__lust_run_sync"
-                                        | "__lust_scoped"
+                                    "__lust_handle" | "__lust_nontail_handle" | "__lust_scoped"
                                 ) && let Some(arg0) = args.first()
                                     && let Some(body_fn) = trace_closure_fn_name_in_mir(func, arg0)
                                 {
@@ -5503,6 +6317,1104 @@ fn emit_trait_and_service_definitions(out: &mut String, ctx: &ModuleEmitContext<
     }
 }
 
+/// Traces an operand directly to a local `Rvalue::Closure { func_name, .. }` ONLY through
+/// simple copy/move assignments (never crossing `__lust_provide`). Used for pure synchronous
+/// `__lust_run_sync` fast path (`NG-W15-1`, `F-02`).
+fn trace_direct_closure_fn_name_in_mir(func: &MirFunction, op: &Operand) -> Option<String> {
+    let mut cur = operand_exact_local(op)?;
+    let mut visited = HashSet::new();
+    while visited.insert(cur) {
+        let mut found_next: Option<LocalId> = None;
+        for block in &func.blocks {
+            if block.is_cleanup {
+                continue;
+            }
+            for stmt in &block.statements {
+                if let Statement::Assign(Place::Local(dst), rval, _) = stmt
+                    && *dst == cur
+                {
+                    match rval {
+                        Rvalue::Closure { func_name, .. } => return Some(func_name.clone()),
+                        Rvalue::Use(
+                            Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)),
+                        ) => {
+                            found_next = Some(*src);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(Terminator::Call {
+                callee,
+                destination: Place::Local(dst),
+                ..
+            }) = &block.terminator
+                && *dst == cur
+                && callee == "__lust_provide"
+            {
+                return None;
+            }
+        }
+        cur = found_next?;
+    }
+    None
+}
+
+/// Returns `true` when all `func.cleanup_blocks` are `MirCleanupKind::Defer` (no `ErrDefer`),
+/// there are no `Raise`/`Unreachable` terminators, and every non-cleanup `Terminator::Return`
+/// block ends with the exact LIFO `AstLowering`-inlined `Defer` action suffix (`NG-W15-1`, `F-02`).
+fn function_inlined_defers_cover_all_returns(func: &MirFunction) -> bool {
+    if func.cleanup_blocks.is_empty() {
+        return false;
+    }
+    if func
+        .cleanup_blocks
+        .iter()
+        .any(|c| c.kind != MirCleanupKind::Defer)
+    {
+        return false;
+    }
+    if func.blocks.iter().any(|b| {
+        !b.is_cleanup
+            && matches!(
+                b.terminator,
+                Some(Terminator::Raise(_, _) | Terminator::Unreachable(_))
+            )
+    }) {
+        return false;
+    }
+    let defer_entries: Vec<BlockId> = func
+        .cleanup_blocks
+        .iter()
+        .map(|c| c.block)
+        .collect();
+    let mut expected: Vec<CleanupActionSig> = Vec::new();
+    for &cbb in defer_entries.iter().rev() {
+        expected.extend(extract_cleanup_action_sigs(func, cbb));
+    }
+    if expected.is_empty() {
+        return false;
+    }
+
+    let mut preds: Vec<Vec<BlockId>> = vec![Vec::new(); func.blocks.len()];
+    for blk in &func.blocks {
+        if blk.is_cleanup {
+            continue;
+        }
+        if let Some(term) = &blk.terminator {
+            for succ_idx in term.successors() {
+                if succ_idx < preds.len() {
+                    preds[succ_idx].push(blk.id);
+                }
+            }
+        }
+    }
+
+    let ret_blocks: Vec<BlockId> = func
+        .blocks
+        .iter()
+        .filter(|b| !b.is_cleanup && matches!(b.terminator, Some(Terminator::Return(_, _))))
+        .map(|b| b.id)
+        .collect();
+    if ret_blocks.is_empty() {
+        return false;
+    }
+
+    for ret_bb in ret_blocks {
+        let mut chain: Vec<BlockId> = vec![ret_bb];
+        let mut cur = ret_bb;
+        while preds[cur.0].len() == 1 {
+            let p = preds[cur.0][0];
+            if matches!(
+                func.blocks[p.0].terminator,
+                Some(Terminator::Call { .. } | Terminator::Goto(_, _))
+            ) {
+                chain.push(p);
+                cur = p;
+            } else {
+                break;
+            }
+        }
+        chain.reverse();
+
+        let mut chain_actions: Vec<CleanupActionSig> = Vec::new();
+        for &bb in &chain {
+            let blk = &func.blocks[bb.0];
+            for stmt in &blk.statements {
+                if let Some(sig) = stmt_action_sig(stmt, func) {
+                    chain_actions.push(sig);
+                }
+            }
+            if let Some(Terminator::Call { callee, args, .. }) = &blk.terminator {
+                chain_actions.push(call_action_sig(callee, args, func));
+            }
+        }
+        if chain_actions.len() < expected.len() {
+            return false;
+        }
+        let start_idx = chain_actions.len() - expected.len();
+        if !chain_actions[start_idx..]
+            .iter()
+            .zip(expected.iter())
+            .all(|(got, exp)| got == exp)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Emits conditional `#![no_std] + alloc`, zero-`unsafe`, zero-panic runtime helpers
+/// for Suite v2 string intrinsics (`string.sub`, `string.byte`, `string.gsub`, `string.split`,
+/// `string.find`), `@std/sync.{Queue}`, and dynamic `AotValue` struct field/method dispatch
+/// (`NG-W15-1`). Only emits helpers referenced by the module.
+fn emit_suite_v2_runtime_helpers(
+    out: &mut String,
+    module: &MirModule,
+    ctx: &ModuleEmitContext<'_>,
+) {
+    let mut need_range = false;
+    let mut need_sub = false;
+    let mut need_byte = false;
+    let mut need_split = false;
+    let mut need_pattern = false;
+    let mut need_gsub = false;
+    let mut need_find = false;
+    let mut need_queue = false;
+    let mut need_unknown_field = false;
+    let mut need_unknown_method = false;
+
+    for func in &module.functions {
+        for block in &func.blocks {
+            if let Some(Terminator::Call { callee, .. }) = &block.terminator {
+                match callee.as_str() {
+                    "string.sub" => {
+                        need_range = true;
+                        need_sub = true;
+                    }
+                    "string.byte" => {
+                        need_range = true;
+                        need_byte = true;
+                    }
+                    "string.split" => {
+                        need_split = true;
+                    }
+                    "string.gsub" => {
+                        need_pattern = true;
+                        need_gsub = true;
+                    }
+                    "string.find" => {
+                        need_range = true;
+                        need_pattern = true;
+                        need_find = true;
+                    }
+                    "Queue" | "sync.Queue" | "@std/sync.Queue" => {
+                        need_queue = true;
+                    }
+                    "__mir_unknown_get_field" => {
+                        need_unknown_field = true;
+                    }
+                    "__mir_unknown_call_method" => {
+                        need_unknown_method = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let allow_attr = if ctx.interop.emit_as_include_module {
+        INCLUDE_ALLOW_ATTR
+    } else {
+        ""
+    };
+
+    if need_range {
+        let _ = writeln!(out, "{allow_attr}#[inline]");
+        out.push_str(
+            r#"fn __lust_aot_normalize_range(start: i64, end: Option<i64>, len: usize) -> (usize, usize) {
+    let len_i = len as i64;
+    let mut s = if start < 0 { len_i + start + 1 } else { start };
+    let mut e = match end {
+        Some(v) => v,
+        None => len_i,
+    };
+    if e < 0 {
+        e = len_i + e + 1;
+    }
+    if s < 1 {
+        s = 1;
+    }
+    if e < 0 {
+        e = 0;
+    }
+    if e > len_i {
+        e = len_i;
+    }
+    if s > e {
+        return (len, len);
+    }
+    (s.saturating_sub(1) as usize, e.max(0) as usize)
+}
+
+"#,
+        );
+    }
+
+    if need_sub {
+        let _ = writeln!(out, "{allow_attr}#[inline]");
+        out.push_str(
+            r#"fn __lust_aot_string_sub(s: &str, start: i64, end: Option<i64>) -> alloc::string::String {
+    let bytes = s.as_bytes();
+    let (lo, hi) = __lust_aot_normalize_range(start, end, bytes.len());
+    let slice = &bytes[lo..hi];
+    match core::str::from_utf8(slice) {
+        Ok(valid) => alloc::string::String::from(valid),
+        Err(_) => alloc::string::String::from_utf8_lossy(slice).into_owned(),
+    }
+}
+
+"#,
+        );
+    }
+
+    if need_byte {
+        let _ = writeln!(out, "{allow_attr}#[inline]");
+        out.push_str(
+            r#"fn __lust_aot_string_byte_vals<'a>(
+    s: &str,
+    start: i64,
+    end: Option<i64>,
+    alloc: &'a lust_aot_rt::LustBudgetAlloc,
+) -> alloc::vec::Vec<lust_aot_rt::AotValue, &'a lust_aot_rt::LustBudgetAlloc> {
+    let bytes = s.as_bytes();
+    let (lo, hi) = __lust_aot_normalize_range(start, end, bytes.len());
+    let mut out = alloc::vec::Vec::new_in(alloc);
+    if lo == hi {
+        out.push(lust_aot_rt::AotValue::Nil);
+        return out;
+    }
+    for &b in &bytes[lo..hi] {
+        out.push(lust_aot_rt::AotValue::Int(b as i64));
+    }
+    out
+}
+
+"#,
+        );
+        let _ = writeln!(out, "{allow_attr}#[inline]");
+        out.push_str(
+            r#"fn __lust_aot_string_byte_ints<'a>(
+    s: &str,
+    start: i64,
+    end: Option<i64>,
+    alloc: &'a lust_aot_rt::LustBudgetAlloc,
+) -> alloc::vec::Vec<i64, &'a lust_aot_rt::LustBudgetAlloc> {
+    let bytes = s.as_bytes();
+    let (lo, hi) = __lust_aot_normalize_range(start, end, bytes.len());
+    let mut out = alloc::vec::Vec::new_in(alloc);
+    for &b in &bytes[lo..hi] {
+        out.push(b as i64);
+    }
+    out
+}
+
+"#,
+        );
+    }
+
+    if need_split {
+        let _ = writeln!(out, "{allow_attr}#[inline]");
+        out.push_str(
+            r#"fn __lust_aot_string_split<'a>(
+    s: &str,
+    sep: &str,
+    alloc: &'a lust_aot_rt::LustBudgetAlloc,
+) -> alloc::vec::Vec<alloc::string::String, &'a lust_aot_rt::LustBudgetAlloc> {
+    let mut out = alloc::vec::Vec::new_in(alloc);
+    if sep.is_empty() {
+        for ch in s.chars() {
+            let mut cs = alloc::string::String::new();
+            cs.push(ch);
+            out.push(cs);
+        }
+    } else {
+        for part in s.split(sep) {
+            out.push(alloc::string::String::from(part));
+        }
+    }
+    out
+}
+
+"#,
+        );
+    }
+
+    if need_pattern {
+        let _ = writeln!(out, "{allow_attr}");
+        out.push_str(
+            r#"#[derive(Clone)]
+enum __LustPatAtom {
+    Any,
+    Lit(u8),
+    Class(u8),
+    Set { negated: bool, items: alloc::vec::Vec<__LustSetItem> },
+}
+
+#[derive(Clone, Copy)]
+enum __LustSetItem {
+    Byte(u8),
+    Range(u8, u8),
+    Class(u8),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum __LustPatQuant {
+    One,
+    Star,
+    Plus,
+    LazyStar,
+    Opt,
+}
+
+#[derive(Clone)]
+enum __LustPatTok {
+    Atom(__LustPatAtom, __LustPatQuant),
+    CapStart(usize),
+    CapEnd(usize),
+    EndAnchor,
+}
+
+#[inline]
+fn __lust_pat_match_class(cls: u8, b: u8) -> bool {
+    let lower = cls.to_ascii_lowercase();
+    let matched = match lower {
+        b'a' => b.is_ascii_alphabetic(),
+        b'c' => b.is_ascii_control(),
+        b'd' => b.is_ascii_digit(),
+        b'l' => b.is_ascii_lowercase(),
+        b'u' => b.is_ascii_uppercase(),
+        b'w' => b.is_ascii_alphanumeric() || b == b'_',
+        b'x' => b.is_ascii_hexdigit(),
+        b's' => b.is_ascii_whitespace(),
+        b'p' => b.is_ascii_punctuation(),
+        b'z' => b == 0,
+        _ => b == cls,
+    };
+    if cls.is_ascii_uppercase() && matches!(lower, b'a' | b'c' | b'd' | b'l' | b'u' | b'w' | b'x' | b's' | b'p' | b'z') {
+        !matched
+    } else {
+        matched
+    }
+}
+
+#[inline]
+fn __lust_pat_match_atom(atom: &__LustPatAtom, b: u8) -> bool {
+    match atom {
+        __LustPatAtom::Any => true,
+        __LustPatAtom::Lit(c) => b == *c,
+        __LustPatAtom::Class(c) => __lust_pat_match_class(*c, b),
+        __LustPatAtom::Set { negated, items } => {
+            let mut hit = false;
+            for item in items {
+                match *item {
+                    __LustSetItem::Byte(c) if b == c => { hit = true; break; }
+                    __LustSetItem::Range(lo, hi) if b >= lo && b <= hi => { hit = true; break; }
+                    __LustSetItem::Class(c) if __lust_pat_match_class(c, b) => { hit = true; break; }
+                    _ => {}
+                }
+            }
+            if *negated { !hit } else { hit }
+        }
+    }
+}
+
+fn __lust_pat_compile(pat: &[u8]) -> Result<(bool, alloc::vec::Vec<__LustPatTok>, usize), lust_aot_rt::AotError> {
+    let mut i = 0usize;
+    let anchored_start = if pat.first() == Some(&b'^') {
+        i = 1;
+        true
+    } else {
+        false
+    };
+    let mut toks = alloc::vec::Vec::new();
+    let mut cap_stack = alloc::vec::Vec::new();
+    let mut cap_count = 0usize;
+    while i < pat.len() {
+        let b = pat[i];
+        if b == b'(' {
+            let idx = cap_count;
+            cap_count += 1;
+            cap_stack.push(idx);
+            toks.push(__LustPatTok::CapStart(idx));
+            i += 1;
+            continue;
+        }
+        if b == b')' {
+            if let Some(idx) = cap_stack.pop() {
+                toks.push(__LustPatTok::CapEnd(idx));
+                i += 1;
+                continue;
+            }
+            return Err(lust_aot_rt::AotError::UserError(alloc::string::String::from("unmatched ')' in pattern")));
+        }
+        if b == b'$' && i + 1 == pat.len() {
+            toks.push(__LustPatTok::EndAnchor);
+            i += 1;
+            continue;
+        }
+        let atom = if b == b'.' {
+            i += 1;
+            __LustPatAtom::Any
+        } else if b == b'%' {
+            i += 1;
+            if i < pat.len() {
+                let c = pat[i];
+                i += 1;
+                let lo = c.to_ascii_lowercase();
+                if matches!(lo, b'a' | b'c' | b'd' | b'l' | b'u' | b'w' | b'x' | b's' | b'p' | b'z') {
+                    __LustPatAtom::Class(c)
+                } else {
+                    __LustPatAtom::Lit(c)
+                }
+            } else {
+                __LustPatAtom::Lit(b'%')
+            }
+        } else if b == b'[' {
+            i += 1;
+            let negated = if i < pat.len() && pat[i] == b'^' {
+                i += 1;
+                true
+            } else {
+                false
+            };
+            let mut items = alloc::vec::Vec::new();
+            let mut first = true;
+            while i < pat.len() && (first || pat[i] != b']') {
+                first = false;
+                if pat[i] == b'%' && i + 1 < pat.len() {
+                    let c = pat[i + 1];
+                    i += 2;
+                    let lo = c.to_ascii_lowercase();
+                    if matches!(lo, b'a' | b'c' | b'd' | b'l' | b'u' | b'w' | b'x' | b's' | b'p' | b'z') {
+                        items.push(__LustSetItem::Class(c));
+                    } else {
+                        items.push(__LustSetItem::Byte(c));
+                    }
+                } else if i + 2 < pat.len() && pat[i + 1] == b'-' && pat[i + 2] != b']' {
+                    items.push(__LustSetItem::Range(pat[i], pat[i + 2]));
+                    i += 3;
+                } else {
+                    items.push(__LustSetItem::Byte(pat[i]));
+                    i += 1;
+                }
+            }
+            if i < pat.len() && pat[i] == b']' {
+                i += 1;
+            }
+            __LustPatAtom::Set { negated, items }
+        } else {
+            i += 1;
+            __LustPatAtom::Lit(b)
+        };
+        let quant = if i < pat.len() {
+            match pat[i] {
+                b'*' => { i += 1; __LustPatQuant::Star }
+                b'+' => { i += 1; __LustPatQuant::Plus }
+                b'-' => { i += 1; __LustPatQuant::LazyStar }
+                b'?' => { i += 1; __LustPatQuant::Opt }
+                _ => __LustPatQuant::One,
+            }
+        } else {
+            __LustPatQuant::One
+        };
+        toks.push(__LustPatTok::Atom(atom, quant));
+    }
+    if !cap_stack.is_empty() {
+        return Err(lust_aot_rt::AotError::UserError(alloc::string::String::from("unclosed '(' in pattern")));
+    }
+    Ok((anchored_start, toks, cap_count))
+}
+
+fn __lust_pat_exec(
+    hay: &[u8],
+    pos: usize,
+    toks: &[__LustPatTok],
+    ti: usize,
+    caps: &mut [(usize, usize)],
+) -> Option<usize> {
+    if ti >= toks.len() {
+        return Some(pos);
+    }
+    match &toks[ti] {
+        __LustPatTok::CapStart(idx) => {
+            let prev = caps[*idx];
+            caps[*idx].0 = pos;
+            if let Some(end) = __lust_pat_exec(hay, pos, toks, ti + 1, caps) {
+                return Some(end);
+            }
+            caps[*idx] = prev;
+            None
+        }
+        __LustPatTok::CapEnd(idx) => {
+            let prev = caps[*idx];
+            caps[*idx].1 = pos;
+            if let Some(end) = __lust_pat_exec(hay, pos, toks, ti + 1, caps) {
+                return Some(end);
+            }
+            caps[*idx] = prev;
+            None
+        }
+        __LustPatTok::EndAnchor => {
+            if pos == hay.len() {
+                __lust_pat_exec(hay, pos, toks, ti + 1, caps)
+            } else {
+                None
+            }
+        }
+        __LustPatTok::Atom(atom, quant) => match quant {
+            __LustPatQuant::One => {
+                if pos < hay.len() && __lust_pat_match_atom(atom, hay[pos]) {
+                    __lust_pat_exec(hay, pos + 1, toks, ti + 1, caps)
+                } else {
+                    None
+                }
+            }
+            __LustPatQuant::Opt => {
+                if pos < hay.len() && __lust_pat_match_atom(atom, hay[pos]) {
+                    if let Some(end) = __lust_pat_exec(hay, pos + 1, toks, ti + 1, caps) {
+                        return Some(end);
+                    }
+                }
+                __lust_pat_exec(hay, pos, toks, ti + 1, caps)
+            }
+            __LustPatQuant::Star | __LustPatQuant::Plus => {
+                let min_k = if *quant == __LustPatQuant::Plus { 1 } else { 0 };
+                let mut max_pos = pos;
+                while max_pos < hay.len() && __lust_pat_match_atom(atom, hay[max_pos]) {
+                    max_pos += 1;
+                }
+                if max_pos - pos < min_k {
+                    return None;
+                }
+                let mut cur = max_pos;
+                loop {
+                    if let Some(end) = __lust_pat_exec(hay, cur, toks, ti + 1, caps) {
+                        return Some(end);
+                    }
+                    if cur == pos + min_k {
+                        break;
+                    }
+                    cur -= 1;
+                }
+                None
+            }
+            __LustPatQuant::LazyStar => {
+                let mut cur = pos;
+                loop {
+                    if let Some(end) = __lust_pat_exec(hay, cur, toks, ti + 1, caps) {
+                        return Some(end);
+                    }
+                    if cur >= hay.len() || !__lust_pat_match_atom(atom, hay[cur]) {
+                        break;
+                    }
+                    cur += 1;
+                }
+                None
+            }
+        },
+    }
+}
+
+"#,
+        );
+    }
+
+    if need_gsub {
+        let _ = writeln!(out, "{allow_attr}");
+        out.push_str(
+            r#"fn __lust_aot_string_gsub(
+    src: &str,
+    pattern: &str,
+    repl: &str,
+    limit: Option<i64>,
+) -> Result<(alloc::string::String, i64), lust_aot_rt::AotError> {
+    let max_repl = match limit {
+        Some(n) if n <= 0 => return Ok((alloc::string::String::from(src), 0)),
+        Some(n) => n,
+        None => i64::MAX,
+    };
+    let (anchored, toks, cap_count) = __lust_pat_compile(pattern.as_bytes())?;
+    let hay = src.as_bytes();
+    let repl_bytes = repl.as_bytes();
+    let mut out = alloc::string::String::with_capacity(src.len());
+    let mut caps = alloc::vec![(0usize, 0usize); cap_count];
+    let mut pos = 0usize;
+    let mut count = 0_i64;
+    while pos <= hay.len() {
+        if count >= max_repl {
+            if let Ok(rest) = core::str::from_utf8(&hay[pos..]) {
+                out.push_str(rest);
+            }
+            break;
+        }
+        if let Some(end) = __lust_pat_exec(hay, pos, &toks, 0, &mut caps) {
+            count += 1;
+            let mut ri = 0usize;
+            while ri < repl_bytes.len() {
+                if repl_bytes[ri] == b'%' && ri + 1 < repl_bytes.len() {
+                    let next = repl_bytes[ri + 1];
+                    if next == b'%' {
+                        out.push('%');
+                    } else if next == b'0' {
+                        if let Ok(seg) = core::str::from_utf8(&hay[pos..end]) {
+                            out.push_str(seg);
+                        }
+                    } else if next.is_ascii_digit() {
+                        let cidx = (next - b'1') as usize;
+                        if let Some(&(cs, ce)) = caps.get(cidx)
+                            && cs <= ce
+                            && ce <= hay.len()
+                            && let Ok(seg) = core::str::from_utf8(&hay[cs..ce])
+                        {
+                            out.push_str(seg);
+                        }
+                    } else {
+                        out.push(next as char);
+                    }
+                    ri += 2;
+                } else {
+                    if let Ok(seg) = core::str::from_utf8(&repl_bytes[ri..]) {
+                        if let Some(ch) = seg.chars().next() {
+                            out.push(ch);
+                            ri += ch.len_utf8();
+                        } else {
+                            ri += 1;
+                        }
+                    } else {
+                        ri += 1;
+                    }
+                }
+            }
+            if end > pos {
+                pos = end;
+            } else {
+                if pos < hay.len() {
+                    if let Ok(seg) = core::str::from_utf8(&hay[pos..]) {
+                        if let Some(ch) = seg.chars().next() {
+                            out.push(ch);
+                            pos += ch.len_utf8();
+                        } else {
+                            pos += 1;
+                        }
+                    } else {
+                        pos += 1;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if anchored {
+                if let Ok(rest) = core::str::from_utf8(&hay[pos..]) {
+                    out.push_str(rest);
+                }
+                break;
+            }
+        } else {
+            if anchored {
+                if let Ok(rest) = core::str::from_utf8(&hay[pos..]) {
+                    out.push_str(rest);
+                }
+                break;
+            }
+            if pos < hay.len() {
+                if let Ok(seg) = core::str::from_utf8(&hay[pos..]) {
+                    if let Some(ch) = seg.chars().next() {
+                        out.push(ch);
+                        pos += ch.len_utf8();
+                    } else {
+                        pos += 1;
+                    }
+                } else {
+                    pos += 1;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    Ok((out, count))
+}
+
+"#,
+        );
+    }
+
+    if need_find {
+        let _ = writeln!(out, "{allow_attr}");
+        out.push_str(
+            r#"fn __lust_aot_string_find(
+    haystack: &str,
+    pattern: &str,
+    start: i64,
+    plain: bool,
+) -> Result<Option<(i64, i64, alloc::vec::Vec<alloc::string::String>)>, lust_aot_rt::AotError> {
+    let (offset, _) = __lust_aot_normalize_range(start, None, haystack.len());
+    let slice = haystack.get(offset..).unwrap_or("");
+    if plain {
+        return Ok(match slice.find(pattern) {
+            Some(pos) => {
+                let begin = offset + pos;
+                let end = begin + pattern.len().saturating_sub(1);
+                Some((begin as i64 + 1, end as i64 + 1, alloc::vec::Vec::new()))
+            }
+            None => None,
+        });
+    }
+    let (anchored, toks, cap_count) = __lust_pat_compile(pattern.as_bytes())?;
+    let hay = slice.as_bytes();
+    let mut caps = alloc::vec![(0usize, 0usize); cap_count];
+    let limit_pos = if anchored { 0 } else { hay.len() };
+    for p in 0..=limit_pos {
+        if let Some(end) = __lust_pat_exec(hay, p, &toks, 0, &mut caps) {
+            let mut cap_strs = alloc::vec::Vec::with_capacity(cap_count);
+            for &(cs, ce) in &caps {
+                if cs <= ce && ce <= hay.len() {
+                    let s = match core::str::from_utf8(&hay[cs..ce]) {
+                        Ok(valid) => alloc::string::String::from(valid),
+                        Err(_) => alloc::string::String::from_utf8_lossy(&hay[cs..ce]).into_owned(),
+                    };
+                    cap_strs.push(s);
+                }
+            }
+            return Ok(Some((
+                (offset + p) as i64 + 1,
+                (offset + end.saturating_sub(1)) as i64 + 1,
+                cap_strs,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+"#,
+        );
+    }
+
+    if need_queue {
+        let _ = writeln!(out, "{allow_attr}");
+        out.push_str(
+            r#"fn __lust_aot_new_queue(
+    capacity: i64,
+    strategy: &str,
+    ctx: &lust_aot_rt::AotCtx,
+) -> Result<lust_aot_rt::AotValue, lust_aot_rt::AotError> {
+    let cap = if capacity <= 0 { 0usize } else { capacity as usize };
+    let strategy_code: u8 = match strategy {
+        "dropping" => 1,
+        "sliding" => 2,
+        _ => 0,
+    };
+    let buf: alloc::rc::Rc<core::cell::RefCell<alloc::collections::VecDeque<lust_aot_rt::AotValue>>> =
+        alloc::rc::Rc::new(core::cell::RefCell::new(alloc::collections::VecDeque::with_capacity(cap)));
+    let closed: alloc::rc::Rc<core::cell::Cell<bool>> =
+        alloc::rc::Rc::new(core::cell::Cell::new(false));
+    let obj = lust_aot_rt::AotValue::map();
+
+    {
+        let q = alloc::rc::Rc::clone(&buf);
+        let cl = alloc::rc::Rc::clone(&closed);
+        let offer_fn = lust_aot_rt::AotValue::closure(
+            move |_ctx: &mut lust_aot_rt::AotCtx, args: &[lust_aot_rt::AotValue]| -> Result<lust_aot_rt::AotValue, lust_aot_rt::AotError> {
+                if cl.get() {
+                    return Ok(lust_aot_rt::AotValue::Bool(false));
+                }
+                let item = args.first().cloned().unwrap_or(lust_aot_rt::AotValue::Nil);
+                let mut guard = lust_aot_rt::ref_borrow_mut(&q)?;
+                if cap > 0 && guard.len() >= cap {
+                    match strategy_code {
+                        1 => return Ok(lust_aot_rt::AotValue::Bool(false)),
+                        2 => { let _ = guard.pop_front(); }
+                        _ => return Err(lust_aot_rt::AotError::UserError(alloc::string::String::from("queue is full"))),
+                    }
+                }
+                guard.push_back(item);
+                Ok(lust_aot_rt::AotValue::Bool(true))
+            },
+        );
+        obj.map_set(lust_aot_rt::AotKey::Str(alloc::string::String::from("offer")), offer_fn.clone(), ctx)?;
+        obj.map_set(lust_aot_rt::AotKey::Str(alloc::string::String::from("try_offer")), offer_fn, ctx)?;
+    }
+
+    {
+        let q = alloc::rc::Rc::clone(&buf);
+        let take_fn = lust_aot_rt::AotValue::closure(
+            move |_ctx: &mut lust_aot_rt::AotCtx, _args: &[lust_aot_rt::AotValue]| -> Result<lust_aot_rt::AotValue, lust_aot_rt::AotError> {
+                let mut guard = lust_aot_rt::ref_borrow_mut(&q)?;
+                Ok(guard.pop_front().unwrap_or(lust_aot_rt::AotValue::Nil))
+            },
+        );
+        obj.map_set(lust_aot_rt::AotKey::Str(alloc::string::String::from("take")), take_fn.clone(), ctx)?;
+        obj.map_set(lust_aot_rt::AotKey::Str(alloc::string::String::from("try_take")), take_fn, ctx)?;
+    }
+
+    {
+        let q = alloc::rc::Rc::clone(&buf);
+        let len_fn = lust_aot_rt::AotValue::closure(
+            move |_ctx: &mut lust_aot_rt::AotCtx, _args: &[lust_aot_rt::AotValue]| -> Result<lust_aot_rt::AotValue, lust_aot_rt::AotError> {
+                let guard = lust_aot_rt::ref_borrow(&q)?;
+                Ok(lust_aot_rt::AotValue::Int(guard.len() as i64))
+            },
+        );
+        obj.map_set(lust_aot_rt::AotKey::Str(alloc::string::String::from("len")), len_fn, ctx)?;
+    }
+
+    {
+        let cl = alloc::rc::Rc::clone(&closed);
+        let close_fn = lust_aot_rt::AotValue::closure(
+            move |_ctx: &mut lust_aot_rt::AotCtx, _args: &[lust_aot_rt::AotValue]| -> Result<lust_aot_rt::AotValue, lust_aot_rt::AotError> {
+                cl.set(true);
+                Ok(lust_aot_rt::AotValue::Nil)
+            },
+        );
+        obj.map_set(lust_aot_rt::AotKey::Str(alloc::string::String::from("close")), close_fn, ctx)?;
+    }
+
+    Ok(obj)
+}
+
+"#,
+        );
+    }
+
+    if need_unknown_field {
+        let _ = writeln!(out, "{allow_attr}#[inline]");
+        out.push_str(
+            "fn __lust_aot_unknown_get_field(obj: &lust_aot_rt::AotValue, field: &str) -> Result<lust_aot_rt::AotValue, lust_aot_rt::AotError> {\n",
+        );
+        out.push_str("    match obj {\n");
+        out.push_str("        lust_aot_rt::AotValue::Struct(rc) => {\n");
+        out.push_str("            let s = lust_aot_rt::ref_borrow(rc)?;\n");
+        out.push_str("            match (s.type_id, field) {\n");
+        for (sname, meta) in &ctx.structs {
+            if let Some(&tid) = ctx.struct_type_ids.get(sname) {
+                for (fi, (fname, _)) in meta.fields.iter().enumerate() {
+                    let _ = writeln!(
+                        out,
+                        "                ({tid}_u32, {fname:?}) => Ok(s.fields.get({fi}).cloned().unwrap_or(lust_aot_rt::AotValue::Nil)),"
+                    );
+                }
+            }
+        }
+        out.push_str(
+            "                _ => Err(lust_aot_rt::AotError::UserError(alloc::format!(\"unknown field '{}' on struct type {}\", field, s.type_id))),\n",
+        );
+        out.push_str("            }\n");
+        out.push_str("        }\n");
+        out.push_str("        lust_aot_rt::AotValue::Map(rc) => {\n");
+        out.push_str("            let m = lust_aot_rt::ref_borrow(rc)?;\n");
+        out.push_str("            let k = lust_aot_rt::AotKey::Str(alloc::string::String::from(field));\n");
+        out.push_str("            Ok(m.get(&k).cloned().unwrap_or(lust_aot_rt::AotValue::Nil))\n");
+        out.push_str("        }\n");
+        out.push_str(
+            "        _ => Err(lust_aot_rt::AotError::UserError(alloc::format!(\"cannot access field '{}' on {}\", field, obj.type_name()))),\n",
+        );
+        out.push_str("    }\n");
+        out.push_str("}\n\n");
+    }
+
+    if need_unknown_method {
+        let has_arena = ctx.module_uses_arena;
+        let arena_param = if has_arena {
+            ", __arena: &'a lust_aot_rt::LustChunkArena<'a>"
+        } else {
+            ""
+        };
+        let _ = writeln!(out, "{allow_attr}#[inline]");
+        let _ = writeln!(
+            out,
+            "fn __lust_aot_unknown_call_method<'a>(__ctx: &mut lust_aot_rt::AotCtx, __alloc: &'a lust_aot_rt::LustBudgetAlloc{arena_param}, obj: &lust_aot_rt::AotValue, method: &str, args: &[lust_aot_rt::AotValue]) -> Result<lust_aot_rt::AotValue, lust_aot_rt::AotError> {{"
+        );
+        out.push_str("    match obj {\n");
+        out.push_str("        lust_aot_rt::AotValue::Struct(rc) => {\n");
+        out.push_str("            let __tid = lust_aot_rt::ref_borrow(rc)?.type_id;\n");
+        out.push_str("            match (__tid, method) {\n");
+        for func in &module.functions {
+            if let Some((sname, mname)) = func.signature.name.split_once(':')
+                && let Some(smeta) = ctx.structs.get(sname)
+                && !smeta.is_cyclic
+                && !smeta.needs_arena_lt
+                && let Some(&tid) = ctx.struct_type_ids.get(sname)
+                && let Some(fmeta) = ctx.fn_metas.get(&func.signature.name)
+            {
+                let rust_sname = rust_struct_name(sname);
+                let _ = writeln!(out, "                ({tid}_u32, {mname:?}) => {{");
+                let _ = writeln!(out, "                    let mut __recv = {{");
+                out.push_str("                        let __s = lust_aot_rt::ref_borrow(rc)?;\n");
+                let mut finits = Vec::with_capacity(smeta.fields.len());
+                for (fi, (_, fty)) in smeta.fields.iter().enumerate() {
+                    let raw = format!(
+                        "__s.fields.get({fi}).cloned().unwrap_or(lust_aot_rt::AotValue::Nil)"
+                    );
+                    let conv = coerce_aot_value_to_rust(&raw, fty, ctx);
+                    finits.push(format!("field_{fi}: {conv}"));
+                }
+                let _ = writeln!(
+                    out,
+                    "                        {rust_sname} {{ {} }}",
+                    finits.join(", ")
+                );
+                out.push_str("                    };\n");
+
+                let mut cargs = Vec::new();
+                if fmeta.needs_ctx {
+                    cargs.push("__ctx".to_string());
+                }
+                if fmeta.needs_alloc {
+                    cargs.push("__alloc".to_string());
+                }
+                if fmeta.needs_arena {
+                    cargs.push("__arena".to_string());
+                }
+                let self_mode = fmeta.param_modes.first().copied().unwrap_or(ParamMode::ByValue);
+                match self_mode {
+                    ParamMode::RefStruct => cargs.push("&__recv".to_string()),
+                    ParamMode::MutRefStruct => cargs.push("&mut __recv".to_string()),
+                    ParamMode::RcRefCell => {
+                        cargs.push("alloc::rc::Rc::new(core::cell::RefCell::new(__recv.clone()))".to_string());
+                    }
+                    _ => cargs.push("__recv".to_string()),
+                }
+                for (pi, &pid) in func.params.iter().enumerate().skip(1) {
+                    let ai = pi - 1;
+                    let pty = &func.locals[pid.0].ty;
+                    let pmode = fmeta.param_modes.get(pi).copied().unwrap_or(ParamMode::ByValue);
+                    let raw = format!(
+                        "args.get({ai}).cloned().unwrap_or(lust_aot_rt::AotValue::Nil)"
+                    );
+                    let val = coerce_aot_value_to_rust(&raw, pty, ctx);
+                    match pmode {
+                        ParamMode::RefStr => cargs.push(format!("&({val})")),
+                        ParamMode::RefStruct => cargs.push(format!("&({val})")),
+                        _ => cargs.push(val),
+                    }
+                }
+                let raw_call = format!("{}({})", fmeta.rust_name, cargs.join(", "));
+                let call_res = if fmeta.can_fail {
+                    format!("{raw_call}?")
+                } else {
+                    format!("match {raw_call} {{ Ok(__v) => __v }}")
+                };
+                let _ = writeln!(out, "                    let __res = {call_res};");
+                if self_mode == ParamMode::MutRefStruct {
+                    out.push_str("                    {\n");
+                    out.push_str("                        let mut __s = lust_aot_rt::ref_borrow_mut(rc)?;\n");
+                    for (fi, (_, fty)) in smeta.fields.iter().enumerate() {
+                        let packed = coerce_rust_to_aot_value(&format!("__recv.field_{fi}"), fty, ctx);
+                        let _ = writeln!(
+                            out,
+                            "                        if let Some(__slot) = __s.fields.get_mut({fi}) {{ *__slot = {packed}; }}"
+                        );
+                    }
+                    out.push_str("                    }\n");
+                }
+                let ret_packed = coerce_rust_to_aot_value("__res", &fmeta.return_type, ctx);
+                let _ = writeln!(out, "                    Ok({ret_packed})");
+                out.push_str("                }\n");
+            }
+        }
+        out.push_str(
+            "                _ => Err(lust_aot_rt::AotError::UserError(alloc::format!(\"unknown method '{}' on struct type {}\", method, __tid))),\n",
+        );
+        out.push_str("            }\n");
+        out.push_str("        }\n");
+        out.push_str("        lust_aot_rt::AotValue::Map(rc) => {\n");
+        out.push_str("            let __fn_val = {\n");
+        out.push_str("                let m = lust_aot_rt::ref_borrow(rc)?;\n");
+        out.push_str("                let k = lust_aot_rt::AotKey::Str(alloc::string::String::from(method));\n");
+        out.push_str("                m.get(&k).cloned().ok_or_else(|| lust_aot_rt::AotError::UserError(alloc::format!(\"unknown method '{}' on map\", method)))?\n");
+        out.push_str("            };\n");
+        out.push_str("            __fn_val.call(__ctx, args)\n");
+        out.push_str("        }\n");
+        out.push_str(
+            "        _ => Err(lust_aot_rt::AotError::UserError(alloc::format!(\"cannot call method '{}' on {}\", method, obj.type_name()))),\n",
+        );
+        out.push_str("    }\n");
+        out.push_str("}\n\n");
+    }
+}
+
+fn coerce_aot_value_to_rust(expr: &str, dst_ty: &MirType, ctx: &ModuleEmitContext<'_>) -> String {
+    match dst_ty {
+        MirType::Unit => format!("{{ let _ = {expr}; () }}"),
+        MirType::Bool => format!("({expr}).is_truthy()"),
+        MirType::Int => format!(
+            "({expr}).as_int().ok_or_else(|| lust_aot_rt::AotError::UserError(alloc::string::String::from(\"expected int\")))?"
+        ),
+        MirType::Float => format!("({expr}).as_float_coerced()?"),
+        MirType::String => format!("({expr}).to_display_string()"),
+        MirType::Unknown => format!("({expr}).clone()"),
+        MirType::Struct(sname) => {
+            if let Some(smeta) = ctx.structs.get(sname)
+                && !smeta.is_cyclic
+                && !smeta.needs_arena_lt
+            {
+                let rust_sname = rust_struct_name(sname);
+                let mut finits = Vec::with_capacity(smeta.fields.len());
+                for (fi, (_, fty)) in smeta.fields.iter().enumerate() {
+                    let raw = format!(
+                        "__s_ref.fields.get({fi}).cloned().unwrap_or(lust_aot_rt::AotValue::Nil)"
+                    );
+                    finits.push(format!(
+                        "field_{fi}: {}",
+                        coerce_aot_value_to_rust(&raw, fty, ctx)
+                    ));
+                }
+                format!(
+                    "match &({expr}) {{ lust_aot_rt::AotValue::Struct(__rc) => {{ let __s_ref = lust_aot_rt::ref_borrow(__rc)?; {rust_sname} {{ {} }} }}, _ => return Err(lust_aot_rt::AotError::UserError(alloc::string::String::from(\"expected struct\"))) }}",
+                    finits.join(", ")
+                )
+            } else {
+                ctx.rust_default_expr(dst_ty)
+            }
+        }
+        _ => ctx.rust_default_expr(dst_ty),
+    }
+}
+
+fn coerce_rust_to_aot_value(expr: &str, src_ty: &MirType, ctx: &ModuleEmitContext<'_>) -> String {
+    match src_ty {
+        MirType::Unit => format!("{{ let _ = {expr}; lust_aot_rt::AotValue::Nil }}"),
+        MirType::Bool => format!("lust_aot_rt::AotValue::Bool({expr})"),
+        MirType::Int => format!("lust_aot_rt::AotValue::Int({expr})"),
+        MirType::Float => format!("lust_aot_rt::AotValue::Float({expr})"),
+        MirType::String => format!("lust_aot_rt::AotValue::str({expr})"),
+        MirType::Unknown | MirType::Effect { .. } => format!("({expr}).clone()"),
+        MirType::Struct(sname) => {
+            if let Some(smeta) = ctx.structs.get(sname)
+                && let Some(&tid) = ctx.struct_type_ids.get(sname)
+            {
+                let mut fvals = Vec::with_capacity(smeta.fields.len());
+                for (fi, (_, fty)) in smeta.fields.iter().enumerate() {
+                    let fexpr = if ctx.is_copy_type(fty) {
+                        format!("__st.field_{fi}")
+                    } else {
+                        format!("__st.field_{fi}.clone()")
+                    };
+                    fvals.push(coerce_rust_to_aot_value(&fexpr, fty, ctx));
+                }
+                format!(
+                    "{{ let __st = &({expr}); lust_aot_rt::AotValue::from_struct({tid}_u32, alloc::vec![{}]) }}",
+                    fvals.join(", ")
+                )
+            } else {
+                format!("lust_aot_rt::AotValue::str(alloc::format!(\"{{:?}}\", {expr}))")
+            }
+        }
+        _ => format!("lust_aot_rt::AotValue::str(alloc::format!(\"{{:?}}\", {expr}))"),
+    }
+}
+
 /// Traces an operand back to a local `Rvalue::Closure { func_name, .. }` (including through
 /// single-copy assignments and `__lust_provide` chains) in `func`.
 fn trace_closure_fn_name_in_mir(func: &MirFunction, op: &Operand) -> Option<String> {
@@ -6029,6 +7941,8 @@ struct FnEmitter<'a, 'm> {
     local_use_counts: HashMap<LocalId, usize>,
     /// Count of Place::Local definitions per local.
     local_def_counts: HashMap<LocalId, usize>,
+    /// Locals defined by `Rvalue::Aggregate` or `Terminator::Call` (`NG-W15-1`).
+    aggregate_or_call_def: HashSet<LocalId>,
     /// Pre-detected `IfOptionSome` patterns keyed by `cond_block`.
     if_option_some: HashMap<BlockId, IfOptionSomePlan>,
     /// Names of active `errdefer` DropGuard variables to dismiss before every `return Ok(...)`.
@@ -6278,14 +8192,18 @@ fn emit_function(
     let tree = structure_mir_function(func);
 
     let mut local_def_counts: HashMap<LocalId, usize> = HashMap::new();
+    let mut aggregate_or_call_def: HashSet<LocalId> = HashSet::new();
     let mut switch_tag_source: HashMap<LocalId, LocalId> = HashMap::new();
     for block in &func.blocks {
         if block.is_cleanup {
             continue;
         }
         for stmt in &block.statements {
-            if let Statement::Assign(Place::Local(dst), _, _) = stmt {
+            if let Statement::Assign(Place::Local(dst), rval, _) = stmt {
                 *local_def_counts.entry(*dst).or_insert(0) += 1;
+                if matches!(rval, Rvalue::Aggregate(_, _)) {
+                    aggregate_or_call_def.insert(*dst);
+                }
             }
         }
         if let Some(Terminator::Call {
@@ -6296,6 +8214,7 @@ fn emit_function(
         }) = &block.terminator
         {
             *local_def_counts.entry(*dst).or_insert(0) += 1;
+            aggregate_or_call_def.insert(*dst);
             if callee == "enum.tag"
                 && let Some(enum_loc) = args.first().and_then(operand_exact_local)
             {
@@ -6326,6 +8245,7 @@ fn emit_function(
         omitted_locals: HashSet::new(),
         local_use_counts: count_local_uses(func),
         local_def_counts,
+        aggregate_or_call_def,
         if_option_some: HashMap::new(),
         errdefer_guards: Vec::new(),
         in_cleanup_closure: None,
@@ -6575,6 +8495,13 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
         if self.ctx.interop.emit_as_include_module {
             self.out.push_str(INCLUDE_ALLOW_ATTR);
         }
+        if !self.meta.can_fail
+            && !self.meta.needs_ctx
+            && self.func.signature.name != "main"
+            && self.func.blocks.len() <= 16
+        {
+            self.out.push_str("#[inline]\n");
+        }
         let _ = writeln!(
             self.out,
             "fn {}{lt_str}({}) -> Result<{ret_ok_ty}, {err_ty}> {{",
@@ -6643,6 +8570,9 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
     /// and marks them skipped so `core::mem::DropGuard` (`_lust_defer_N`) executes each `defer`
     /// exactly once on both normal `Ok(...)` exits and `Err(...)` exits in exact LIFO order.
     fn analyze_inlined_defer_strips(&mut self) {
+        if self.meta.keep_inlined_defers_direct {
+            return;
+        }
         let defer_entries: Vec<BlockId> = self
             .func
             .cleanup_blocks
@@ -6752,7 +8682,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
     /// Emits `let _lust_defer_N = lust_aot_rt::defer(...)` and
     /// `let _lust_errdefer_N = lust_aot_rt::errdefer(...)` guards backed by `core::mem::DropGuard`.
     fn emit_cleanup_guards(&mut self) -> Result<()> {
-        if self.func.cleanup_blocks.is_empty() {
+        if self.func.cleanup_blocks.is_empty() || self.meta.keep_inlined_defers_direct {
             return Ok(());
         }
 
@@ -7358,6 +9288,16 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
         }
     }
 
+    /// Returns `true` when `loc` is an unnamed single-definition, single-use aggregate or call
+    /// materialization temp (`_tmp = [1, 2]; _a = Move(_tmp)`), matching `detect_aliased_container_locals`.
+    fn is_pure_init_temp(&self, loc: LocalId) -> bool {
+        !self.func.params.contains(&loc)
+            && self.func.locals[loc.0].name.is_none()
+            && self.local_def_counts.get(&loc).copied().unwrap_or(0) == 1
+            && self.aggregate_or_call_def.contains(&loc)
+            && self.local_use_counts.get(&loc).copied().unwrap_or(0) <= 1
+    }
+
     /// Detects single-definition local aliases (`dst = Copy/Move(src)`) of Arrays or Structs
     /// (commonly emitted when `MirInliner` inlines a function taking an Array or Struct param)
     /// and resolves `dst -> src` directly to preserve reference semantics with zero cloning.
@@ -7419,8 +9359,22 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             if !is_ref_semantic {
                 continue;
             }
-            let src_uses = self.local_use_counts.get(&src).copied().unwrap_or(0);
-            if src_uses <= 1 && !param_set.contains(&src) {
+            // Match `detect_aliased_container_locals` (`NG-W15-1`): fold named locals even when
+            // syntactically read once inside a loop (e.g. `_41 = Copy(win)` in `BENCH-NG-15`),
+            // skipping only pure unnamed single-use init temporaries.
+            if self.is_pure_init_temp(src) {
+                continue;
+            }
+            // Do not fold `dst -> src` if `src` is mutated along any path between `dst = Copy(src)`
+            // and a use of `dst` without passing through `dst`'s definition again.
+            if is_src_mutated_while_dst_live(
+                self.func,
+                src,
+                dst,
+                bb,
+                sidx,
+                &self.ctx.fn_metas,
+            ) {
                 continue;
             }
             if param_escapes_by_move(self.func, dst) {
@@ -9123,6 +11077,28 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             return Ok(());
         }
 
+        if let Some(struct_name) = callee.strip_suffix(".decode")
+            && !self.ctx.fn_metas.contains_key(callee)
+            && self
+                .ctx
+                .structs
+                .get(struct_name)
+                .is_some_and(|s| s.has_schema_decoders)
+        {
+            let sname = rust_struct_name(struct_name);
+            let arg_expr = args
+                .first()
+                .map(|a| self.emit_operand_str_ref(a))
+                .unwrap_or_else(|| "\"\"".to_string());
+            let call_expr = format!("{sname}::decode_json({arg_expr}, __ctx)?");
+            if self.dest_is_omitted(destination) {
+                let _ = writeln!(self.out, "{pad}let _ = {call_expr};");
+            } else {
+                self.emit_assign_place_val(destination, &call_expr, indent);
+            }
+            return Ok(());
+        }
+
         match callee {
             "print" | "println" => {
                 let is_ln = callee == "println";
@@ -9282,6 +11258,58 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                             let m_expr = self.emit_operand_value(&args[0]);
                             let k_expr = self.emit_operand_as_map_key(&args[1], &MirType::Unknown);
                             let raw = format!("{{ let __k = {k_expr}; {m_expr}.map_get(&__k)? }}");
+                            self.coerce_expr_to_type(&raw, &MirType::Unknown, &dst_ty)
+                        }
+                        _ => self.ctx.rust_default_expr(&dst_ty),
+                    };
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "map.get_unwrap" if args.len() >= 2 => {
+                if !self.dest_is_omitted(destination) {
+                    let m_ty = operand_mir_type(&args[0], self.func);
+                    let dst_ty = self.place_mir_type(destination);
+                    let expr = match m_ty {
+                        MirType::Map(k_ty, v_ty) => {
+                            let m_expr = self.emit_operand_value(&args[0]);
+                            let k_expr = self.emit_operand_as_map_key(&args[1], &k_ty);
+                            let raw = format!("{{ let __k = {k_expr}; {m_expr}.get(&__k)? }}");
+                            self.coerce_expr_to_type(&raw, &v_ty, &dst_ty)
+                        }
+                        MirType::Unknown => {
+                            let m_expr = self.emit_operand_value(&args[0]);
+                            let k_expr = self.emit_operand_as_map_key(&args[1], &MirType::Unknown);
+                            let raw = format!("{{ let __k = {k_expr}; {m_expr}.map_get(&__k)? }}");
+                            self.coerce_expr_to_type(&raw, &MirType::Unknown, &dst_ty)
+                        }
+                        _ => self.ctx.rust_default_expr(&dst_ty),
+                    };
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "map.get_unwrap_or" if args.len() >= 3 => {
+                if !self.dest_is_omitted(destination) {
+                    let m_ty = operand_mir_type(&args[0], self.func);
+                    let dst_ty = self.place_mir_type(destination);
+                    let expr = match m_ty {
+                        MirType::Map(k_ty, v_ty) => {
+                            let m_expr = self.emit_operand_value(&args[0]);
+                            let k_expr = self.emit_operand_as_map_key(&args[1], &k_ty);
+                            let def_expr = self.emit_operand_owned(&args[2], &v_ty);
+                            let raw = format!(
+                                "{{ let __k = {k_expr}; match {m_expr}.get_opt(&__k)? {{ Some(__v) => __v, None => {def_expr} }} }}"
+                            );
+                            self.coerce_expr_to_type(&raw, &v_ty, &dst_ty)
+                        }
+                        MirType::Unknown => {
+                            let m_expr = self.emit_operand_value(&args[0]);
+                            let k_expr = self.emit_operand_as_map_key(&args[1], &MirType::Unknown);
+                            let def_expr = self.emit_operand_as_aot_value(&args[2]);
+                            let raw = format!(
+                                "{{ let __k = {k_expr}; match {m_expr}.map_get_opt(&__k)? {{ Some(__v) => __v, None => {def_expr} }} }}"
+                            );
                             self.coerce_expr_to_type(&raw, &MirType::Unknown, &dst_ty)
                         }
                         _ => self.ctx.rust_default_expr(&dst_ty),
@@ -9491,6 +11519,342 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                     && !self.dest_is_omitted(destination)
                 {
                     let expr = self.emit_tostring_expr(arg);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "string.upper" if !args.is_empty() => {
+                if !self.dest_is_omitted(destination) {
+                    let s = self.emit_operand_str_ref(&args[0]);
+                    let dst_ty = self.place_mir_type(destination);
+                    let raw = format!("({s}).to_uppercase()");
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::String, &dst_ty);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "string.lower" if !args.is_empty() => {
+                if !self.dest_is_omitted(destination) {
+                    let s = self.emit_operand_str_ref(&args[0]);
+                    let dst_ty = self.place_mir_type(destination);
+                    let raw = format!("({s}).to_lowercase()");
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::String, &dst_ty);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "string.trim" if !args.is_empty() => {
+                if !self.dest_is_omitted(destination) {
+                    let s = self.emit_operand_str_ref(&args[0]);
+                    let dst_ty = self.place_mir_type(destination);
+                    let raw = format!("alloc::string::String::from(({s}).trim())");
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::String, &dst_ty);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "string.contains" if args.len() >= 2 => {
+                if !self.dest_is_omitted(destination) {
+                    let s = self.emit_operand_str_ref(&args[0]);
+                    let needle = self.emit_operand_str_ref(&args[1]);
+                    let dst_ty = self.place_mir_type(destination);
+                    let raw = format!("({s}).contains({needle})");
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::Bool, &dst_ty);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "string.starts_with" if args.len() >= 2 => {
+                if !self.dest_is_omitted(destination) {
+                    let s = self.emit_operand_str_ref(&args[0]);
+                    let prefix = self.emit_operand_str_ref(&args[1]);
+                    let dst_ty = self.place_mir_type(destination);
+                    let raw = format!("({s}).starts_with({prefix})");
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::Bool, &dst_ty);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "string.ends_with" if args.len() >= 2 => {
+                if !self.dest_is_omitted(destination) {
+                    let s = self.emit_operand_str_ref(&args[0]);
+                    let suffix = self.emit_operand_str_ref(&args[1]);
+                    let dst_ty = self.place_mir_type(destination);
+                    let raw = format!("({s}).ends_with({suffix})");
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::Bool, &dst_ty);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "string.concat" if args.len() >= 2 => {
+                if !self.dest_is_omitted(destination) {
+                    let a = self.emit_operand_str_ref(&args[0]);
+                    let b = self.emit_operand_str_ref(&args[1]);
+                    let dst_ty = self.place_mir_type(destination);
+                    let raw = format!(
+                        "{{ let mut __s = alloc::string::String::from({a}); __s.push_str({b}); __s }}"
+                    );
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::String, &dst_ty);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "string.sub" if args.len() >= 2 => {
+                if !self.dest_is_omitted(destination) {
+                    let s = self.emit_operand_str_ref(&args[0]);
+                    let start = self.emit_operand_owned(&args[1], &MirType::Int);
+                    let end = args
+                        .get(2)
+                        .map(|a| format!("Some({})", self.emit_operand_owned(a, &MirType::Int)))
+                        .unwrap_or_else(|| "None".to_string());
+                    let dst_ty = self.place_mir_type(destination);
+                    let raw = format!("__lust_aot_string_sub({s}, {start}, {end})");
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::String, &dst_ty);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "string.byte" if !args.is_empty() => {
+                if !self.dest_is_omitted(destination) {
+                    let s = self.emit_operand_str_ref(&args[0]);
+                    let start = args
+                        .get(1)
+                        .map(|a| self.emit_operand_owned(a, &MirType::Int))
+                        .unwrap_or_else(|| "1_i64".to_string());
+                    let end = args
+                        .get(2)
+                        .map(|a| format!("Some({})", self.emit_operand_owned(a, &MirType::Int)))
+                        .unwrap_or_else(|| "None".to_string());
+                    let dst_ty = self.place_mir_type(destination);
+                    let expr = match &dst_ty {
+                        MirType::Array(inner) if matches!(**inner, MirType::Int) => {
+                            format!("__lust_aot_string_byte_ints({s}, {start}, {end}, __alloc)")
+                        }
+                        MirType::Array(_) => {
+                            format!("__lust_aot_string_byte_vals({s}, {start}, {end}, __alloc)")
+                        }
+                        MirType::Int => format!(
+                            "{{ let __b = __lust_aot_string_byte_ints({s}, {start}, {end}, __alloc); __b.first().copied().unwrap_or(0_i64) }}"
+                        ),
+                        MirType::Unknown => format!(
+                            "{{ let __b = __lust_aot_string_byte_vals({s}, {start}, {end}, __alloc); lust_aot_rt::AotValue::array(__b.into_iter().collect()) }}"
+                        ),
+                        _ => format!("__lust_aot_string_byte_vals({s}, {start}, {end}, __alloc)"),
+                    };
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "string.split" if args.len() >= 2 => {
+                if !self.dest_is_omitted(destination) {
+                    let s = self.emit_operand_str_ref(&args[0]);
+                    let sep = self.emit_operand_str_ref(&args[1]);
+                    let dst_ty = self.place_mir_type(destination);
+                    let expr = match &dst_ty {
+                        MirType::Array(inner) if matches!(**inner, MirType::Unknown) => format!(
+                            "{{ let __parts = __lust_aot_string_split({s}, {sep}, __alloc); let mut __out = alloc::vec::Vec::new_in(__alloc); for __p in __parts {{ __out.push(lust_aot_rt::AotValue::str(__p)); }} __out }}"
+                        ),
+                        MirType::Unknown => format!(
+                            "{{ let __parts = __lust_aot_string_split({s}, {sep}, __alloc); lust_aot_rt::AotValue::array(__parts.into_iter().map(lust_aot_rt::AotValue::str).collect()) }}"
+                        ),
+                        _ => format!("__lust_aot_string_split({s}, {sep}, __alloc)"),
+                    };
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "string.gsub" if args.len() >= 3 => {
+                let s = self.emit_operand_str_ref(&args[0]);
+                let pat = self.emit_operand_str_ref(&args[1]);
+                let repl = self.emit_operand_str_ref(&args[2]);
+                let limit = args
+                    .get(3)
+                    .map(|a| format!("Some({})", self.emit_operand_owned(a, &MirType::Int)))
+                    .unwrap_or_else(|| "None".to_string());
+                if self.dest_is_omitted(destination) {
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}let _ = __lust_aot_string_gsub({s}, {pat}, {repl}, {limit})?;"
+                    );
+                } else {
+                    let dst_ty = self.place_mir_type(destination);
+                    let expr = match &dst_ty {
+                        MirType::Array(inner) if matches!(**inner, MirType::String) => format!(
+                            "{{ let (__out, __cnt) = __lust_aot_string_gsub({s}, {pat}, {repl}, {limit})?; let mut __v = alloc::vec::Vec::new_in(__alloc); __v.push(__out); let mut __cs = alloc::string::String::new(); lust_aot_rt::string_append_int(&mut __cs, __cnt); __v.push(__cs); __v }}"
+                        ),
+                        MirType::String => format!(
+                            "__lust_aot_string_gsub({s}, {pat}, {repl}, {limit})?.0"
+                        ),
+                        MirType::Unknown => format!(
+                            "{{ let (__out, __cnt) = __lust_aot_string_gsub({s}, {pat}, {repl}, {limit})?; lust_aot_rt::AotValue::array(alloc::vec![lust_aot_rt::AotValue::str(__out), lust_aot_rt::AotValue::Int(__cnt)]) }}"
+                        ),
+                        _ => format!(
+                            "{{ let (__out, __cnt) = __lust_aot_string_gsub({s}, {pat}, {repl}, {limit})?; let mut __v = alloc::vec::Vec::new_in(__alloc); __v.push(lust_aot_rt::AotValue::str(__out)); __v.push(lust_aot_rt::AotValue::Int(__cnt)); __v }}"
+                        ),
+                    };
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "string.find" if args.len() >= 2 => {
+                if !self.dest_is_omitted(destination) {
+                    let s = self.emit_operand_str_ref(&args[0]);
+                    let pat = self.emit_operand_str_ref(&args[1]);
+                    let start = args
+                        .get(2)
+                        .map(|a| self.emit_operand_owned(a, &MirType::Int))
+                        .unwrap_or_else(|| "1_i64".to_string());
+                    let plain = args
+                        .get(3)
+                        .map(|a| self.emit_operand_bool(a))
+                        .unwrap_or_else(|| "false".to_string());
+                    let dst_ty = self.place_mir_type(destination);
+                    let expr = match &dst_ty {
+                        MirType::Array(inner) if matches!(**inner, MirType::Int) => format!(
+                            "match __lust_aot_string_find({s}, {pat}, {start}, {plain})? {{ Some((__a, __b, _)) => {{ let mut __v = alloc::vec::Vec::new_in(__alloc); __v.push(__a); __v.push(__b); __v }}, None => alloc::vec::Vec::new_in(__alloc) }}"
+                        ),
+                        MirType::Int => format!(
+                            "__lust_aot_string_find({s}, {pat}, {start}, {plain})?.map(|(__a, _, _)| __a).unwrap_or(-1_i64)"
+                        ),
+                        MirType::Option(_) => format!(
+                            "__lust_aot_string_find({s}, {pat}, {start}, {plain})?.map(|(__a, _, _)| __a)"
+                        ),
+                        MirType::Unknown => format!(
+                            "match __lust_aot_string_find({s}, {pat}, {start}, {plain})? {{ Some((__a, __b, __caps)) => {{ let mut __v = alloc::vec![lust_aot_rt::AotValue::Int(__a), lust_aot_rt::AotValue::Int(__b)]; for __c in __caps {{ __v.push(lust_aot_rt::AotValue::str(__c)); }} lust_aot_rt::AotValue::array(__v) }}, None => lust_aot_rt::AotValue::Nil }}"
+                        ),
+                        _ => format!(
+                            "match __lust_aot_string_find({s}, {pat}, {start}, {plain})? {{ Some((__a, __b, __caps)) => {{ let mut __v = alloc::vec::Vec::new_in(__alloc); __v.push(lust_aot_rt::AotValue::Int(__a)); __v.push(lust_aot_rt::AotValue::Int(__b)); for __c in __caps {{ __v.push(lust_aot_rt::AotValue::str(__c)); }} __v }}, None => {{ let mut __v = alloc::vec::Vec::new_in(__alloc); __v.push(lust_aot_rt::AotValue::Nil); __v }} }}"
+                        ),
+                    };
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "__mir_unknown_is_int" if !args.is_empty() => {
+                if !self.dest_is_omitted(destination) {
+                    let v = self.emit_operand_as_aot_value(&args[0]);
+                    let expr = format!("matches!(&({v}), lust_aot_rt::AotValue::Int(_))");
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "__mir_unknown_is_float" if !args.is_empty() => {
+                if !self.dest_is_omitted(destination) {
+                    let v = self.emit_operand_as_aot_value(&args[0]);
+                    let expr = format!("matches!(&({v}), lust_aot_rt::AotValue::Float(_))");
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "__mir_unknown_is_string" if !args.is_empty() => {
+                if !self.dest_is_omitted(destination) {
+                    let v = self.emit_operand_as_aot_value(&args[0]);
+                    let expr = format!("matches!(&({v}), lust_aot_rt::AotValue::Str(_))");
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "__mir_unknown_is_bool" if !args.is_empty() => {
+                if !self.dest_is_omitted(destination) {
+                    let v = self.emit_operand_as_aot_value(&args[0]);
+                    let expr = format!("matches!(&({v}), lust_aot_rt::AotValue::Bool(_))");
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "__mir_unknown_unwrap_int" if !args.is_empty() => {
+                if !self.dest_is_omitted(destination) {
+                    let v = self.emit_operand_as_aot_value(&args[0]);
+                    let expr = format!(
+                        "({v}).as_int().ok_or_else(|| lust_aot_rt::AotError::UserError(alloc::string::String::from(\"expected int\")))?"
+                    );
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "__mir_unknown_unwrap_float" if !args.is_empty() => {
+                if !self.dest_is_omitted(destination) {
+                    let v = self.emit_operand_as_aot_value(&args[0]);
+                    let expr = format!("({v}).as_float_coerced()?");
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "__mir_unknown_unwrap_string" if !args.is_empty() => {
+                if !self.dest_is_omitted(destination) {
+                    let v = self.emit_operand_as_aot_value(&args[0]);
+                    let expr = format!(
+                        "match &({v}) {{ lust_aot_rt::AotValue::Str(__s) => (**__s).clone(), _ => return Err(lust_aot_rt::AotError::UserError(alloc::string::String::from(\"expected string\"))) }}"
+                    );
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "__mir_unknown_unwrap_bool" if !args.is_empty() => {
+                if !self.dest_is_omitted(destination) {
+                    let v = self.emit_operand_as_aot_value(&args[0]);
+                    let expr = format!(
+                        "({v}).as_bool().ok_or_else(|| lust_aot_rt::AotError::UserError(alloc::string::String::from(\"expected bool\")))?"
+                    );
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "__mir_unknown_get_field" if args.len() >= 2 => {
+                let obj = self.emit_operand_as_aot_value(&args[0]);
+                let field = self.emit_operand_str_ref(&args[1]);
+                let raw = format!("__lust_aot_unknown_get_field(&({obj}), {field})?");
+                if self.dest_is_omitted(destination) {
+                    let _ = writeln!(self.out, "{pad}let _ = {raw};");
+                } else {
+                    let dst_ty = self.place_mir_type(destination);
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::Unknown, &dst_ty);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "__mir_unknown_call_method" if args.len() >= 2 => {
+                let obj = self.emit_operand_as_aot_value(&args[0]);
+                let method = self.emit_operand_str_ref(&args[1]);
+                let rest: Vec<String> = args[2..]
+                    .iter()
+                    .map(|a| self.emit_operand_as_aot_value(a))
+                    .collect();
+                let arena_arg = if self.ctx.module_uses_arena {
+                    ", __arena"
+                } else {
+                    ""
+                };
+                let raw = format!(
+                    "__lust_aot_unknown_call_method(__ctx, __alloc{arena_arg}, &({obj}), {method}, &[{}])?",
+                    rest.join(", ")
+                );
+                if self.dest_is_omitted(destination)
+                    || matches!(self.place_mir_type(destination), MirType::Unit)
+                {
+                    let _ = writeln!(self.out, "{pad}let _ = {raw};");
+                } else {
+                    let dst_ty = self.place_mir_type(destination);
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::Unknown, &dst_ty);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+                return Ok(());
+            }
+            "Queue" | "sync.Queue" | "@std/sync.Queue" => {
+                let cap = args
+                    .first()
+                    .map(|a| self.emit_operand_owned(a, &MirType::Int))
+                    .unwrap_or_else(|| "64_i64".to_string());
+                let strat = args
+                    .get(1)
+                    .map(|a| self.emit_operand_str_ref(a))
+                    .unwrap_or_else(|| "\"suspend\"".to_string());
+                let raw = format!("__lust_aot_new_queue({cap}, {strat}, __ctx)?");
+                if self.dest_is_omitted(destination) {
+                    let _ = writeln!(self.out, "{pad}let _ = {raw};");
+                } else {
+                    let dst_ty = self.place_mir_type(destination);
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::Unknown, &dst_ty);
                     self.emit_assign_place_val(destination, &expr, indent);
                 }
                 return Ok(());
@@ -10996,44 +13360,67 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             let raw_call = format!("{}({})", thunk_meta.rust_name, thunk_args.join(", "));
             let ret_rust = self.ctx.rust_type(&thunk_meta.return_type, "'a");
 
-            let _ = writeln!(self.out, "{pad}let __sync_res = {{");
-            for b in &cap_bindings {
-                let _ = writeln!(self.out, "{pad}    {b}");
-            }
-            for (pi, (svc_key, prov_op)) in plan.providers.iter().enumerate() {
-                let in_ctx = if pi == 0 {
-                    "__ctx".to_string()
+            // Fast path (`NG-W15-1`, `F-02`): pure synchronous lifted thunk with no providers
+            // and no `AotCtx` requirement bypasses `lust_aot_rt::with_aot_scope` completely.
+            if plan.providers.is_empty() && !thunk_meta.needs_ctx {
+                let unwrapped_call = if thunk_meta.can_fail
+                    || self.in_cleanup_closure.is_some()
+                    || self.meta.can_fail
+                {
+                    format!("{raw_call}?")
                 } else {
-                    format!("__p_ctx_{pi}")
+                    format!("match {raw_call} {{ Ok(__v) => __v }}")
                 };
-                let out_ctx = format!("__p_ctx_{}", pi + 1);
-                let prov_val = self.emit_operand_as_aot_value(prov_op);
-                let inner_pad = "    ".repeat(indent + 1 + pi);
+                if cap_bindings.is_empty() {
+                    let _ = writeln!(self.out, "{pad}let __sync_res = {unwrapped_call};");
+                } else {
+                    let _ = writeln!(self.out, "{pad}let __sync_res = {{");
+                    for b in &cap_bindings {
+                        let _ = writeln!(self.out, "{pad}    {b}");
+                    }
+                    let _ = writeln!(self.out, "{pad}    {unwrapped_call}");
+                    let _ = writeln!(self.out, "{pad}}};");
+                }
+            } else {
+                let _ = writeln!(self.out, "{pad}let __sync_res = {{");
+                for b in &cap_bindings {
+                    let _ = writeln!(self.out, "{pad}    {b}");
+                }
+                for (pi, (svc_key, prov_op)) in plan.providers.iter().enumerate() {
+                    let in_ctx = if pi == 0 {
+                        "__ctx".to_string()
+                    } else {
+                        format!("__p_ctx_{pi}")
+                    };
+                    let out_ctx = format!("__p_ctx_{}", pi + 1);
+                    let prov_val = self.emit_operand_as_aot_value(prov_op);
+                    let inner_pad = "    ".repeat(indent + 1 + pi);
+                    let _ = writeln!(
+                        self.out,
+                        "{inner_pad}lust_aot_rt::with_provided_service({in_ctx}, {svc_key:?}, {prov_val}, |{out_ctx}: &mut lust_aot_rt::AotCtx| -> Result<{ret_rust}, lust_aot_rt::AotError> {{"
+                    );
+                }
+                let body_pad = "    ".repeat(indent + 1 + plan.providers.len());
+                let scope_suffix = if plan.providers.is_empty() { "?" } else { "" };
                 let _ = writeln!(
                     self.out,
-                    "{inner_pad}lust_aot_rt::with_provided_service({in_ctx}, {svc_key:?}, {prov_val}, |{out_ctx}: &mut lust_aot_rt::AotCtx| -> Result<{ret_rust}, lust_aot_rt::AotError> {{"
+                    "{body_pad}lust_aot_rt::with_aot_scope({final_ctx_var}, |__eff_scope_ctx: &mut lust_aot_rt::AotCtx| -> Result<{ret_rust}, lust_aot_rt::AotError> {{"
                 );
-            }
-            let body_pad = "    ".repeat(indent + 1 + plan.providers.len());
-            let scope_suffix = if plan.providers.is_empty() { "?" } else { "" };
-            let _ = writeln!(
-                self.out,
-                "{body_pad}lust_aot_rt::with_aot_scope({final_ctx_var}, |__eff_scope_ctx: &mut lust_aot_rt::AotCtx| -> Result<{ret_rust}, lust_aot_rt::AotError> {{"
-            );
-            let _ = writeln!(
-                self.out,
-                "{body_pad}    {raw_call}.map_err(lust_aot_rt::AotError::from)"
-            );
-            let _ = writeln!(self.out, "{body_pad}}}){scope_suffix}");
-            for pi in (0..plan.providers.len()).rev() {
-                let inner_pad = "    ".repeat(indent + 1 + pi);
-                if pi == 0 {
-                    let _ = writeln!(self.out, "{inner_pad}}})?");
-                } else {
-                    let _ = writeln!(self.out, "{inner_pad}}})");
+                let _ = writeln!(
+                    self.out,
+                    "{body_pad}    {raw_call}.map_err(lust_aot_rt::AotError::from)"
+                );
+                let _ = writeln!(self.out, "{body_pad}}}){scope_suffix}");
+                for pi in (0..plan.providers.len()).rev() {
+                    let inner_pad = "    ".repeat(indent + 1 + pi);
+                    if pi == 0 {
+                        let _ = writeln!(self.out, "{inner_pad}}})?");
+                    } else {
+                        let _ = writeln!(self.out, "{inner_pad}}})");
+                    }
                 }
+                let _ = writeln!(self.out, "{pad}}};");
             }
-            let _ = writeln!(self.out, "{pad}}};");
 
             if !self.dest_is_omitted(destination) {
                 let dst_ty = self.place_mir_type(destination);
@@ -11476,6 +13863,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                         cargs.join(", ")
                     )
                 }
+                MirType::Struct(_) => coerce_rust_to_aot_value(expr, src_ty, self.ctx),
                 MirType::Unknown | MirType::Effect { .. } => format!("({expr}).clone()"),
                 _ => format!("lust_aot_rt::AotValue::str(alloc::format!(\"{{:?}}\", {expr}))"),
             };
@@ -11489,6 +13877,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 ),
                 MirType::Float => format!("({expr}).as_float_coerced()?"),
                 MirType::String => format!("({expr}).to_display_string()"),
+                MirType::Struct(_) => coerce_aot_value_to_rust(expr, dst_ty, self.ctx),
                 _ => expr.to_string(),
             };
         }
@@ -11546,9 +13935,22 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                                     }
                                 }
                                 MirType::Array(_) => {
-                                    format!(
-                                        "core::mem::replace(&mut {var}, alloc::vec::Vec::new_in(__alloc))"
-                                    )
+                                    if self.is_param(r).is_some_and(|(_, m)| {
+                                        matches!(m, ParamMode::RefSlice | ParamMode::MutVec)
+                                    }) {
+                                        format!(
+                                            "{{ let mut __v = alloc::vec::Vec::new_in(__alloc); __v.extend_from_slice({var}); __v }}"
+                                        )
+                                    } else if is_move
+                                        && self.is_pure_init_temp(r)
+                                        && self.local_use_counts.get(&r).copied().unwrap_or(0) <= 1
+                                    {
+                                        format!(
+                                            "core::mem::replace(&mut {var}, alloc::vec::Vec::new_in(__alloc))"
+                                        )
+                                    } else {
+                                        format!("{var}.clone()")
+                                    }
                                 }
                                 MirType::Map(_, _) | MirType::Function { .. } | MirType::Unknown => {
                                     format!("{var}.clone()")
@@ -11560,13 +13962,26 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                                     format!("core::mem::take(&mut {var})")
                                 }
                                 MirType::Struct(sname) => {
-                                    if self
-                                        .ctx
-                                        .structs
-                                        .get(sname)
-                                        .is_some_and(|s| s.derives_default)
-                                    {
-                                        format!("core::mem::take(&mut {var})")
+                                    if let Some(s) = self.ctx.structs.get(sname) {
+                                        if s.is_cyclic {
+                                            format!("core::mem::take(&mut {var})")
+                                        } else if s.derives_default {
+                                            if is_move
+                                                && self.is_pure_init_temp(r)
+                                                && self
+                                                    .local_use_counts
+                                                    .get(&r)
+                                                    .copied()
+                                                    .unwrap_or(0)
+                                                    <= 1
+                                            {
+                                                format!("core::mem::take(&mut {var})")
+                                            } else {
+                                                format!("{var}.clone()")
+                                            }
+                                        } else {
+                                            var
+                                        }
                                     } else {
                                         var
                                     }
@@ -11585,6 +14000,10 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 if self.ctx.is_copy_type(expected_ty) {
                     expr
                 } else if matches!(expected_ty, MirType::Option(_)) {
+                    format!("core::mem::take(&mut {expr})")
+                } else if let MirType::Struct(sname) = expected_ty
+                    && self.ctx.structs.get(sname).is_some_and(|s| s.is_cyclic)
+                {
                     format!("core::mem::take(&mut {expr})")
                 } else {
                     format!("{expr}.clone()")

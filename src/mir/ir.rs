@@ -989,20 +989,35 @@ impl MirFunction {
                     idx, self.locals.len(), self.signature.name
                 ));
             }
+            fn is_supported_deopt_mir_type(ty: &MirType) -> bool {
+                match ty {
+                    MirType::Int
+                    | MirType::Bool
+                    | MirType::Float
+                    | MirType::Unit
+                    | MirType::String => true,
+                    MirType::Array(inner) => {
+                        matches!(
+                            &**inner,
+                            MirType::Int | MirType::Bool | MirType::Float | MirType::String
+                        ) || matches!(&**inner, MirType::Struct(name) if !name.is_empty())
+                    }
+                    MirType::Struct(name) => !name.is_empty(),
+                    MirType::Option(inner) => {
+                        matches!(
+                            &**inner,
+                            MirType::Int | MirType::Bool | MirType::Float | MirType::String
+                        ) || matches!(&**inner, MirType::Struct(name) if !name.is_empty())
+                    }
+                    MirType::Map(k, v) => {
+                        is_supported_deopt_mir_type(k) && is_supported_deopt_mir_type(v)
+                    }
+                    MirType::Enum(name) => !name.is_empty(),
+                    _ => false,
+                }
+            }
             let ty = &self.locals[idx].ty;
-            let is_supported = matches!(
-                ty,
-                MirType::Int | MirType::Bool | MirType::Float | MirType::Unit | MirType::String
-            ) || matches!(
-                ty,
-                MirType::Array(inner)
-                    if matches!(&**inner, MirType::Int | MirType::Bool | MirType::Float)
-            ) || matches!(ty, MirType::Struct(name) if !name.is_empty())
-                || matches!(
-                    ty,
-                    MirType::Option(inner)
-                        if matches!(&**inner, MirType::Struct(name) if !name.is_empty())
-                );
+            let is_supported = is_supported_deopt_mir_type(ty);
             if !is_supported {
                 return Err(alloc::format!(
                     "Cannot derive proven compiler site metadata for deopt site {}: local {} has unsupported deopt type {:?} (Unsupported non-scalar type)",
@@ -1150,6 +1165,8 @@ impl MirFunction {
             hashbrown::HashMap::new();
         let mut lt_len_defs: hashbrown::HashMap<usize, (usize, LocalId, Operand)> =
             hashbrown::HashMap::new();
+        let mut len_defs: hashbrown::HashMap<usize, (usize, LocalId)> =
+            hashbrown::HashMap::new();
 
         for (stmt_idx, stmt) in block.statements.iter().enumerate() {
             match stmt {
@@ -1161,6 +1178,8 @@ impl MirFunction {
                     lt_len_defs.retain(|_, (_, idx_l, len_op)| {
                         idx_l.0 != loc.0 && operand_local_id(len_op) != Some(*loc)
                     });
+                    len_defs.remove(&loc.0);
+                    len_defs.retain(|_, (_, arr_l)| arr_l.0 != loc.0);
                 }
                 Statement::Assign(Place::Local(dst), rval, _) => {
                     let mut matched_fusion = false;
@@ -1209,6 +1228,35 @@ impl MirFunction {
                                 _ => false,
                             };
                             if idx_is_int && ge_ok && lt_ok && len_non_neg {
+                                let (arr_local, s_len) = match operand_local_id(&len_op) {
+                                    Some(len_tmp) => {
+                                        if let Some(&(len_stmt_idx, arr_loc)) =
+                                            len_defs.get(&len_tmp.0)
+                                        {
+                                            let can_skip_len = self
+                                                .locals
+                                                .get(len_tmp.0)
+                                                .is_some_and(|d| !d.is_param)
+                                                && !excluded_locals.contains(&len_tmp.0)
+                                                && local_read_counts
+                                                    .get(len_tmp.0)
+                                                    .copied()
+                                                    .unwrap_or(0)
+                                                    == 1;
+                                            (
+                                                Some(arr_loc),
+                                                if can_skip_len {
+                                                    Some(len_stmt_idx)
+                                                } else {
+                                                    None
+                                                },
+                                            )
+                                        } else {
+                                            (None, None)
+                                        }
+                                    }
+                                    None => (None, None),
+                                };
                                 fusion.skip_stmts.insert(s_ge);
                                 fusion.skip_stmts.insert(s_lt);
                                 fusion.fused_checks.insert(
@@ -1217,6 +1265,8 @@ impl MirFunction {
                                         dst: *dst,
                                         idx_local: idx_ge,
                                         len_op,
+                                        arr_local,
+                                        s_len,
                                     },
                                 );
                                 ge_zero_defs.remove(&ge_loc.0);
@@ -1234,6 +1284,8 @@ impl MirFunction {
                     lt_len_defs.retain(|_, (_, idx_l, len_op)| {
                         idx_l.0 != dst.0 && operand_local_id(len_op) != Some(*dst)
                     });
+                    len_defs.remove(&dst.0);
+                    len_defs.retain(|_, (_, arr_l)| arr_l.0 != dst.0);
 
                     if !matched_fusion {
                         if let Some(idx_loc) = match_ge_zero_rvalue(rval) {
@@ -1244,8 +1296,17 @@ impl MirFunction {
                     }
 
                     match rval {
-                        Rvalue::UnaryOp(MirUnaryOp::Len, _) => {
+                        Rvalue::UnaryOp(MirUnaryOp::Len, op) => {
                             non_neg_locals.insert(dst.0);
+                            if let Some(arr_loc) = operand_local_id(op)
+                                && arr_loc != *dst
+                                && matches!(
+                                    self.locals.get(arr_loc.0).map(|d| &d.ty),
+                                    Some(MirType::Array(_))
+                                )
+                            {
+                                len_defs.insert(dst.0, (stmt_idx, arr_loc));
+                            }
                         }
                         Rvalue::Use(Operand::Constant(MirConstant::Int(c))) if *c >= 0 => {
                             non_neg_locals.insert(dst.0);
@@ -1288,6 +1349,7 @@ impl MirFunction {
         let num_blocks = self.blocks.len();
         let empty = LoopBoundsAnalysis {
             proven_in_bounds: hashbrown::HashMap::new(),
+            proven_in_bounds_at_stmt: hashbrown::HashMap::new(),
             non_neg_locals_in: vec![hashbrown::HashSet::new(); num_blocks],
         };
         if num_blocks == 0 || entry_block >= num_blocks {
@@ -1575,6 +1637,7 @@ impl MirFunction {
         if !allow_induction_proofs {
             return LoopBoundsAnalysis {
                 proven_in_bounds: hashbrown::HashMap::new(),
+                proven_in_bounds_at_stmt: hashbrown::HashMap::new(),
                 non_neg_locals_in,
             };
         }
@@ -1840,8 +1903,74 @@ impl MirFunction {
             }
         }
 
+        // Phase E (`NG-W15-6`): Direct interval/length-relation bounds proofs from Phase C
+        // (e.g., `n = array.len(stack); if n >= 4 then mid = n / 2; if stack[mid] is Ok(v)`).
+        let mut proven_in_bounds_at_stmt: hashbrown::HashMap<(usize, usize), Vec<(LocalId, LocalId)>> =
+            hashbrown::HashMap::new();
+        for b in 0..num_blocks {
+            if !reachable.contains(&b) {
+                continue;
+            }
+            let Some(in_facts) = facts_in[b].as_ref() else {
+                continue;
+            };
+            // Block-entry proven pairs: `idx.lo >= 0` and `len(arr) > idx`.
+            for (&arr_idx, arr_facts) in &in_facts.len_rels {
+                if !matches!(self.locals.get(arr_idx).map(|d| &d.ty), Some(MirType::Array(_))) {
+                    continue;
+                }
+                for lf in arr_facts {
+                    if let LenFact::GtLocal(idx_loc) = lf
+                        && arr_idx != idx_loc.0
+                        && !excluded_locals.contains(&idx_loc.0)
+                        && in_facts.interval(*idx_loc).lo >= 0
+                    {
+                        let entry = proven_in_bounds.entry(b).or_default();
+                        let pair = (LocalId(arr_idx), *idx_loc);
+                        if !entry.contains(&pair) {
+                            entry.push(pair);
+                        }
+                    }
+                }
+            }
+
+            // Per-statement proven pairs inside `b` (handles `mid = n / 2` defined in the
+            // same block as `if stack[mid] is Ok(v)`).
+            let mut cur_facts = in_facts.clone();
+            for (stmt_idx, stmt) in self.blocks[b].statements.iter().enumerate() {
+                if !cur_facts.len_rels.is_empty() {
+                    let mut pairs: Vec<(LocalId, LocalId)> = Vec::new();
+                    for (&arr_idx, arr_facts) in &cur_facts.len_rels {
+                        if !matches!(
+                            self.locals.get(arr_idx).map(|d| &d.ty),
+                            Some(MirType::Array(_))
+                        ) {
+                            continue;
+                        }
+                        for lf in arr_facts {
+                            if let LenFact::GtLocal(idx_loc) = lf
+                                && arr_idx != idx_loc.0
+                                && !excluded_locals.contains(&idx_loc.0)
+                                && cur_facts.interval(*idx_loc).lo >= 0
+                            {
+                                let pair = (LocalId(arr_idx), *idx_loc);
+                                if !pairs.contains(&pair) {
+                                    pairs.push(pair);
+                                }
+                            }
+                        }
+                    }
+                    if !pairs.is_empty() {
+                        proven_in_bounds_at_stmt.insert((b, stmt_idx), pairs);
+                    }
+                }
+                self.transfer_statement_facts(stmt, &mut cur_facts, excluded_locals);
+            }
+        }
+
         LoopBoundsAnalysis {
             proven_in_bounds,
+            proven_in_bounds_at_stmt,
             non_neg_locals_in,
         }
     }
@@ -2243,6 +2372,154 @@ impl MirFunction {
         }
     }
 
+    fn transfer_statement_facts(
+        &self,
+        stmt: &Statement,
+        facts: &mut BlockFacts,
+        excluded_locals: &hashbrown::HashSet<usize>,
+    ) {
+        match stmt {
+            Statement::StorageDead(loc, _) => {
+                facts.kill_local(*loc);
+            }
+            Statement::Assign(Place::Local(dst), rval, _) => {
+                // Evaluate RHS intervals and length facts BEFORE killing `dst`
+                let new_iv = if excluded_locals.contains(&dst.0) {
+                    None
+                } else {
+                    eval_rvalue_interval(rval, facts)
+                };
+
+                // Snapshot length facts inherited from RHS before killing `dst`
+                let mut new_self_len_facts: Vec<LenFact> = Vec::new();
+                let mut add_arr_len_facts: Vec<(usize, LenFact)> = Vec::new();
+
+                match rval {
+                    Rvalue::Aggregate(MirType::Array(_), elems) => {
+                        new_self_len_facts.push(LenFact::GeConst(elems.len() as i64));
+                    }
+                    Rvalue::UnaryOp(MirUnaryOp::Len, op) => {
+                        if let Some(arr) = operand_local_id(op)
+                            && arr != *dst
+                            && matches!(
+                                self.locals.get(arr.0).map(|d| &d.ty),
+                                Some(MirType::Array(_))
+                            )
+                        {
+                            add_arr_len_facts.push((arr.0, LenFact::EqLocal(*dst)));
+                            add_arr_len_facts.push((arr.0, LenFact::GeLocal(*dst)));
+                        }
+                    }
+                    Rvalue::Use(op) => {
+                        if let Some(src) = operand_local_id(op)
+                            && src != *dst
+                        {
+                            // Copy of an array local transfers its current length facts
+                            if let Some(src_arr_facts) = facts.len_rels.get(&src.0) {
+                                for lf in src_arr_facts {
+                                    if !len_fact_mentions(lf, *dst) {
+                                        new_self_len_facts.push(lf.clone());
+                                    }
+                                }
+                            }
+                            // Copy of a bound/length integer local propagates relations
+                            for (&arr_idx, arr_facts) in &facts.len_rels {
+                                if arr_idx == dst.0 {
+                                    continue;
+                                }
+                                for lf in arr_facts {
+                                    match lf {
+                                        LenFact::EqLocal(l) if *l == src => {
+                                            add_arr_len_facts
+                                                .push((arr_idx, LenFact::EqLocal(*dst)));
+                                            add_arr_len_facts
+                                                .push((arr_idx, LenFact::GeLocal(*dst)));
+                                        }
+                                        LenFact::GeLocal(l) if *l == src => {
+                                            add_arr_len_facts
+                                                .push((arr_idx, LenFact::GeLocal(*dst)));
+                                        }
+                                        LenFact::GtLocal(l) if *l == src => {
+                                            add_arr_len_facts
+                                                .push((arr_idx, LenFact::GtLocal(*dst)));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Rvalue::BinaryOp(
+                        MirBinaryOp::Sub,
+                        lhs,
+                        Operand::Constant(MirConstant::Int(c)),
+                    ) if *c >= 1 => {
+                        if let Some(src) = operand_local_id(lhs)
+                            && src != *dst
+                        {
+                            for (&arr_idx, arr_facts) in &facts.len_rels {
+                                if arr_idx == dst.0 {
+                                    continue;
+                                }
+                                if arr_facts.iter().any(|lf| {
+                                    matches!(
+                                        lf,
+                                        LenFact::EqLocal(l) | LenFact::GeLocal(l) if *l == src
+                                    )
+                                }) {
+                                    add_arr_len_facts.push((arr_idx, LenFact::GtLocal(*dst)));
+                                }
+                            }
+                        }
+                    }
+                    Rvalue::BinaryOp(
+                        MirBinaryOp::Div | MirBinaryOp::FloorDiv,
+                        lhs,
+                        Operand::Constant(MirConstant::Int(d)),
+                    ) if *d >= 2 => {
+                        if let Some(src) = operand_local_id(lhs)
+                            && src != *dst
+                            && facts.interval(src).lo >= 1
+                        {
+                            for (&arr_idx, arr_facts) in &facts.len_rels {
+                                if arr_idx == dst.0 {
+                                    continue;
+                                }
+                                if arr_facts.iter().any(|lf| {
+                                    matches!(
+                                        lf,
+                                        LenFact::EqLocal(l)
+                                            | LenFact::GeLocal(l)
+                                            | LenFact::GtLocal(l) if *l == src
+                                    )
+                                }) {
+                                    add_arr_len_facts.push((arr_idx, LenFact::GtLocal(*dst)));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                // Kill stale facts for `dst`
+                facts.kill_local(*dst);
+
+                // Commit new interval & length facts
+                if let Some(iv) = new_iv {
+                    facts.intervals.insert(dst.0, iv);
+                }
+                if !new_self_len_facts.is_empty() {
+                    facts.len_rels.insert(dst.0, new_self_len_facts);
+                }
+                for (arr_idx, lf) in add_arr_len_facts {
+                    let entry = facts.len_rels.entry(arr_idx).or_default();
+                    push_unique(entry, lf);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn transfer_block_facts(
         &self,
         block_idx: usize,
@@ -2254,120 +2531,7 @@ impl MirFunction {
         let block = &self.blocks[block_idx];
 
         for stmt in &block.statements {
-            match stmt {
-                Statement::StorageDead(loc, _) => {
-                    facts.kill_local(*loc);
-                }
-                Statement::Assign(Place::Local(dst), rval, _) => {
-                    // Evaluate RHS intervals and length facts BEFORE killing `dst`
-                    let new_iv = if excluded_locals.contains(&dst.0) {
-                        None
-                    } else {
-                        eval_rvalue_interval(rval, &facts)
-                    };
-
-                    // Snapshot length facts inherited from RHS before killing `dst`
-                    let mut new_self_len_facts: Vec<LenFact> = Vec::new();
-                    let mut add_arr_len_facts: Vec<(usize, LenFact)> = Vec::new();
-
-                    match rval {
-                        Rvalue::Aggregate(MirType::Array(_), elems) => {
-                            new_self_len_facts.push(LenFact::GeConst(elems.len() as i64));
-                        }
-                        Rvalue::UnaryOp(MirUnaryOp::Len, op) => {
-                            if let Some(arr) = operand_local_id(op)
-                                && arr != *dst
-                                && matches!(
-                                    self.locals.get(arr.0).map(|d| &d.ty),
-                                    Some(MirType::Array(_))
-                                )
-                            {
-                                add_arr_len_facts.push((arr.0, LenFact::EqLocal(*dst)));
-                                add_arr_len_facts.push((arr.0, LenFact::GeLocal(*dst)));
-                            }
-                        }
-                        Rvalue::Use(op) => {
-                            if let Some(src) = operand_local_id(op)
-                                && src != *dst
-                            {
-                                // Copy of an array local transfers its current length facts
-                                if let Some(src_arr_facts) = facts.len_rels.get(&src.0) {
-                                    for lf in src_arr_facts {
-                                        if !len_fact_mentions(lf, *dst) {
-                                            new_self_len_facts.push(lf.clone());
-                                        }
-                                    }
-                                }
-                                // Copy of a bound/length integer local propagates relations
-                                for (&arr_idx, arr_facts) in &facts.len_rels {
-                                    if arr_idx == dst.0 {
-                                        continue;
-                                    }
-                                    for lf in arr_facts {
-                                        match lf {
-                                            LenFact::EqLocal(l) if *l == src => {
-                                                add_arr_len_facts
-                                                    .push((arr_idx, LenFact::EqLocal(*dst)));
-                                                add_arr_len_facts
-                                                    .push((arr_idx, LenFact::GeLocal(*dst)));
-                                            }
-                                            LenFact::GeLocal(l) if *l == src => {
-                                                add_arr_len_facts
-                                                    .push((arr_idx, LenFact::GeLocal(*dst)));
-                                            }
-                                            LenFact::GtLocal(l) if *l == src => {
-                                                add_arr_len_facts
-                                                    .push((arr_idx, LenFact::GtLocal(*dst)));
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Rvalue::BinaryOp(
-                            MirBinaryOp::Sub,
-                            lhs,
-                            Operand::Constant(MirConstant::Int(c)),
-                        ) if *c >= 1 => {
-                            if let Some(src) = operand_local_id(lhs)
-                                && src != *dst
-                            {
-                                for (&arr_idx, arr_facts) in &facts.len_rels {
-                                    if arr_idx == dst.0 {
-                                        continue;
-                                    }
-                                    if arr_facts.iter().any(|lf| {
-                                        matches!(
-                                            lf,
-                                            LenFact::EqLocal(l) | LenFact::GeLocal(l) if *l == src
-                                        )
-                                    }) {
-                                        add_arr_len_facts.push((arr_idx, LenFact::GtLocal(*dst)));
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    // Kill stale facts for `dst`
-                    facts.kill_local(*dst);
-
-                    // Commit new interval & length facts
-                    if let Some(iv) = new_iv {
-                        facts.intervals.insert(dst.0, iv);
-                    }
-                    if !new_self_len_facts.is_empty() {
-                        facts.len_rels.insert(dst.0, new_self_len_facts);
-                    }
-                    for (arr_idx, lf) in add_arr_len_facts {
-                        let entry = facts.len_rels.entry(arr_idx).or_default();
-                        push_unique(entry, lf);
-                    }
-                }
-                _ => {}
-            }
+            self.transfer_statement_facts(stmt, &mut facts, excluded_locals);
         }
 
         if let Some(Terminator::Call {
@@ -2435,12 +2599,15 @@ impl MirFunction {
     }
 }
 
-/// Fused unsigned range check `(idx as u64) < (len as u64)` emitted by `NG-W14-8`.
+/// Fused unsigned range check `(idx as u64) < (len as u64)` emitted by `NG-W14-8`
+/// and extended by `NG-W15-6` with source array/len statement metadata for proven-in-bounds folding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnsignedRangeCheck {
     pub dst: LocalId,
     pub idx_local: LocalId,
     pub len_op: Operand,
+    pub arr_local: Option<LocalId>,
+    pub s_len: Option<usize>,
 }
 
 /// Per-block result of detecting fusable unsigned range checks (`NG-W14-8`).
@@ -2450,10 +2617,11 @@ pub struct BlockUnsignedRangeFusion {
     pub fused_checks: hashbrown::HashMap<usize, UnsignedRangeCheck>,
 }
 
-/// Result of conservative loop-induction bounds analysis (`NG-W14-8`).
+/// Result of conservative loop-induction bounds analysis (`NG-W14-8` / `NG-W15-6`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoopBoundsAnalysis {
     pub proven_in_bounds: hashbrown::HashMap<usize, Vec<(LocalId, LocalId)>>,
+    pub proven_in_bounds_at_stmt: hashbrown::HashMap<(usize, usize), Vec<(LocalId, LocalId)>>,
     pub non_neg_locals_in: Vec<hashbrown::HashSet<usize>>,
 }
 
@@ -2708,6 +2876,21 @@ fn eval_rvalue_interval(rval: &Rvalue, facts: &BlockFacts) -> Option<IntInterval
                     }
                 } else {
                     IntInterval::TOP
+                }
+            } else {
+                IntInterval::TOP
+            }
+        }
+        Rvalue::BinaryOp(
+            MirBinaryOp::Div | MirBinaryOp::FloorDiv,
+            lhs,
+            Operand::Constant(MirConstant::Int(d)),
+        ) if *d >= 1 => {
+            let a = facts.operand_interval(lhs);
+            if a.lo >= 0 {
+                IntInterval {
+                    lo: a.lo / *d,
+                    hi: a.hi / *d,
                 }
             } else {
                 IntInterval::TOP

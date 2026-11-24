@@ -161,9 +161,7 @@ impl MirInliner {
 
         if changed {
             while Self::simplify_cfg(caller) {}
-            for (i, block) in caller.blocks.iter_mut().enumerate() {
-                block.id = BlockId(i);
-            }
+            renumber_blocks_rpo(caller);
         }
 
         changed
@@ -226,11 +224,62 @@ impl MirInliner {
         true
     }
 
-    /// Evaluates JIT-safe eligibility of `callee` for inlining (`PERF-T1-4` / Hazard 3 Step A):
+    /// Evaluates whether a loop-bearing `callee` is a small single-loop leaf function safe to inline
+    /// into a loop call site (`NG-W15-2`):
+    /// - `callee.blocks.len() <= 8` and total non-storage statements across all blocks `<= 32`.
+    /// - Exactly one dominance-verified loop header (`Safepoints::find_loop_headers_in_fn(callee).len() == 1`).
+    /// - Zero `cleanup_blocks`, zero `is_cleanup` blocks, zero `Rvalue::Closure` statements.
+    /// - Every block terminator is `Goto`, `Cond`, `Return`, or a primitive leaf builtin `Call`
+    ///   (e.g. `array.len`, `table.len`, `string.len`, `math.*`) with `error: None` — zero user calls.
+    pub fn is_eligible_small_loop_leaf_callee(callee: &MirFunction) -> bool {
+        if callee.blocks.is_empty() || callee.entry.0 >= callee.blocks.len() {
+            return false;
+        }
+        if callee.blocks.len() > 8 {
+            return false;
+        }
+        let exec_stmts: usize = callee
+            .blocks
+            .iter()
+            .flat_map(|b| b.statements.iter())
+            .filter(|s| !matches!(s, Statement::StorageLive(..) | Statement::StorageDead(..)))
+            .count();
+        if exec_stmts > 32 {
+            return false;
+        }
+        if !callee.cleanup_blocks.is_empty() || callee.blocks.iter().any(|b| b.is_cleanup) {
+            return false;
+        }
+        if crate::mir::opt::Safepoints::find_loop_headers_in_fn(callee).len() != 1 {
+            return false;
+        }
+        for block in &callee.blocks {
+            for stmt in &block.statements {
+                if matches!(stmt, Statement::Assign(_, Rvalue::Closure { .. }, _)) {
+                    return false;
+                }
+            }
+            match &block.terminator {
+                Some(Terminator::Goto(..))
+                | Some(Terminator::Cond { .. })
+                | Some(Terminator::Return(..)) => {}
+                Some(Terminator::Call {
+                    callee: inner,
+                    error: None,
+                    ..
+                }) if is_primitive_leaf_builtin_callee(inner) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Evaluates JIT-safe eligibility of `callee` for inlining (`PERF-T1-4` / `NG-W15-2`):
     /// - Enforces all base `is_eligible_callee` guards (direct recursion, cycle in `call_stack`,
     ///   `max_depth`, valid entry, `max_callee_blocks`, `max_callee_statements`, self-recursion).
     /// - Guard 1: Never inline a callee containing any `is_effect_or_handler_callee`.
-    /// - Guard 2: Never inline a callee containing loops (`!find_loop_headers(&callee.blocks).is_empty()`).
+    /// - Guard 2: Loop-bearing callees are rejected unless invoked at an in-loop call site and
+    ///   satisfying `is_eligible_small_loop_leaf_callee` (see `is_eligible_callee_for_jit_at_site`).
     /// - Guard 3: Never inline INTO or OUT OF any function in `jit_config.excluded_functions`.
     /// - Rejects `Terminator::Raise` callees and callers exceeding `max_caller_locals` (keeps
     ///   MIR-VM continuation bytecode register indices safely within `u8`).
@@ -241,6 +290,25 @@ impl MirInliner {
         caller_local_count: usize,
         call_stack: &[String],
         jit_config: &JitInlineConfig,
+    ) -> bool {
+        self.is_eligible_callee_for_jit_at_site(
+            callee,
+            caller_name,
+            caller_local_count,
+            call_stack,
+            jit_config,
+            false,
+        )
+    }
+
+    fn is_eligible_callee_for_jit_at_site(
+        &self,
+        callee: &MirFunction,
+        caller_name: &str,
+        caller_local_count: usize,
+        call_stack: &[String],
+        jit_config: &JitInlineConfig,
+        call_site_in_loop: bool,
     ) -> bool {
         if jit_config.excluded_functions.contains(caller_name)
             || jit_config.excluded_functions.contains(&callee.signature.name)
@@ -253,7 +321,9 @@ impl MirInliner {
         if callee_has_effect_or_handler_call(callee) {
             return false;
         }
-        if callee_has_loops(callee) {
+        if callee_has_loops(callee)
+            && !(call_site_in_loop && Self::is_eligible_small_loop_leaf_callee(callee))
+        {
             return false;
         }
         if callee
@@ -332,6 +402,7 @@ impl MirInliner {
         }
         let mut block_stacks: Vec<Vec<String>> =
             vec![vec![caller.signature.name.clone()]; caller.blocks.len()];
+        let mut caller_loop_blocks = compute_natural_loop_blocks(caller);
         let mut changed = false;
         let mut block_idx = 0;
 
@@ -355,13 +426,15 @@ impl MirInliner {
                     } else {
                         vec![caller.signature.name.clone()]
                     };
+                    let call_site_in_loop = caller_loop_blocks.contains(&BlockId(block_idx));
 
-                    if self.is_eligible_callee_for_jit(
+                    if self.is_eligible_callee_for_jit_at_site(
                         callee_fn,
                         &caller.signature.name,
                         caller.locals.len(),
                         &current_stack,
                         jit_config,
+                        call_site_in_loop,
                     ) && callee_fn.params.len() == args.len()
                     {
                         let mut next_stack = current_stack;
@@ -381,6 +454,7 @@ impl MirInliner {
                         for _ in 0..added_blocks {
                             block_stacks.push(next_stack.clone());
                         }
+                        caller_loop_blocks = compute_natural_loop_blocks(caller);
 
                         changed = true;
                     }
@@ -391,9 +465,7 @@ impl MirInliner {
 
         if changed {
             while Self::simplify_cfg(caller) {}
-            for (i, block) in caller.blocks.iter_mut().enumerate() {
-                block.id = BlockId(i);
-            }
+            renumber_blocks_rpo(caller);
         }
 
         changed
@@ -404,7 +476,7 @@ impl MirInliner {
         if callee.blocks.is_empty() || callee.entry.0 >= callee.blocks.len() {
             return false;
         }
-        if !crate::mir::opt::Safepoints::find_loop_headers(&callee.blocks).is_empty() {
+        if !crate::mir::opt::Safepoints::find_loop_headers_in_fn(callee).is_empty() {
             return false;
         }
         if !callee.cleanup_blocks.is_empty() || callee.blocks.iter().any(|b| b.is_cleanup) {
@@ -680,9 +752,7 @@ impl MirInliner {
             }
 
             let loop_headers: hashbrown::HashSet<BlockId> =
-                crate::mir::opt::Safepoints::find_loop_headers(&func.blocks)
-                    .into_iter()
-                    .collect();
+                crate::mir::opt::Safepoints::find_loop_headers_in_fn(func);
 
             let mut error_targets: hashbrown::HashSet<BlockId> = hashbrown::HashSet::new();
             for block in &func.blocks {
@@ -902,7 +972,190 @@ fn callee_has_effect_or_handler_call(callee: &MirFunction) -> bool {
 }
 
 fn callee_has_loops(callee: &MirFunction) -> bool {
-    !crate::mir::opt::Safepoints::find_loop_headers(&callee.blocks).is_empty()
+    !crate::mir::opt::Safepoints::find_loop_headers_in_fn(callee).is_empty()
+}
+
+fn is_primitive_leaf_builtin_callee(callee: &str) -> bool {
+    matches!(
+        callee,
+        "array.len"
+            | "table.len"
+            | "string.len"
+            | "math.abs"
+            | "abs"
+            | "math.min"
+            | "min"
+            | "math.max"
+            | "max"
+            | "math.clamp"
+            | "clamp"
+            | "math.floor"
+            | "floor"
+            | "math.ceil"
+            | "ceil"
+            | "math.sqrt"
+            | "sqrt"
+    )
+}
+
+/// Computes all blocks belonging to any natural loop in `func` using dominance-verified
+/// backedges from `Safepoints::find_loop_backedges_in_fn`.
+fn compute_natural_loop_blocks(func: &MirFunction) -> HashSet<BlockId> {
+    let n = func.blocks.len();
+    if n == 0 || func.entry.0 >= n {
+        return HashSet::new();
+    }
+    let backedges = crate::mir::opt::Safepoints::find_loop_backedges_in_fn(func);
+    if backedges.is_empty() {
+        return HashSet::new();
+    }
+    let mut preds: Vec<Vec<BlockId>> = alloc::vec![Vec::new(); n];
+    for (idx, block) in func.blocks.iter().enumerate() {
+        if let Some(term) = &block.terminator {
+            for succ in terminator_successors(term) {
+                if succ.0 < n {
+                    preds[succ.0].push(BlockId(idx));
+                }
+            }
+        }
+    }
+    let mut in_loop = HashSet::new();
+    for (latch, header) in backedges {
+        in_loop.insert(header);
+        if latch != header && in_loop.insert(latch) {
+            let mut worklist = alloc::vec![latch];
+            while let Some(b) = worklist.pop() {
+                for &p in &preds[b.0] {
+                    if p != header && in_loop.insert(p) {
+                        worklist.push(p);
+                    }
+                }
+            }
+        }
+    }
+    in_loop
+}
+
+/// Reorders reachable blocks in Reverse Post-Order (RPO) from `func.entry` (with any
+/// entry-unreachable cleanup blocks appended in original order) and remaps all block IDs,
+/// `func.entry`, `func.cleanup_blocks`, and `func.proven_in_bounds`.
+///
+/// In a reducible CFG, RPO numbering guarantees every forward edge satisfies `src < dst`
+/// and every backedge satisfies `dst <= src`, preventing post-inline spliced return edges
+/// (`cloned_exit -> succ_bb`) from appearing as false backedges to downstream index-order passes.
+fn renumber_blocks_rpo(func: &mut MirFunction) {
+    let n = func.blocks.len();
+    if n == 0 || func.entry.0 >= n {
+        return;
+    }
+
+    let mut visited = alloc::vec![false; n];
+    let mut postorder = Vec::with_capacity(n);
+    let mut stack: Vec<(usize, Vec<usize>, usize)> = Vec::with_capacity(n);
+
+    let succs_of = |blocks: &[BasicBlock], idx: usize| -> Vec<usize> {
+        blocks
+            .get(idx)
+            .and_then(|b| b.terminator.as_ref())
+            .map(|t| {
+                terminator_successors(t)
+                    .into_iter()
+                    .map(|s| s.0)
+                    .filter(|&s| s < blocks.len())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    visited[func.entry.0] = true;
+    stack.push((func.entry.0, succs_of(&func.blocks, func.entry.0), 0));
+
+    while let Some((u, succs, next_idx)) = stack.last_mut() {
+        if *next_idx < succs.len() {
+            let v = succs[*next_idx];
+            *next_idx += 1;
+            if !visited[v] {
+                visited[v] = true;
+                let v_succs = succs_of(&func.blocks, v);
+                stack.push((v, v_succs, 0));
+            }
+        } else {
+            let u_val = *u;
+            stack.pop();
+            postorder.push(u_val);
+        }
+    }
+
+    let mut order = postorder;
+    order.reverse();
+
+    // Preserve any cleanup blocks (and blocks reachable from them) not reached from `func.entry`.
+    let mut cleanup_worklist: Vec<usize> = Vec::new();
+    for entry in &func.cleanup_blocks {
+        if entry.block.0 < n && !visited[entry.block.0] {
+            visited[entry.block.0] = true;
+            cleanup_worklist.push(entry.block.0);
+        }
+    }
+    for (idx, b) in func.blocks.iter().enumerate() {
+        if b.is_cleanup && !visited[idx] {
+            visited[idx] = true;
+            cleanup_worklist.push(idx);
+        }
+    }
+    let mut wi = 0;
+    while wi < cleanup_worklist.len() {
+        let u = cleanup_worklist[wi];
+        wi += 1;
+        order.push(u);
+        for v in succs_of(&func.blocks, u) {
+            if !visited[v] {
+                visited[v] = true;
+                cleanup_worklist.push(v);
+            }
+        }
+    }
+
+    let is_identity = order.len() == n && order.iter().enumerate().all(|(i, &b)| i == b);
+    if is_identity {
+        for (i, b) in func.blocks.iter_mut().enumerate() {
+            b.id = BlockId(i);
+        }
+        return;
+    }
+
+    let mut remap: HashMap<BlockId, BlockId> = HashMap::with_capacity(order.len());
+    let mut new_blocks: Vec<BasicBlock> = Vec::with_capacity(order.len());
+    for (new_idx, &old_idx) in order.iter().enumerate() {
+        let new_id = BlockId(new_idx);
+        remap.insert(BlockId(old_idx), new_id);
+        let mut blk = func.blocks[old_idx].clone();
+        blk.id = new_id;
+        new_blocks.push(blk);
+    }
+
+    for block in &mut new_blocks {
+        if let Some(term) = &mut block.terminator {
+            patch_terminator_targets(term, &remap);
+        }
+    }
+
+    if let Some(&new_entry) = remap.get(&func.entry) {
+        func.entry = new_entry;
+    }
+    for entry in &mut func.cleanup_blocks {
+        if let Some(&new_id) = remap.get(&entry.block) {
+            entry.block = new_id;
+        }
+    }
+    let mut new_proven = HashMap::new();
+    for (old_b_idx, pairs) in &func.proven_in_bounds {
+        if let Some(&new_id) = remap.get(&BlockId(*old_b_idx)) {
+            new_proven.insert(new_id.0, pairs.clone());
+        }
+    }
+    func.proven_in_bounds = new_proven;
+    func.blocks = new_blocks;
 }
 
 /// Computes all module functions that participate in a direct or mutual recursion cycle

@@ -2,10 +2,14 @@ use super::*;
 use crate::ast::StructLiteralField;
 impl Compiler {
     pub(super) fn is_unshadowed_array_module(&self, name: &str) -> bool {
-        if name != "array" {
-            return false;
-        }
-        if self.resolve_local(name).is_ok() || self.is_module_level_identifier(name) {
+        name == "array" && self.is_unshadowed_std_module(name)
+    }
+
+    fn is_unshadowed_std_module(&self, name: &str) -> bool {
+        if self.resolve_local(name).is_ok()
+            || self.lookup_effect_thunk(name).is_some()
+            || self.is_module_level_identifier(name)
+        {
             return false;
         }
         if self.function_table.contains_key(name) || self.extern_value_aliases.contains_key(name) {
@@ -21,10 +25,87 @@ impl Compiler {
                 return false;
             }
             if let Some(target) = imports.module_aliases.get(name) {
-                return target == "array" || target == "std.array";
+                return target == name || target.strip_prefix("std.") == Some(name);
             }
         }
-        self.is_stdlib_symbol("array")
+        self.is_stdlib_symbol(name)
+    }
+
+    pub(super) fn builtin_map_args<'a>(
+        &self,
+        expr: &'a Expr,
+        operation: &str,
+    ) -> Option<&'a [Expr]> {
+        let ExprKind::Call {
+            callee,
+            args,
+            type_args: None,
+        } = &expr.kind
+        else {
+            return None;
+        };
+        match &callee.kind {
+            ExprKind::FieldAccess { object, field }
+                if field == operation
+                    && args.len() == if operation == "set" { 3 } else { 2 }
+                    && matches!(&object.kind, ExprKind::Identifier(name)
+                        if name == "map" && self.is_unshadowed_std_module(name)) =>
+            {
+                Some(args)
+            }
+            _ => None,
+        }
+    }
+
+    fn map_operand_registers(&mut self, args: &[Expr]) -> Result<(Register, Register, Register)> {
+        // Keep the ordinary call's left-to-right argument snapshots whenever an
+        // expression could write a register used by an earlier argument.
+        if args
+            .iter()
+            .all(|arg| matches!(arg.kind, ExprKind::Identifier(_) | ExprKind::Literal(_)))
+        {
+            let map = self.compile_expr(&args[0])?;
+            let key = self.compile_expr(&args[1])?;
+            let value = if args.len() == 3 {
+                self.compile_expr(&args[2])?
+            } else {
+                0
+            };
+            Ok((map, key, value))
+        } else {
+            let refs: Vec<_> = args.iter().collect();
+            let first = self.place_exprs_consecutive(&refs)?;
+            Ok((
+                first,
+                first + 1,
+                if args.len() == 3 { first + 2 } else { 0 },
+            ))
+        }
+    }
+
+    fn compile_map_get(&mut self, args: &[Expr], unwrap: bool) -> Result<Register> {
+        let saved_register = self.next_register;
+        let (map, key, _) = self.map_operand_registers(args)?;
+        self.next_register = saved_register;
+        let dest = self.allocate_register();
+        let inst = if unwrap {
+            Instruction::MapGetUnwrap(dest, map, key)
+        } else {
+            Instruction::MapGet(dest, map, key)
+        };
+        self.emit(inst, 0);
+        Ok(dest)
+    }
+
+    pub(super) fn try_compile_map_set(&mut self, expr: &Expr) -> Result<bool> {
+        let Some(args) = self.builtin_map_args(expr, "set") else {
+            return Ok(false);
+        };
+        let saved_register = self.next_register;
+        let (map, key, value) = self.map_operand_registers(args)?;
+        self.emit(Instruction::MapSet(map, key, value), expr.span.start_line);
+        self.next_register = saved_register;
+        Ok(true)
     }
 
     pub(super) fn try_compile_array_void_call(&mut self, expr: &Expr) -> Result<bool> {
@@ -357,6 +438,14 @@ impl Compiler {
                 args,
                 type_args,
             } => {
+                if let Some(args) = self.builtin_map_args(expr, "get") {
+                    return self.compile_map_get(args, false);
+                }
+                if self.try_compile_map_set(expr)? {
+                    let result_reg = self.allocate_register();
+                    self.emit(Instruction::LoadNil(result_reg), 0);
+                    return Ok(result_reg);
+                }
                 if let ExprKind::Identifier(fn_name) = &callee.kind {
                     if fn_name == "Ok" || fn_name == "Err" {
                         let enum_name_idx = self.add_string_constant("Result");
@@ -522,7 +611,7 @@ impl Compiler {
                         let resolved_type = self.resolve_type_name(type_name);
                         let resolved_candidate = format!("{}.{}", resolved_type, field);
                         if resolved_candidate != alias_candidate {
-                            candidates.push(resolved_candidate);
+                            candidates.push(resolved_candidate.clone());
                         }
 
                         for static_method_name in &candidates {
@@ -551,9 +640,17 @@ impl Compiler {
                         }
 
                         for static_method_name in &candidates {
-                            if let Some(runtime_name) =
-                                self.extern_value_aliases.get(static_method_name).cloned()
-                            {
+                            let runtime_name = self
+                                .extern_value_aliases
+                                .get(static_method_name)
+                                .cloned()
+                                .or_else(|| {
+                                    (field == "decode"
+                                        && self.struct_defs.contains_key(&resolved_type)
+                                        && static_method_name == &resolved_candidate)
+                                        .then(|| resolved_candidate.clone())
+                                });
+                            if let Some(runtime_name) = runtime_name {
                                 let func_reg = self.allocate_register();
                                 let name_idx = self.add_string_constant(&runtime_name);
                                 self.emit(Instruction::LoadGlobal(func_reg, name_idx), 0);
@@ -643,6 +740,9 @@ impl Compiler {
                     let mut index_expr = receiver.as_ref();
                     while let ExprKind::Paren(inner) = &index_expr.kind {
                         index_expr = inner;
+                    }
+                    if let Some(args) = self.builtin_map_args(index_expr, "get") {
+                        return self.compile_map_get(args, true);
                     }
                     if let ExprKind::Index { object, index } = &index_expr.kind {
                         let obj_reg = self.compile_expr(object)?;

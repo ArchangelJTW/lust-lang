@@ -1,6 +1,12 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use crate::bytecode::{Value, ValueKey};
+use crate::vm::stdlib::{
+    normalize_range, string_byte_values, string_find_values, string_gsub_fast, string_split_values,
+    string_sub_slice,
+};
 use alloc::boxed::Box;
+use hashbrown::hash_map::Entry;
 use alloc::vec::Vec;
 #[cfg(not(feature = "std"))]
 use core::sync::atomic::{AtomicI64, AtomicUsize};
@@ -267,7 +273,7 @@ pub struct MirContext {
     #[cfg(feature = "std")]
     pub interned_list: LocalLock<Vec<alloc::string::String>>,
     #[cfg(feature = "std")]
-    pub small_digit_handles: [LocalCell<i64>; 10],
+    pub small_digit_handles: [LocalCell<i64>; SMALL_INT_STRING_COUNT],
     #[cfg(feature = "std")]
     pub struct_fields: LocalLock<hashbrown::HashMap<alloc::string::String, Vec<crate::mir::ir::MirType>>>,
     #[cfg(feature = "std")]
@@ -320,7 +326,7 @@ impl MirContext {
             borrowed_scope_floors: LocalLock::new(Vec::new()),
             interned_strings: LocalLock::new(hashbrown::HashMap::new()),
             interned_list: LocalLock::new(Vec::new()),
-            small_digit_handles: core::array::from_fn(|_| LocalCell::new(0)),
+            small_digit_handles: [const { LocalCell::new(0) }; SMALL_INT_STRING_COUNT],
             struct_fields: LocalLock::new(hashbrown::HashMap::new()),
             struct_type_names: LocalLock::new(hashbrown::HashSet::new()),
             last_struct_type_name: core::cell::RefCell::new(None),
@@ -574,7 +580,7 @@ impl MirContext {
         #[cfg(feature = "std")]
         {
             if handle < 0 {
-                let idx = ((-handle) - 1) as usize;
+                let idx = usize::try_from(handle.unsigned_abs() - 1).ok()?;
                 let list = self.interned_list.borrow();
                 if let Some(s) = list.get(idx) {
                     return Some(crate::bytecode::Value::string(s.clone()));
@@ -2410,42 +2416,63 @@ pub extern "C" fn lust_mir_string_append_inplace(lhs_handle: i64, rhs_handle: i6
     }
 }
 
+pub(crate) const SMALL_INT_STRING_COUNT: usize = 1024;
+
+pub(crate) fn format_i64_stack(value: i64, buf: &mut [u8; 24]) -> &str {
+    let mut magnitude = value.unsigned_abs();
+    let mut start = buf.len();
+    loop {
+        start -= 1;
+        buf[start] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        start -= 1;
+        buf[start] = b'-';
+    }
+    core::str::from_utf8(&buf[start..]).expect("integer formatting produces ASCII")
+}
+
+fn charge_handle_bytes(ctx: &MirContext, bytes: usize) -> bool {
+    if let Ok(bytes) = i64::try_from(bytes)
+        && let Some(total) = ctx.memory_used().checked_add(bytes)
+        && total <= ctx.max_memory_limit()
+    {
+        ctx.set_memory_used(total);
+        return true;
+    }
+    ctx.set_status(MIR_STATUS_ERR_OOM);
+    false
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_tostring_int(v: i64) -> i64 {
     with_current_mir_context(|ctx| {
-        #[cfg(feature = "std")]
-        if (0..10).contains(&v) {
-            const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
-            let bytes: i64 = 1;
-            let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
-            let prev = ctx.memory_used.fetch_add(bytes, Ordering::SeqCst);
-            if prev.saturating_add(bytes) > limit {
-                ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
-                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+        if (0..SMALL_INT_STRING_COUNT as i64).contains(&v) {
+            let digits = match v {
+                0..=9 => 1,
+                10..=99 => 2,
+                100..=999 => 3,
+                _ => 4,
+            };
+            if !charge_handle_bytes(ctx, digits) {
                 return 0;
             }
-            let idx = v as usize;
-            let cached = ctx.small_digit_handles[idx].load(Ordering::Relaxed);
-            if cached < 0 {
-                return cached;
+            let cached = &ctx.small_digit_handles[v as usize];
+            if cached.get() == 0 {
+                cached.set(ctx.intern_string(format_i64_stack(v, &mut [0; 24])));
             }
-            let h = ctx.intern_string(DIGITS[idx]);
-            ctx.small_digit_handles[idx].store(h, Ordering::Relaxed);
-            return h;
+            return cached.get();
         }
-        let s = alloc::format!("{}", crate::bytecode::Value::Int(v));
-        let Ok(bytes) = i64::try_from(s.len()) else {
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
-            return 0;
-        };
-        let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
-        let prev = ctx.memory_used.fetch_add(bytes, Ordering::SeqCst);
-        if prev.saturating_add(bytes) > limit {
-            ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+        let mut buffer = [0; 24];
+        let text = format_i64_stack(v, &mut buffer);
+        if !charge_handle_bytes(ctx, text.len()) {
             return 0;
         }
-        ctx.register_handle(crate::bytecode::Value::string(s))
+        ctx.register_handle(Value::string(text))
     })
 }
 
@@ -2506,6 +2533,132 @@ pub extern "C" fn lust_mir_string_len(handle: i64) -> i64 {
             Some(crate::bytecode::Value::String(s)) => s.len() as i64,
             _ => 0,
         }
+    })
+}
+
+fn string_handle(ctx: &MirContext, handle: i64) -> Option<alloc::rc::Rc<alloc::string::String>> {
+    match ctx.get_handle(handle) {
+        Some(Value::String(text)) => Some(text),
+        _ => {
+            ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+            None
+        }
+    }
+}
+
+fn register_string_results(ctx: &MirContext, values: Vec<Value>) -> i64 {
+    let bytes = values.iter().fold(
+        values.len().saturating_mul(core::mem::size_of::<Value>()),
+        |bytes, value| bytes.saturating_add(value.as_string().map_or(0, str::len)),
+    );
+    if !charge_handle_bytes(ctx, bytes) {
+        return 0;
+    }
+    ctx.register_handle(Value::array(values))
+}
+
+// Native helper calls use the active MIR context guard. The leading context
+// operand is reserved by the call ABI and is never dereferenced.
+pub extern "C" fn lust_mir_string_sub(_vm_ctx: i64, handle: i64, start: i64, end: i64) -> i64 {
+    with_current_mir_context(|ctx| {
+        let Some(text) = string_handle(ctx, handle) else {
+            return 0;
+        };
+        let slice = string_sub_slice(&text, start, Some(end));
+        if !charge_handle_bytes(ctx, slice.len()) {
+            return 0;
+        }
+        ctx.register_handle(Value::string(slice))
+    })
+}
+
+/// Returns an array of byte values. An empty range returns a single nil.
+pub extern "C" fn lust_mir_string_byte(_vm_ctx: i64, handle: i64, start: i64, end: i64) -> i64 {
+    with_current_mir_context(|ctx| {
+        let Some(text) = string_handle(ctx, handle) else {
+            return 0;
+        };
+        register_string_results(ctx, string_byte_values(&text, start, Some(end)))
+    })
+}
+
+/// Scalar byte lookup for a call that requires an integer result.
+pub extern "C" fn lust_mir_string_byte_at(_vm_ctx: i64, handle: i64, index: i64) -> i64 {
+    with_current_mir_context(|ctx| {
+        let Some(text) = string_handle(ctx, handle) else {
+            return 0;
+        };
+        let (start, end) = normalize_range(index, Some(index), text.len());
+        if start == end {
+            ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+            return 0;
+        }
+        i64::from(text.as_bytes()[start])
+    })
+}
+
+pub extern "C" fn lust_mir_string_gsub(
+    _vm_ctx: i64,
+    handle: i64,
+    pattern: i64,
+    replacement: i64,
+) -> i64 {
+    with_current_mir_context(|ctx| {
+        let Some(text) = string_handle(ctx, handle) else {
+            return 0;
+        };
+        let Some(pattern) = string_handle(ctx, pattern) else {
+            return 0;
+        };
+        let Some(replacement) = string_handle(ctx, replacement) else {
+            return 0;
+        };
+        match string_gsub_fast(&text, &pattern, &replacement) {
+            Ok((output, count)) => {
+                register_string_results(ctx, alloc::vec![Value::string(output), Value::Int(count)])
+            }
+            Err(_) => {
+                ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                0
+            }
+        }
+    })
+}
+
+/// Returns an array of 1-based endpoints and captures, or a single nil on no match.
+pub extern "C" fn lust_mir_string_find(
+    _vm_ctx: i64,
+    handle: i64,
+    pattern: i64,
+    start: i64,
+    plain: i64,
+) -> i64 {
+    with_current_mir_context(|ctx| {
+        let Some(text) = string_handle(ctx, handle) else {
+            return 0;
+        };
+        let Some(pattern) = string_handle(ctx, pattern) else {
+            return 0;
+        };
+        match string_find_values(&text, &pattern, start, plain != 0) {
+            Ok(values) => register_string_results(ctx, values),
+            Err(_) => {
+                ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                0
+            }
+        }
+    })
+}
+
+pub extern "C" fn lust_mir_string_split(_vm_ctx: i64, handle: i64, separator: i64) -> i64 {
+    with_current_mir_context(|ctx| {
+        let Some(text) = string_handle(ctx, handle) else {
+            return 0;
+        };
+        let Some(separator) = string_handle(ctx, separator) else {
+            return 0;
+        };
+        register_string_results(ctx, string_split_values(&text, &separator))
     })
 }
 
@@ -2570,17 +2723,115 @@ pub extern "C" fn lust_mir_map_set(map_handle: i64, key_handle: i64, val_handle:
             Some(v) => v,
             None => crate::bytecode::Value::Int(val_handle),
         };
-        let bytes = 32;
-        let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
-        let prev = ctx.memory_used.fetch_add(bytes, Ordering::SeqCst);
-        if prev.saturating_add(bytes) > limit {
-            ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
-            return;
-        }
-        let key = crate::bytecode::ValueKey::from(key_val);
-        map_val.borrow_mut().insert(key, val);
+        set_map_entry(ctx, &mut map_val.borrow_mut(), ValueKey::from(key_val), val);
     })
+}
+
+fn set_map_entry(ctx: &MirContext, map: &mut crate::bytecode::LustMap, key: ValueKey, value: Value) {
+    match map.entry(key) {
+        Entry::Occupied(mut entry) => {
+            entry.insert(value);
+        }
+        Entry::Vacant(entry) => {
+            if charge_handle_bytes(ctx, 32) {
+                entry.insert(value);
+            }
+        }
+    }
+}
+
+fn decode_map_operand(ctx: &MirContext, raw: i64, tag: i64) -> Option<Value> {
+    let value = match tag {
+        0 => Some(Value::Int(raw)),
+        1 => Some(Value::Bool(raw != 0)),
+        2 => Some(Value::Float(f64::from_bits(raw as u64))),
+        3 => ctx.get_handle(raw),
+        _ => None,
+    };
+    if value.is_none() {
+        ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+    }
+    value
+}
+
+fn with_typed_map<R>(
+    map_handle: i64,
+    key_raw: i64,
+    key_tag: i64,
+    access: impl FnOnce(&MirContext, &core::cell::RefCell<crate::bytecode::LustMap>, ValueKey) -> R,
+) -> Option<R> {
+    with_current_mir_context(|ctx| {
+        let Some(Value::Map(map)) = ctx.get_handle(map_handle) else {
+            ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+            return None;
+        };
+        let key = ValueKey::from(decode_map_operand(ctx, key_raw, key_tag)?);
+        Some(access(ctx, &map, key))
+    })
+}
+
+/// Returns MIR status. Operand tags are 0 = int, 1 = bool, 2 = float bits, 3 = handle.
+pub extern "C" fn lust_mir_map_set_typed(
+    _vm_ctx: i64,
+    map_handle: i64,
+    key_raw: i64,
+    val_raw: i64,
+    key_tag: i64,
+    val_tag: i64,
+) -> i64 {
+    with_typed_map(map_handle, key_raw, key_tag, |ctx, map, key| {
+        if let Some(value) = decode_map_operand(ctx, val_raw, val_tag) {
+            set_map_entry(ctx, &mut map.borrow_mut(), key, value);
+        }
+        ctx.last_status()
+    })
+    .unwrap_or(MIR_STATUS_ERR_OUT_OF_BOUNDS)
+}
+
+pub extern "C" fn lust_mir_map_get_typed(
+    _vm_ctx: i64,
+    map_handle: i64,
+    key_raw: i64,
+    key_tag: i64,
+) -> i64 {
+    with_typed_map(map_handle, key_raw, key_tag, |ctx, map, key| {
+        map.borrow()
+            .get(&key)
+            .map_or(0, |value| ctx.register_handle(Value::some(value.clone())))
+    })
+    .unwrap_or(0)
+}
+
+pub extern "C" fn lust_mir_map_has_typed(
+    _vm_ctx: i64,
+    map_handle: i64,
+    key_raw: i64,
+    key_tag: i64,
+) -> i64 {
+    with_typed_map(map_handle, key_raw, key_tag, |_, map, key| {
+        i64::from(map.borrow().contains_key(&key))
+    })
+    .unwrap_or(0)
+}
+
+pub extern "C" fn lust_mir_map_get_int_unwrap(
+    _vm_ctx: i64,
+    map_handle: i64,
+    key_raw: i64,
+    key_tag: i64,
+    default_or_trap: i64,
+) -> i64 {
+    with_typed_map(map_handle, key_raw, key_tag, |ctx, map, key| {
+        match map.borrow().get(&key) {
+            Some(Value::Int(value)) => *value,
+            None if default_or_trap != i64::MIN => default_or_trap,
+            _ => {
+                ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                0
+            }
+        }
+    })
+    .unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
@@ -2601,6 +2852,30 @@ pub extern "C" fn lust_mir_alloc_enum(tag: i64, payload_handle: i64) -> i64 {
         };
         let enum_obj = crate::bytecode::EnumObject::new("Enum", alloc::format!("Variant{tag}"), payload);
         ctx.register_handle(crate::bytecode::Value::Enum(enum_obj))
+    })
+}
+
+/// Allocates a numeric-tag enum with up to two raw integer payloads.
+pub extern "C" fn lust_mir_alloc_enum2(
+    _vm_ctx: i64,
+    tag: i64,
+    p0: i64,
+    p1: i64,
+    arity: i64,
+) -> i64 {
+    with_current_mir_context(|ctx| {
+        if !(0..=2).contains(&arity) {
+            ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+            return 0;
+        }
+        let arity = arity as usize;
+        if !charge_handle_bytes(ctx, 48 + arity * core::mem::size_of::<Value>()) {
+            return 0;
+        }
+        let raw = [p0, p1];
+        let payload = (arity != 0).then(|| raw[..arity].iter().copied().map(Value::Int).collect());
+        let object = crate::bytecode::EnumObject::new("Enum", alloc::format!("Variant{tag}"), payload);
+        ctx.register_handle(Value::Enum(object))
     })
 }
 
@@ -2628,21 +2903,24 @@ pub extern "C" fn lust_mir_enum_tag(enum_handle: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_enum_payload(enum_handle: i64) -> i64 {
+    lust_mir_enum_payload_at(0, enum_handle, 0)
+}
+
+/// Reads a zero-based payload field, unboxing primitive values.
+pub extern "C" fn lust_mir_enum_payload_at(_vm_ctx: i64, enum_handle: i64, field_idx: i64) -> i64 {
     with_current_mir_context(|ctx| {
-        match ctx.get_handle(enum_handle) {
-            Some(crate::bytecode::Value::Enum(e)) => {
-                if let Some(first) = e.values.as_ref().and_then(|v| v.first()) {
-                    match first {
-                        crate::bytecode::Value::Int(n) => *n,
-                        crate::bytecode::Value::Bool(b) => i64::from(*b),
-                        crate::bytecode::Value::Float(f) => f.to_bits() as i64,
-                        _ => ctx.register_handle(first.clone()),
-                    }
-                } else {
-                    0
-                }
-            }
-            _ => 0,
+        let Some(Value::Enum(object)) = ctx.get_handle(enum_handle) else {
+            return 0;
+        };
+        let Ok(index) = usize::try_from(field_idx) else {
+            return 0;
+        };
+        match object.values.as_ref().and_then(|values| values.get(index)) {
+            Some(Value::Int(n)) => *n,
+            Some(Value::Bool(b)) => i64::from(*b),
+            Some(Value::Float(f)) => f.to_bits() as i64,
+            Some(value) => ctx.register_handle(value.clone()),
+            None => 0,
         }
     })
 }

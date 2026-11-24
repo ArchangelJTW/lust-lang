@@ -1302,20 +1302,30 @@ impl EmbeddedProgram {
         Ret: FromLustValue,
     {
         #[cfg(feature = "std")]
-        if self.vm.has_native_entry(handle.func_idx) {
+        if self.vm.has_native_entry(handle.func_idx)
+            || self.vm.has_cranelift_direct_scalar_entry_5_6(handle.func_idx)
+        {
             if self
                 .vm
                 .functions()
                 .get(handle.func_idx)
-                .is_some_and(|f| f.param_count <= 4 && f.name == handle.expected_name)
+                .is_some_and(|f| f.param_count <= 6 && f.name == handle.expected_name)
             {
-                let mut stack_args = [const { Value::Nil }; 4];
+                let mut stack_args = [const { Value::Nil }; 6];
                 let arg_count = args.write_args(&mut stack_args);
-                if arg_count <= 4 {
-                    if let Some(res) = self
-                        .vm
-                        .try_call_cranelift_scalar_direct(handle.func_idx, &stack_args[..arg_count])
-                    {
+                if arg_count <= 6 {
+                    let direct_res = if arg_count <= 4 {
+                        self.vm.try_call_cranelift_scalar_direct(
+                            handle.func_idx,
+                            &stack_args[..arg_count],
+                        )
+                    } else {
+                        self.vm.try_call_cranelift_scalar_direct_5_6(
+                            handle.func_idx,
+                            &stack_args[..arg_count],
+                        )
+                    };
+                    if let Some(res) = direct_res {
                         return Ret::from_value(res?);
                     }
                     let value = self.vm.call_retained_target_slice(
@@ -1327,7 +1337,7 @@ impl EmbeddedProgram {
                 }
                 return Err(LustError::RuntimeError {
                     message: format!(
-                        "Arity mismatch in call_handle for '{}': expected <= 4 arguments, got {}",
+                        "Arity mismatch in call_handle for '{}': expected <= 6 arguments, got {}",
                         handle.expected_name, arg_count
                     ),
                 });
@@ -1411,20 +1421,28 @@ impl EmbeddedProgram {
         };
 
         #[cfg(feature = "std")]
-        if self.vm.has_native_entry(func_idx) {
+        if self.vm.has_native_entry(func_idx)
+            || self.vm.has_cranelift_direct_scalar_entry_5_6(func_idx)
+        {
             if self
                 .vm
                 .functions()
                 .get(func_idx)
-                .is_some_and(|f| f.param_count <= 4 && f.name == function_name)
+                .is_some_and(|f| f.param_count <= 6 && f.name == function_name)
             {
-                let mut stack_args = [const { Value::Nil }; 4];
+                let mut stack_args = [const { Value::Nil }; 6];
                 let arg_count = args.write_args(&mut stack_args);
-                if arg_count <= 4 {
-                    if let Some(res) = self
-                        .vm
-                        .try_call_cranelift_scalar_direct(func_idx, &stack_args[..arg_count])
-                    {
+                if arg_count <= 6 {
+                    let direct_res = if arg_count <= 4 {
+                        self.vm
+                            .try_call_cranelift_scalar_direct(func_idx, &stack_args[..arg_count])
+                    } else {
+                        self.vm.try_call_cranelift_scalar_direct_5_6(
+                            func_idx,
+                            &stack_args[..arg_count],
+                        )
+                    };
+                    if let Some(res) = direct_res {
                         return R::from_value(res?);
                     }
                     let value = self.vm.call_retained_target_slice(
@@ -1436,7 +1454,7 @@ impl EmbeddedProgram {
                 }
                 return Err(LustError::RuntimeError {
                     message: format!(
-                        "Arity mismatch in call_typed for '{}': expected <= 4 arguments, got {}",
+                        "Arity mismatch in call_typed for '{}': expected <= 6 arguments, got {}",
                         function_name, arg_count
                     ),
                 });

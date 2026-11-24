@@ -10,6 +10,8 @@ use crate::lua_compat::register_lust_function;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng, make_rng};
 use regex::Regex;
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::rc::Rc;
@@ -1111,15 +1113,15 @@ fn create_string_sub_fn() -> Value {
                 .as_int()
                 .unwrap_or(source.len() as LustInt)
         });
-        let (start_idx, end_idx) = normalize_range(start, end, source.len());
-        if start_idx >= source.len() || start_idx >= end_idx {
-            return Ok(NativeCallResult::Return(Value::string("")));
-        }
-        let slice = &source.as_bytes()[start_idx..end_idx.min(source.len())];
-        Ok(NativeCallResult::Return(Value::string(
-            String::from_utf8_lossy(slice),
-        )))
+        Ok(NativeCallResult::Return(Value::string(string_sub_slice(
+            source, start, end,
+        ))))
     }))
+}
+
+pub(crate) fn string_sub_slice(source: &str, start: LustInt, end: Option<LustInt>) -> Cow<'_, str> {
+    let (start, end) = normalize_range(start, end, source.len());
+    String::from_utf8_lossy(&source.as_bytes()[start..end])
 }
 
 fn create_string_byte_fn() -> Value {
@@ -1135,17 +1137,19 @@ fn create_string_byte_fn() -> Value {
         let end = args
             .get(2)
             .map(|v| unwrap_lua_value(v.clone()).as_int().unwrap_or(start));
-        let (start_idx, end_idx) = normalize_range(start, end, source.len());
-        let bytes = source.as_bytes();
-        if start_idx >= bytes.len() || start_idx >= end_idx {
-            return return_lua_values(vec![lua_nil()]);
-        }
-        let mut values = Vec::new();
-        for b in &bytes[start_idx..end_idx.min(bytes.len())] {
-            values.push(Value::Int(*b as LustInt));
-        }
-        return_lua_values(values)
+        return_lua_values(string_byte_values(source, start, end))
     }))
+}
+
+pub(crate) fn string_byte_values(source: &str, start: LustInt, end: Option<LustInt>) -> Vec<Value> {
+    let (start, end) = normalize_range(start, end, source.len());
+    if start == end {
+        return vec![Value::Nil];
+    }
+    source.as_bytes()[start..end]
+        .iter()
+        .map(|&byte| Value::Int(LustInt::from(byte)))
+        .collect()
 }
 
 fn create_string_char_fn() -> Value {
@@ -1186,43 +1190,45 @@ fn create_string_find_fn() -> Value {
             .get(3)
             .map(|v| matches!(unwrap_lua_value(v.clone()), Value::Bool(true)))
             .unwrap_or(false);
-        let (offset, _) = normalize_range(start, None, haystack.len());
-        if offset > haystack.len() {
-            return return_lua_values(vec![lua_nil()]);
-        }
-        let slice = haystack.get(offset..).unwrap_or("");
-        if plain {
-            if let Some(pos) = slice.find(pattern) {
+        return_lua_values(string_find_values(haystack, pattern, start, plain)?)
+    }))
+}
+
+pub(crate) fn string_find_values(
+    haystack: &str,
+    pattern: &str,
+    start: LustInt,
+    plain: bool,
+) -> Result<Vec<Value>, String> {
+    let (offset, _) = normalize_range(start, None, haystack.len());
+    let slice = haystack.get(offset..).unwrap_or("");
+    if plain {
+        return Ok(match slice.find(pattern) {
+            Some(pos) => {
                 let begin = offset + pos;
                 let end = begin + pattern.len().saturating_sub(1);
-                return return_lua_values(vec![
-                    Value::Int((begin as LustInt) + 1),
-                    Value::Int((end as LustInt) + 1),
-                ]);
+                vec![Value::Int(begin as LustInt + 1), Value::Int(end as LustInt + 1)]
             }
-            return return_lua_values(vec![lua_nil()]);
-        }
-        let regex = lua_pattern_to_regex(pattern)?;
-        if let Some(caps) = regex.captures(slice)
-            && let Some(mat) = caps.get(0)
-        {
-            let begin = offset + mat.start();
-            let end = offset + mat.end().saturating_sub(1);
-            let mut results: Vec<Value> = vec![
-                Value::Int((begin as LustInt) + 1),
-                Value::Int((end as LustInt) + 1),
-            ];
-            for idx in 1..caps.len() {
-                if let Some(c) = caps.get(idx) {
-                    results.push(Value::string(c.as_str()));
-                } else {
-                    results.push(lua_nil());
-                }
-            }
-            return return_lua_values(results);
-        }
-        return_lua_values(vec![lua_nil()])
-    }))
+            None => vec![Value::Nil],
+        });
+    }
+
+    with_lua_pattern_regex(pattern, |regex| {
+        let Some(caps) = regex.captures(slice) else {
+            return vec![Value::Nil];
+        };
+        let mat = caps.get(0).expect("captures include the full match");
+        let mut results = vec![
+            Value::Int((offset + mat.start()) as LustInt + 1),
+            Value::Int((offset + mat.end().saturating_sub(1)) as LustInt + 1),
+        ];
+        results.extend(
+            caps.iter()
+                .skip(1)
+                .map(|capture| capture.map_or(Value::Nil, |m| Value::string(m.as_str()))),
+        );
+        results
+    })
 }
 
 fn create_string_match_fn() -> Value {
@@ -1290,30 +1296,26 @@ fn create_string_gsub_fn() -> Value {
         let pattern = pattern_val
             .as_string()
             .ok_or_else(|| "string.gsub expects a pattern string".to_string())?;
-        let regex = lua_pattern_to_regex(pattern)?;
         let max_repls = if limit < 0 { i64::MAX } else { limit };
-        enum Replacer {
-            String(String),
-            Func(Value),
-            Other(Value),
-        }
-        let replacer = match &repl {
-            Value::Enum(object)
-                if object.enum_name == "LuaValue" && object.variant == "Function" =>
-            {
-                Replacer::Func(repl.clone())
-            }
-            Value::Function(_) | Value::NativeFunction(_) | Value::Closure(_) => {
-                Replacer::Func(repl.clone())
-            }
-            _ => {
-                let unwrapped = unwrap_lua_value(repl.clone());
-                match unwrapped {
-                    Value::String(s) => Replacer::String(s.to_string()),
-                    other => Replacer::Other(other),
-                }
-            }
+        let callable = match &repl {
+            Value::Enum(object) => object.enum_name == "LuaValue" && object.variant == "Function",
+            Value::Function(_) | Value::NativeFunction(_) | Value::Closure(_) => true,
+            _ => false,
         };
+        let unwrapped = if callable {
+            Value::Nil
+        } else {
+            unwrap_lua_value(repl.clone())
+        };
+        if let Value::String(template) = &unwrapped {
+            let (output, count) = if limit < 0 {
+                string_gsub_fast(text, pattern, template)?
+            } else {
+                string_gsub_template(text, pattern, template, max_repls)?
+            };
+            return return_lua_values(vec![Value::string(output), Value::Int(count)]);
+        }
+        let regex = lua_pattern_to_regex(pattern)?;
         let mut last_end = 0;
         let mut count: i64 = 0;
         let mut output = String::new();
@@ -1323,9 +1325,8 @@ fn create_string_gsub_fn() -> Value {
             }
             let mat = caps.get(0).unwrap();
             output.push_str(&text[last_end..mat.start()]);
-            let replacement = match &replacer {
-                Replacer::String(template) => build_template_replacement(template.as_str(), &caps),
-                Replacer::Func(func_val) => VM::with_current(|vm| {
+            let replacement = if callable {
+                VM::with_current(|vm| {
                     let mut call_args = Vec::new();
                     if caps.len() > 1 {
                         for idx in 1..caps.len() {
@@ -1339,12 +1340,13 @@ fn create_string_gsub_fn() -> Value {
                         call_args.push(to_lua_value(vm, Value::string(m.as_str()))?);
                     }
                     let result = vm
-                        .call_value(func_val, call_args)
+                        .call_value(&repl, call_args)
                         .map_err(|e| e.to_string())?;
                     let first = unwrap_first_return(result);
                     Ok(first.to_string())
-                })?,
-                Replacer::Other(other) => other.to_string(),
+                })?
+            } else {
+                unwrapped.to_string()
             };
             output.push_str(&replacement);
             last_end = mat.end();
@@ -1423,13 +1425,18 @@ fn create_string_split_fn() -> Value {
             .as_ref()
             .and_then(|v| v.as_string())
             .unwrap_or_default();
-        let parts: Vec<Value> = if delimiter.is_empty() {
-            s.chars().map(|c| Value::string(c.to_string())).collect()
-        } else {
-            s.split(delimiter).map(Value::string).collect()
-        };
-        Ok(NativeCallResult::Return(Value::array(parts)))
+        Ok(NativeCallResult::Return(Value::array(string_split_values(
+            s, delimiter,
+        ))))
     }))
+}
+
+pub(crate) fn string_split_values(s: &str, delimiter: &str) -> Vec<Value> {
+    if delimiter.is_empty() {
+        s.chars().map(|c| Value::string(c.to_string())).collect()
+    } else {
+        s.split(delimiter).map(Value::string).collect()
+    }
 }
 
 fn create_string_trim_fn() -> Value {
@@ -4566,7 +4573,7 @@ fn pad_value(value: String, width: Option<usize>, zero_pad: bool) -> String {
     value
 }
 
-fn normalize_range(start: LustInt, end: Option<LustInt>, len: usize) -> (usize, usize) {
+pub(crate) fn normalize_range(start: LustInt, end: Option<LustInt>, len: usize) -> (usize, usize) {
     let len_i = len as LustInt;
     let mut s = if start < 0 { len_i + start + 1 } else { start };
     let mut e = end.unwrap_or(len_i);
@@ -4589,6 +4596,32 @@ fn normalize_range(start: LustInt, end: Option<LustInt>, len: usize) -> (usize, 
 }
 
 fn lua_pattern_to_regex(pattern: &str) -> Result<Regex, String> {
+    with_lua_pattern_regex(pattern, Regex::clone)
+}
+
+fn with_lua_pattern_regex<T>(pattern: &str, use_regex: impl FnOnce(&Regex) -> T) -> Result<T, String> {
+    const CAPACITY: usize = 64;
+    thread_local! {
+        static REGEX_CACHE: RefCell<Vec<(String, Regex)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(index) = cache.iter().position(|(key, _)| key == pattern) {
+            cache[..=index].rotate_right(1);
+        } else {
+            let regex = compile_lua_pattern(pattern)?;
+            if cache.len() == CAPACITY {
+                cache.pop();
+            }
+            cache.insert(0, (pattern.to_owned(), regex));
+        }
+        // Only call internal string operations here. VM callbacks use a cloned regex.
+        Ok(use_regex(&cache[0].1))
+    })
+}
+
+fn compile_lua_pattern(pattern: &str) -> Result<Regex, String> {
     fn is_regex_meta(ch: char) -> bool {
         matches!(
             ch,
@@ -4664,8 +4697,43 @@ fn lua_pattern_to_regex(pattern: &str) -> Result<Regex, String> {
     Regex::new(&out).map_err(|e| e.to_string())
 }
 
-fn build_template_replacement(template: &str, caps: &regex::Captures) -> String {
-    let mut out = String::new();
+pub(crate) fn string_gsub_fast(src: &str, pattern: &str, repl: &str) -> Result<(String, i64), String> {
+    string_gsub_template(src, pattern, repl, i64::MAX)
+}
+
+fn string_gsub_template(
+    src: &str,
+    pattern: &str,
+    repl: &str,
+    limit: i64,
+) -> Result<(String, i64), String> {
+    with_lua_pattern_regex(pattern, |regex| {
+        let mut last_end = 0;
+        let mut count = 0;
+        let mut output = String::with_capacity(src.len());
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        if repl.contains('%') {
+            for caps in regex.captures_iter(src).take(limit) {
+                let mat = caps.get(0).expect("captures include the full match");
+                output.push_str(&src[last_end..mat.start()]);
+                push_template_replacement(&mut output, repl, &caps);
+                last_end = mat.end();
+                count += 1;
+            }
+        } else {
+            for mat in regex.find_iter(src).take(limit) {
+                output.push_str(&src[last_end..mat.start()]);
+                output.push_str(repl);
+                last_end = mat.end();
+                count += 1;
+            }
+        }
+        output.push_str(&src[last_end..]);
+        (output, count)
+    })
+}
+
+fn push_template_replacement(out: &mut String, template: &str, caps: &regex::Captures) {
     let mut chars = template.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '%' {
@@ -4693,7 +4761,6 @@ fn build_template_replacement(template: &str, caps: &regex::Captures) -> String 
             out.push(ch);
         }
     }
-    out
 }
 
 fn to_lua_value(vm: &VM, value: Value) -> Result<Value, String> {

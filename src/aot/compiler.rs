@@ -319,8 +319,9 @@ impl AotCompiler {
             .map_err(|e| LustError::Unknown(format!("Parser error: {e}")))?;
 
         let prepared_items = prepare_items_for_mir(&items);
-        let module = AstLowering::lower_module_items("main_module", &prepared_items)
+        let mut module = AstLowering::lower_module_items("main_module", &prepared_items)
             .map_err(|e| LustError::Unknown(format!("MIR lowering error: {e}")))?;
+        register_ast_struct_layouts(&mut module, &items);
 
         Self::compile_module_with_links(&module, output_bin, opts, links)
     }
@@ -997,8 +998,9 @@ fn lower_and_typecheck_source(source: &str) -> Result<(MirModule, Vec<Item>)> {
 
     let prepared_items = prepare_items_for_mir(&items);
     let rust_aot_items = desugar_effects_for_rust_aot(&prepared_items);
-    let module = AstLowering::lower_module_items("main_module", &rust_aot_items)
+    let mut module = AstLowering::lower_module_items("main_module", &rust_aot_items)
         .map_err(|e| LustError::Unknown(format!("MIR lowering error: {e}")))?;
+    register_ast_struct_layouts(&mut module, &items);
     Ok((module, items))
 }
 
@@ -1007,8 +1009,34 @@ fn lower_and_typecheck_source(source: &str) -> Result<(MirModule, Vec<Item>)> {
 pub fn prepare_and_lower_items_for_rust_aot(items: &[Item]) -> Result<MirModule> {
     let prepared_items = prepare_items_for_mir(items);
     let rust_aot_items = desugar_effects_for_rust_aot(&prepared_items);
-    AstLowering::lower_module_items("main_module", &rust_aot_items)
-        .map_err(|e| LustError::Unknown(format!("MIR lowering error: {e}")))
+    let mut module = AstLowering::lower_module_items("main_module", &rust_aot_items)
+        .map_err(|e| LustError::Unknown(format!("MIR lowering error: {e}")))?;
+    register_ast_struct_layouts(&mut module, items);
+    Ok(module)
+}
+
+/// Ensures every AST `struct` declaration (including non-`@repr` structs and structs nested inside
+/// `ItemKind::Module`) has its `MirStructLayout` registered in `module.struct_layouts` so
+/// `Struct.decode(raw)` works uniformly across all AOT backends (`NG-W15-1`).
+fn register_ast_struct_layouts(module: &mut MirModule, items: &[Item]) {
+    for item in items {
+        match &item.kind {
+            ItemKind::Struct(def) => {
+                if !module
+                    .struct_layouts
+                    .iter()
+                    .any(|l| l.type_name == def.name)
+                {
+                    let layout = crate::data::materialize::struct_def_to_layout(def);
+                    module.register_struct_layout(crate::mir::ir::MirStructLayout::from(&layout));
+                }
+            }
+            ItemKind::Module { items: sub, .. } => {
+                register_ast_struct_layouts(module, sub);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Pre-lowers Lust `EffectBlock` / `:provide(..)` / `.provide(..)` / `:run_sync()` / `.run_sync()`

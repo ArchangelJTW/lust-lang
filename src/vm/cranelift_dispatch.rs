@@ -280,7 +280,14 @@ pub fn validate_and_decode_array(
                 MirType::Int => Value::Int(raw),
                 MirType::Float => Value::Float(f64::from_bits(raw as u64)),
                 MirType::String => mir_ctx.get_handle(raw).unwrap_or_else(|| Value::string("")),
-                _ => unreachable!("validated primitive array element type"),
+                MirType::Struct(name) => {
+                    if let Some(val @ Value::Struct(_)) = mir_ctx.get_handle(raw) {
+                        val
+                    } else {
+                        validate_and_decode_struct(mir_ctx, &[], raw, name, None)?
+                    }
+                }
+                _ => unreachable!("validated array element type"),
             };
             elements.push(elem);
         }
@@ -305,7 +312,7 @@ pub fn validate_and_decode_tuple(
     expected_elem_types: &[MirType],
 ) -> Result<Vec<Value>> {
     for elem_ty in expected_elem_types {
-        if !VM::is_cranelift_supported_array_elem_type(elem_ty) {
+        if !VM::is_cranelift_supported_primitive_elem_type(elem_ty) {
             return Err(LustError::RuntimeError {
                 message: format!(
                     "Unsupported non-primitive tuple element type {:?}",
@@ -933,9 +940,18 @@ fn is_readonly_cranelift_builtin(callee: &str) -> bool {
             | "table.len"
             | "array.len"
             | "string.len"
+            | "string.sub"
+            | "string.byte"
+            | "string.byte_at"
+            | "string.gsub"
+            | "string.split"
+            | "string.find"
             | "tostring"
             | "map.len"
+            | "map.has"
             | "enum.tag"
+            | "enum.payload"
+            | "enum.payload_at"
     )
 }
 
@@ -1328,15 +1344,27 @@ fn is_host_callback_free_cranelift_builtin(callee: &str) -> bool {
             | "array.push"
             | "table.push"
             | "string.len"
+            | "string.sub"
+            | "string.byte"
+            | "string.byte_at"
+            | "string.gsub"
+            | "string.split"
+            | "string.find"
             | "tostring"
             | "map.len"
+            | "map.has"
             | "map.get"
+            | "map.get_unwrap"
+            | "map.get_unwrap_or"
             | "map.set"
             | "map.new"
             | "enum.tag"
             | "enum.payload"
+            | "enum.payload_at"
             | "enum.new"
             | "enum.alloc"
+            | "enum.new2"
+            | "enum.alloc2"
     )
 }
 
@@ -1688,11 +1716,17 @@ pub fn build_or_get_cached_flat_array(
 
 impl VM {
     #[cfg(feature = "std")]
-    pub(crate) fn is_cranelift_supported_array_elem_type(ty: &MirType) -> bool {
+    pub(crate) fn is_cranelift_supported_primitive_elem_type(ty: &MirType) -> bool {
         matches!(
             ty,
             MirType::Int | MirType::Bool | MirType::Float | MirType::String
         )
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn is_cranelift_supported_array_elem_type(ty: &MirType) -> bool {
+        Self::is_cranelift_supported_primitive_elem_type(ty)
+            || matches!(ty, MirType::Struct(name) if !name.is_empty())
     }
 
     #[cfg(feature = "std")]
@@ -1729,14 +1763,22 @@ impl VM {
                     || matches!(&**inner, MirType::Unknown)
             }
             MirType::Option(inner) => {
-                matches!(&**inner, MirType::Struct(name) if !name.is_empty())
+                matches!(
+                    &**inner,
+                    MirType::Int
+                        | MirType::Bool
+                        | MirType::Float
+                        | MirType::String
+                        | MirType::Unknown
+                ) || matches!(&**inner, MirType::Struct(name) if !name.is_empty())
             }
-            MirType::Tuple(elems) => elems
-                .iter()
-                .all(|e| Self::is_cranelift_supported_array_elem_type(e) || matches!(e, MirType::Unknown)),
+            MirType::Tuple(elems) => elems.iter().all(|e| {
+                Self::is_cranelift_supported_primitive_elem_type(e)
+                    || matches!(e, MirType::Unknown)
+            }),
             MirType::Struct(_) => true,
             MirType::Map(k, v) => Self::is_cranelift_supported_type(k) && Self::is_cranelift_supported_type(v),
-            MirType::Enum(_) => true,
+            MirType::Enum(name) => !name.is_empty(),
             MirType::Function { .. } | MirType::Effect { .. } => false,
         }
     }
@@ -1848,13 +1890,26 @@ impl VM {
     fn is_cranelift_supported_type_in_vm(&self, ty: &MirType) -> bool {
         match ty {
             MirType::Struct(name) => self.is_cranelift_supported_struct(name),
+            MirType::Array(inner) => match &**inner {
+                MirType::Struct(name) => self.is_cranelift_supported_struct(name),
+                other => {
+                    Self::is_cranelift_supported_primitive_elem_type(other)
+                        || matches!(other, MirType::Unknown)
+                }
+            },
             MirType::Option(inner) => match &**inner {
+                MirType::Int
+                | MirType::Bool
+                | MirType::Float
+                | MirType::String
+                | MirType::Unknown => true,
                 MirType::Struct(name) => self.is_cranelift_supported_struct(name),
                 _ => false,
             },
             MirType::Map(k, v) => {
                 self.is_cranelift_supported_type_in_vm(k) && self.is_cranelift_supported_type_in_vm(v)
             }
+            MirType::Enum(name) => !name.is_empty(),
             other => Self::is_cranelift_supported_type(other),
         }
     }
@@ -1920,7 +1975,12 @@ impl VM {
         }
         match ty {
             MirType::Struct(name) => check_struct(name),
+            MirType::Array(inner) => match &**inner {
+                MirType::Struct(name) => check_struct(name),
+                _ => true,
+            },
             MirType::Option(inner) => match &**inner {
+                MirType::Int | MirType::Bool | MirType::Float | MirType::String => true,
                 MirType::Struct(name) => check_struct(name),
                 _ => false,
             },
@@ -1928,6 +1988,7 @@ impl VM {
                 Self::check_refined_type(k, check_struct)
                     && Self::check_refined_type(v, check_struct)
             }
+            MirType::Enum(name) => !name.is_empty(),
             _ => true,
         }
     }
@@ -1957,14 +2018,15 @@ impl VM {
                     return false;
                 }
                 match Self::mir_place_type_in_vm(base, locals, struct_meta) {
-                    Some(MirType::Array(elem)) => {
-                        Self::is_cranelift_supported_array_elem_type(&elem)
-                    }
+                    Some(MirType::Array(elem)) => match &*elem {
+                        MirType::Struct(name) => check_struct(name),
+                        other => Self::is_cranelift_supported_primitive_elem_type(other),
+                    },
                     Some(MirType::Tuple(elems)) => {
                         !elems.is_empty()
                             && elems
                                 .iter()
-                                .all(Self::is_cranelift_supported_array_elem_type)
+                                .all(Self::is_cranelift_supported_primitive_elem_type)
                     }
                     _ => false,
                 }
@@ -2165,7 +2227,15 @@ impl VM {
                                 }
                                 match agg_ty {
                                     MirType::Array(elem_ty) => {
-                                        if !Self::is_cranelift_supported_array_elem_type(elem_ty) {
+                                        let elem_ok = match &**elem_ty {
+                                            MirType::Struct(name) => check_struct(name),
+                                            other => {
+                                                Self::is_cranelift_supported_primitive_elem_type(
+                                                    other,
+                                                )
+                                            }
+                                        };
+                                        if !elem_ok {
                                             return false;
                                         }
                                         for elem in elems {
@@ -2188,7 +2258,7 @@ impl VM {
                                         for (elem, expected_ty) in
                                             elems.iter().zip(elem_types.iter())
                                         {
-                                            if !Self::is_cranelift_supported_array_elem_type(
+                                            if !Self::is_cranelift_supported_primitive_elem_type(
                                                 expected_ty,
                                             ) || Self::mir_operand_type_in_vm(
                                                 elem,
@@ -2342,6 +2412,191 @@ impl VM {
                                 struct_meta,
                             );
                             if arg_ty != Some(MirType::String) {
+                                return false;
+                            }
+                        } else if callee == "string.sub" {
+                            if args.len() != 2 && args.len() != 3 {
+                                return false;
+                            }
+                            let s_ty = Self::mir_operand_type_in_vm(
+                                &args[0],
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            let i_ty = Self::mir_operand_type_in_vm(
+                                &args[1],
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            let j_ok = args.get(2).is_none_or(|a| {
+                                Self::mir_operand_type_in_vm(a, &refined.locals, struct_meta)
+                                    == Some(MirType::Int)
+                            });
+                            let dest_ty = Self::mir_place_type_in_vm(
+                                destination,
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            if s_ty != Some(MirType::String)
+                                || i_ty != Some(MirType::Int)
+                                || !j_ok
+                                || dest_ty != Some(MirType::String)
+                            {
+                                return false;
+                            }
+                        } else if callee == "string.byte" {
+                            if !(1..=3).contains(&args.len()) {
+                                return false;
+                            }
+                            let s_ty = Self::mir_operand_type_in_vm(
+                                &args[0],
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            let bounds_ok = args[1..].iter().all(|a| {
+                                Self::mir_operand_type_in_vm(a, &refined.locals, struct_meta)
+                                    == Some(MirType::Int)
+                            });
+                            let dest_ty = Self::mir_place_type_in_vm(
+                                destination,
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            if s_ty != Some(MirType::String)
+                                || !bounds_ok
+                                || !matches!(dest_ty, Some(MirType::Int | MirType::Array(_)))
+                            {
+                                return false;
+                            }
+                        } else if callee == "string.gsub" {
+                            if args.len() != 3 {
+                                return false;
+                            }
+                            let args_ok = args.iter().all(|a| {
+                                Self::mir_operand_type_in_vm(a, &refined.locals, struct_meta)
+                                    == Some(MirType::String)
+                            });
+                            let dest_ty = Self::mir_place_type_in_vm(
+                                destination,
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            let dest_ok = match dest_ty {
+                                Some(MirType::String) => true,
+                                Some(MirType::Array(inner)) => *inner == MirType::String,
+                                _ => false,
+                            };
+                            if !args_ok || !dest_ok {
+                                return false;
+                            }
+                        } else if callee == "string.split" {
+                            if args.len() != 2 {
+                                return false;
+                            }
+                            let args_ok = args.iter().all(|a| {
+                                Self::mir_operand_type_in_vm(a, &refined.locals, struct_meta)
+                                    == Some(MirType::String)
+                            });
+                            let dest_ty = Self::mir_place_type_in_vm(
+                                destination,
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            if !args_ok
+                                || !matches!(dest_ty, Some(MirType::Array(inner)) if *inner == MirType::String)
+                            {
+                                return false;
+                            }
+                        } else if callee == "string.find" {
+                            if !(2..=4).contains(&args.len()) {
+                                return false;
+                            }
+                            let s_ok = Self::mir_operand_type_in_vm(
+                                &args[0],
+                                &refined.locals,
+                                struct_meta,
+                            ) == Some(MirType::String)
+                                && Self::mir_operand_type_in_vm(
+                                    &args[1],
+                                    &refined.locals,
+                                    struct_meta,
+                                ) == Some(MirType::String);
+                            let start_ok = args.get(2).is_none_or(|a| {
+                                Self::mir_operand_type_in_vm(a, &refined.locals, struct_meta)
+                                    == Some(MirType::Int)
+                            });
+                            let plain_ok = args.get(3).is_none_or(|a| {
+                                matches!(
+                                    Self::mir_operand_type_in_vm(a, &refined.locals, struct_meta),
+                                    Some(MirType::Bool | MirType::Int)
+                                )
+                            });
+                            let dest_ty = Self::mir_place_type_in_vm(
+                                destination,
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            if !s_ok
+                                || !start_ok
+                                || !plain_ok
+                                || !matches!(dest_ty, Some(MirType::Int | MirType::Array(_)))
+                            {
+                                return false;
+                            }
+                        } else if callee == "map.get_unwrap" {
+                            if args.len() != 2 {
+                                return false;
+                            }
+                            let Some(MirType::Map(k_ty, v_ty)) = Self::mir_operand_type_in_vm(
+                                &args[0],
+                                &refined.locals,
+                                struct_meta,
+                            ) else {
+                                return false;
+                            };
+                            let arg_k = Self::mir_operand_type_in_vm(
+                                &args[1],
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            let dest_ty = Self::mir_place_type_in_vm(
+                                destination,
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            if arg_k.as_ref() != Some(&*k_ty) || dest_ty.as_ref() != Some(&*v_ty) {
+                                return false;
+                            }
+                        } else if callee == "map.get_unwrap_or" {
+                            if args.len() != 3 {
+                                return false;
+                            }
+                            let Some(MirType::Map(k_ty, v_ty)) = Self::mir_operand_type_in_vm(
+                                &args[0],
+                                &refined.locals,
+                                struct_meta,
+                            ) else {
+                                return false;
+                            };
+                            let arg_k = Self::mir_operand_type_in_vm(
+                                &args[1],
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            let arg_def = Self::mir_operand_type_in_vm(
+                                &args[2],
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            let dest_ty = Self::mir_place_type_in_vm(
+                                destination,
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            if arg_k.as_ref() != Some(&*k_ty)
+                                || arg_def.as_ref() != Some(&*v_ty)
+                                || dest_ty.as_ref() != Some(&*v_ty)
+                            {
                                 return false;
                             }
                         }
@@ -2500,35 +2755,55 @@ impl VM {
                 | "array.push"
                 | "table.push"
                 | "string.len"
+                | "string.sub"
+                | "string.byte"
+                | "string.byte_at"
+                | "string.gsub"
+                | "string.split"
+                | "string.find"
                 | "tostring"
                 | "map.len"
+                | "map.has"
                 | "map.get"
+                | "map.get_unwrap"
+                | "map.get_unwrap_or"
                 | "map.set"
                 | "map.new"
                 | "enum.tag"
                 | "enum.payload"
+                | "enum.payload_at"
                 | "enum.new"
                 | "enum.alloc"
+                | "enum.new2"
+                | "enum.alloc2"
         )
     }
 
     #[cfg(feature = "std")]
-    fn is_supported_deopt_recipe_type(&self, ty: &MirType) -> bool {
-        matches!(
-            ty,
-            MirType::Int | MirType::Bool | MirType::Float | MirType::Unit | MirType::String
-        ) || matches!(
-            ty,
-            MirType::Array(inner)
-                if matches!(&**inner, MirType::Int | MirType::Bool | MirType::Float)
-        ) || matches!(
-            ty,
-            MirType::Struct(name) if self.is_cranelift_supported_struct(name)
-        ) || matches!(
-            ty,
-            MirType::Option(inner)
-                if matches!(&**inner, MirType::Struct(name) if self.is_cranelift_supported_struct(name))
-        )
+    pub fn is_supported_deopt_recipe_type(&self, ty: &MirType) -> bool {
+        if Self::type_contains_unknown(ty) {
+            return false;
+        }
+        match ty {
+            MirType::Int | MirType::Bool | MirType::Float | MirType::Unit | MirType::String => true,
+            MirType::Array(inner) => match &**inner {
+                MirType::Int | MirType::Bool | MirType::Float | MirType::String => true,
+                MirType::Struct(name) => self.is_cranelift_supported_struct(name),
+                _ => false,
+            },
+            MirType::Struct(name) => self.is_cranelift_supported_struct(name),
+            MirType::Option(inner) => match &**inner {
+                MirType::Int | MirType::Bool | MirType::Float | MirType::String => true,
+                MirType::Struct(name) => self.is_cranelift_supported_struct(name),
+                _ => false,
+            },
+            MirType::Map(k, v) => {
+                self.is_cranelift_supported_type_in_vm(k)
+                    && self.is_cranelift_supported_type_in_vm(v)
+            }
+            MirType::Enum(name) => !name.is_empty(),
+            _ => false,
+        }
     }
 
     /// Rewrites MIR-VM continuation bytecode operations on `MirType::Struct` locals from
@@ -3720,6 +3995,77 @@ impl VM {
             .map(|entry| entry.sroa_recipes.clone())
     }
 
+    /// Read-only inspection helper returning whether a compiled Cranelift function qualifies for
+    /// the 0..=6-arg direct scalar C-ABI fast path (`NG-W10-3` + `NG-W15-7`).
+    #[cfg(feature = "std")]
+    pub fn cranelift_is_pure_scalar_abi_6(&self, func_name: &str) -> Option<bool> {
+        let func_idx = self.functions.iter().position(|f| f.name == func_name)?;
+        self.cranelift_fn_cache
+            .get(func_idx)?
+            .as_ref()
+            .map(|entry| {
+                entry.is_pure_scalar_abi
+                    || Self::entry_is_5_or_6_uniform_scalar_abi(entry)
+            })
+    }
+
+    #[cfg(feature = "std")]
+    #[inline]
+    fn entry_is_5_or_6_uniform_scalar_abi(entry: &crate::vm::CompiledFnEntry) -> bool {
+        !entry.has_external_or_host_calls
+            && matches!(entry.param_types.len(), 5 | 6)
+            && (entry.param_types.iter().all(|t| matches!(t, MirType::Int))
+                || entry.param_types.iter().all(|t| matches!(t, MirType::Float)))
+            && matches!(entry.ret_type, MirType::Int | MirType::Float)
+    }
+
+    /// Returns true when `func_idx` can use the 5- or 6-arg direct scalar Cranelift C-ABI fast
+    /// path (`NG-W15-7`), mirroring `VM::has_native_entry` without changing `is_pure_scalar_abi`
+    /// (`<= 4` args contract tested by `ng_w10_3_direct_scalar_call_abi`).
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn has_cranelift_direct_scalar_entry_5_6(&self, func_idx: usize) -> bool {
+        if self.backend != crate::vm::VmBackend::Cranelift
+            || (self.slow_path_flags & !crate::vm::SLOW_PATH_GAS_LIMIT) != 0
+            || crate::vm::MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed)
+            || !self.call_stack.is_empty()
+            || self.active_jit_depth != 0
+            || self.active_native_depth != 0
+            || self.budgets.memory.limit_bytes.is_some()
+            || self.has_active_finalizers
+            || crate::vm::tracing::has_trace_hook()
+        {
+            return false;
+        }
+        #[cfg(feature = "test-deopt")]
+        if self.test_deopt_spike_hook.is_some() {
+            return false;
+        }
+        let Some(func) = self.functions.get(func_idx) else {
+            return false;
+        };
+        if !matches!(func.param_count, 5 | 6) {
+            return false;
+        }
+        let current_struct_gen = self.struct_metadata.generation();
+        if self.cranelift_compiled_generation == self.cranelift_generation
+            && self.cranelift_compiled_struct_gen == current_struct_gen
+            && self.mir_context_struct_gen == current_struct_gen
+        {
+            if let Some(Some(entry)) = self.cranelift_fn_cache.get(func_idx) {
+                return Self::entry_is_5_or_6_uniform_scalar_abi(entry)
+                    && !entry.code_ptr.is_null()
+                    && entry.compiled_generation == self.cranelift_compiled_generation
+                    && entry.struct_metadata_generation == current_struct_gen;
+            }
+            return self
+                .cranelift_jit
+                .as_ref()
+                .is_some_and(|jit| jit.is_deferred_dead_helper(&func.name));
+        }
+        !self.mir_functions.is_empty() && self.mir_functions.contains_key(&func.name)
+    }
+
     /// Read-only inspection helper returning the compile-time `is_pure_scalar_abi` flag
     /// for a compiled Cranelift function (`NG-W10-3`).
     #[cfg(feature = "std")]
@@ -4089,6 +4435,35 @@ impl VM {
         Ok(())
     }
 
+    /// Sub-frame guard (`NG-W15-7`): detects trivial loop-free leaf methods whose VM<->Cranelift
+    /// struct-marshaling cost far exceeds running the few bytecode instructions in `'frame_fast`.
+    #[cfg(feature = "std")]
+    #[inline]
+    fn is_trivial_leaf_method_for_vm_subframe(func: &crate::bytecode::Function) -> bool {
+        use crate::bytecode::Instruction;
+        if !func.is_method || func.chunk.instructions.len() > 24 {
+            return false;
+        }
+        for insn in &func.chunk.instructions {
+            match insn {
+                Instruction::Jump(off)
+                | Instruction::JumpIf(_, off)
+                | Instruction::JumpIfNot(_, off)
+                | Instruction::BranchLtInt(_, _, off)
+                | Instruction::BranchLeInt(_, _, off) => {
+                    if *off < 0 {
+                        return false;
+                    }
+                }
+                Instruction::Call(..) | Instruction::CallMethod(..) | Instruction::Closure(..) => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
     /// Attempts to execute the top call frame natively using Cranelift JIT.
     #[cfg(feature = "std")]
     pub(crate) fn try_run_cranelift_top_frame(&mut self) -> Result<Option<Option<Value>>> {
@@ -4116,11 +4491,19 @@ impl VM {
             });
         }
 
-        let current_struct_gen = self.struct_metadata.generation();
         #[cfg(feature = "test-deopt")]
         let has_spike_hook = self.test_deopt_spike_hook.is_some();
         #[cfg(not(feature = "test-deopt"))]
         let has_spike_hook = false;
+
+        if self.call_stack.len() > 1
+            && !has_spike_hook
+            && Self::is_trivial_leaf_method_for_vm_subframe(&self.functions[func_idx])
+        {
+            return Ok(None);
+        }
+
+        let current_struct_gen = self.struct_metadata.generation();
 
         let entry = if self.cranelift_compiled_generation == self.cranelift_generation
             && self.cranelift_compiled_struct_gen == current_struct_gen
@@ -4579,7 +4962,7 @@ impl VM {
         self.mir_context.set_status(MIR_STATUS_OK);
         self.mir_context.set_memory_used(0);
         self.mir_context.set_max_memory_limit(i64::MAX);
-        let mut gas_guard = crate::vm::GasScopeGuard::enter(
+        let gas_guard = crate::vm::GasScopeGuard::enter(
             Rc::clone(&self.mir_context),
             vm_gas_budget,
             self.active_jit_depth > 0,
@@ -4687,9 +5070,17 @@ impl VM {
                             }
                         }
 
-                        let elem_tag = mir_array_elem_tag(elem_ty).ok_or_else(|| LustError::RuntimeError {
-                            message: format!("Unsupported non-primitive array element type {:?}", elem_ty),
-                        })?;
+                        let Some(elem_tag) = mir_array_elem_tag(elem_ty) else {
+                            if matches!(&**elem_ty, MirType::Struct(_)) {
+                                return Ok(CraneliftOutcome::Fallback);
+                            }
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "Unsupported non-primitive array element type {:?}",
+                                    elem_ty
+                                ),
+                            });
+                        };
                         let unboxed_ptr_opt: Option<Result<Option<*mut i64>>> =
                             if rc.is_unboxed() {
                                 rc.with_unboxed_data(|unb| {
@@ -4891,6 +5282,25 @@ impl VM {
                             }
                             _ => return Ok(CraneliftOutcome::Fallback),
                         },
+                        MirType::Int | MirType::Bool | MirType::Float | MirType::String => {
+                            match val.as_enum() {
+                                Some(("Option", "None", None))
+                                | Some(("Option", "None", Some([]))) => RawArg::Int(0),
+                                Some(("Option", "Some", Some([payload])))
+                                    if matches!(
+                                        (payload, &**inner),
+                                        (Value::Int(_), MirType::Int)
+                                            | (Value::Bool(_), MirType::Bool)
+                                            | (Value::Float(_), MirType::Float)
+                                            | (Value::String(_), MirType::String)
+                                    ) =>
+                                {
+                                    let h = self.mir_context.register_handle(val.clone());
+                                    RawArg::Int(h)
+                                }
+                                _ => return Ok(CraneliftOutcome::Fallback),
+                            }
+                        }
                         _ => return Ok(CraneliftOutcome::Fallback),
                     },
                     (Value::Map(_), MirType::Map(_, _) | MirType::Unknown) => {
@@ -4932,8 +5342,44 @@ impl VM {
         // Charge base gas for entry
         crate::mir::cranelift_backend::jit_engine::lust_mir_charge_gas(1);
 
+        let Some((raw_int, raw_float)) =
+            Self::invoke_cranelift_raw_code_ptr(code_ptr, &raw_args, ret_type)
+        else {
+            *native_entered = false;
+            self.cranelift_entry_count = self.cranelift_entry_count.saturating_sub(1);
+            return Ok(CraneliftOutcome::Fallback);
+        };
+
+        let status = crate::mir::cranelift_backend::jit_engine::lust_mir_get_status();
+        drop(_jit_guard);
+        drop(_inv_guard);
+
+        self.finish_cranelift_top_frame_scoped(
+            func_name,
+            ret_type,
+            local_types,
+            readonly_params,
+            sroa_recipes,
+            frame_depth,
+            invocation_id,
+            vm_has_mem_budget,
+            gas_guard,
+            &marshalled_arrays,
+            &marshalled_structs,
+            raw_int,
+            raw_float,
+            status,
+        )
+    }
+
+    #[cfg(feature = "std")]
+    fn invoke_cranelift_raw_code_ptr(
+        code_ptr: *const u8,
+        raw_args: &[RawArg],
+        ret_type: &MirType,
+    ) -> Option<(i64, f64)> {
         // Execute JIT compiled code matching argument types and return type
-        let (raw_int, raw_float): (i64, f64) = match (raw_args.as_slice(), &ret_type) {
+        let (raw_int, raw_float): (i64, f64) = match (raw_args, ret_type) {
             // 0 args
             (&[], MirType::Float) => {
                 let func: extern "C" fn() -> f64 = unsafe { core::mem::transmute(code_ptr) };
@@ -5177,17 +5623,214 @@ impl VM {
                 (func(a, b, c, d, e, f), 0.0)
             }
 
-            _ => {
-                *native_entered = false;
-                self.cranelift_entry_count = self.cranelift_entry_count.saturating_sub(1);
-                return Ok(CraneliftOutcome::Fallback);
+            _ => return None,
+        };
+        Some((raw_int, raw_float))
+    }
+
+    /// Direct 5- and 6-argument scalar C-ABI fast path into Cranelift JIT without allocating a VM
+    /// `CallFrame` (`NG-W15-7`, `BENCH-NG-15`), preserving `SEC-01` gas enforcement.
+    #[cfg(feature = "std")]
+    pub(crate) fn try_call_cranelift_scalar_direct_5_6(
+        &mut self,
+        func_idx: usize,
+        args: &[Value],
+    ) -> Option<Result<Value>> {
+        if self.backend != crate::vm::VmBackend::Cranelift
+            || (self.slow_path_flags & !crate::vm::SLOW_PATH_GAS_LIMIT) != 0
+            || crate::vm::MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed)
+            || !self.call_stack.is_empty()
+            || self.active_jit_depth != 0
+            || self.active_native_depth != 0
+            || self.budgets.memory.limit_bytes.is_some()
+            || self.has_active_finalizers
+            || super::execution::get_effect_finalizer_count() > 0
+            || crate::vm::tracing::has_trace_hook()
+            || !matches!(args.len(), 5 | 6)
+        {
+            return None;
+        }
+        #[cfg(feature = "test-deopt")]
+        if self.test_deopt_spike_hook.is_some() {
+            return None;
+        }
+        if crate::mir::cranelift_backend::safepoint_stats().mask_depth != 0 {
+            return None;
+        }
+
+        let current_struct_gen = self.struct_metadata.generation();
+        let needs_compile = self.cranelift_compiled_generation != self.cranelift_generation
+            || self.cranelift_compiled_struct_gen != current_struct_gen
+            || self.mir_context_struct_gen != current_struct_gen
+            || func_idx >= self.cranelift_fn_cache.len();
+        if needs_compile {
+            if self.mir_functions.is_empty() {
+                return None;
             }
+            self.compile_cranelift().ok()?;
+        } else if self
+            .cranelift_fn_cache
+            .get(func_idx)
+            .and_then(|s| s.as_ref())
+            .is_none()
+            && let Some(func_name) = self.functions.get(func_idx).map(|f| f.name.clone())
+            && self
+                .cranelift_jit
+                .as_ref()
+                .is_some_and(|jit| jit.is_deferred_dead_helper(&func_name))
+        {
+            self.compile_cranelift_internal(Some(&func_name)).ok()?;
+        }
+
+        let post_struct_gen = self.struct_metadata.generation();
+        let entry = self.cranelift_fn_cache.get(func_idx)?.as_ref()?;
+        if !Self::entry_is_5_or_6_uniform_scalar_abi(entry)
+            || entry.code_ptr.is_null()
+            || entry.compiled_generation != self.cranelift_compiled_generation
+            || entry.struct_metadata_generation != post_struct_gen
+            || args.len() != entry.param_types.len()
+        {
+            return None;
+        }
+
+        let arg_len = args.len();
+        let mut raw_args = [RawArg::Int(0); 6];
+        for (i, (val, expected_ty)) in args.iter().zip(entry.param_types.iter()).enumerate() {
+            raw_args[i] = match (val, expected_ty) {
+                (Value::Int(n), MirType::Int) => RawArg::Int(*n),
+                (Value::Float(f), MirType::Float) => RawArg::Float(*f),
+                _ => return None,
+            };
+        }
+        let code_ptr = entry.code_ptr;
+        let ret_type = entry.ret_type.clone();
+
+        let baseline = self.mir_context.capture_baseline();
+        let _mir_guard = self.mir_context.enter();
+
+        let vm_gas_budget = self.gas_remaining();
+        self.mir_context.set_status(MIR_STATUS_OK);
+        self.mir_context.set_memory_used(0);
+        self.mir_context.set_max_memory_limit(i64::MAX);
+        let mut gas_guard = crate::vm::GasScopeGuard::enter(
+            Rc::clone(&self.mir_context),
+            vm_gas_budget,
+            false,
+        );
+
+        self.cranelift_entry_count += 1;
+        let _jit_guard = self.enter_jit_scope();
+
+        // Charge base entry gas (matches `try_call_cranelift_scalar_direct` & `try_run_cranelift_top_frame_scoped`).
+        self.mir_context.charge_gas(1);
+
+        let invoked = if self.mir_context.last_status() == MIR_STATUS_OK {
+            match Self::invoke_cranelift_raw_code_ptr(code_ptr, &raw_args[..arg_len], &ret_type) {
+                Some(pair) => Some(pair),
+                None => {
+                    drop(_jit_guard);
+                    self.cranelift_entry_count = self.cranelift_entry_count.saturating_sub(1);
+                    if self.mir_context.dirty_allocations() {
+                        self.mir_context
+                            .clear_to_baselines(baseline.handles, baseline.buffers);
+                    }
+                    drop(gas_guard);
+                    drop(_mir_guard);
+                    return None;
+                }
+            }
+        } else {
+            Some((0, 0.0))
         };
 
-        let status = crate::mir::cranelift_backend::jit_engine::lust_mir_get_status();
+        let status = self.mir_context.last_status();
         drop(_jit_guard);
-        drop(_inv_guard);
 
+        if status == MIR_STATUS_DEOPT {
+            crate::mir::cranelift_backend::take_deopt_payload();
+            self.mir_context.set_status(MIR_STATUS_OK);
+            self.cranelift_entry_count = self.cranelift_entry_count.saturating_sub(1);
+            if self.mir_context.dirty_allocations() {
+                self.mir_context
+                    .clear_to_baselines(baseline.handles, baseline.buffers);
+            }
+            drop(gas_guard);
+            drop(_mir_guard);
+            return None;
+        }
+
+        let gas_charge_res = gas_guard.finish_and_charge(&mut self.budgets);
+
+        if self.mir_context.dirty_allocations() {
+            self.mir_context
+                .clear_to_baselines(baseline.handles, baseline.buffers);
+        }
+        drop(_mir_guard);
+
+        if status == MIR_STATUS_OK {
+            let (raw_int, raw_float) = invoked.unwrap_or((0, 0.0));
+            let result_val = match ret_type {
+                MirType::Float => Value::Float(raw_float),
+                MirType::Int => Value::Int(raw_int),
+                _ => Value::Nil,
+            };
+            return Some(gas_charge_res.map(|()| result_val));
+        }
+
+        if let Some(sticky_err) = crate::mir::cranelift_backend::take_current_sticky_error() {
+            crate::mir::cranelift_backend::take_deopt_payload();
+            return Some(Err(LustError::RuntimeError {
+                message: format!("Native deopt helper error: {}", sticky_err),
+            }));
+        }
+
+        crate::mir::cranelift_backend::take_deopt_payload();
+        match status {
+            MIR_STATUS_ERR_OUT_OF_GAS => Some(Err(match gas_charge_res {
+                Err(e) => e,
+                Ok(()) => LustError::RuntimeError {
+                    message: "Out of gas during Cranelift JIT execution".into(),
+                },
+            })),
+            MIR_STATUS_ERR_OOM => Some(Err(LustError::RuntimeError {
+                message: "Out of memory during Cranelift JIT execution".into(),
+            })),
+            MIR_STATUS_ERR_DIV_BY_ZERO => Some(Err(LustError::RuntimeError {
+                message: "Division or modulo by zero during Cranelift JIT execution".into(),
+            })),
+            MIR_STATUS_ERR_NEG_EXPONENT => Some(Err(LustError::RuntimeError {
+                message: "Negative exponent in integer power during Cranelift JIT execution".into(),
+            })),
+            MIR_STATUS_ERR_OUT_OF_BOUNDS => Some(Err(LustError::RuntimeError {
+                message: "Array index or pointer out of bounds during Cranelift JIT execution"
+                    .into(),
+            })),
+            _ => {
+                self.mir_context.set_status(MIR_STATUS_OK);
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[allow(clippy::too_many_arguments)]
+    fn finish_cranelift_top_frame_scoped(
+        &mut self,
+        func_name: &str,
+        ret_type: &MirType,
+        local_types: &[MirType],
+        readonly_params: &[bool],
+        sroa_recipes: &[crate::mir::ir::SroaStructRecipe],
+        frame_depth: usize,
+        invocation_id: u64,
+        vm_has_mem_budget: bool,
+        mut gas_guard: crate::vm::GasScopeGuard,
+        marshalled_arrays: &[MarshalledArray],
+        marshalled_structs: &[MarshalledStruct],
+        raw_int: i64,
+        raw_float: f64,
+        status: i64,
+    ) -> Result<CraneliftOutcome> {
         let gas_charge_res = gas_guard.finish_and_charge(&mut self.budgets);
 
         let mem_spent = usize::try_from(self.mir_context.memory_used().max(0)).unwrap_or(usize::MAX);
@@ -5358,16 +6001,26 @@ impl VM {
                 self.mir_context.get_handle(raw_int).unwrap_or_else(|| Value::string(""))
             }
             MirType::Array(elem_ty) => {
-                let decoded = validate_and_decode_array(
-                    &self.mir_context,
-                    &marshalled_arrays,
-                    raw_int,
-                    elem_ty,
-                )?;
-                if let Some(orig_rc) = decoded.matched_input_rc {
-                    Value::Array(orig_rc)
+                if matches!(&**elem_ty, MirType::String | MirType::Struct(_))
+                    && self
+                        .mir_context
+                        .get_active_allocation_record(raw_int as usize)
+                        .is_none()
+                    && let Some(Value::Array(rc)) = self.mir_context.get_handle(raw_int)
+                {
+                    Value::Array(rc)
                 } else {
-                    Value::Array(Rc::new(LustArray::new(decoded.elements)))
+                    let decoded = validate_and_decode_array(
+                        &self.mir_context,
+                        marshalled_arrays,
+                        raw_int,
+                        elem_ty,
+                    )?;
+                    if let Some(orig_rc) = decoded.matched_input_rc {
+                        Value::Array(orig_rc)
+                    } else {
+                        Value::Array(Rc::new(LustArray::new(decoded.elements)))
+                    }
                 }
             }
             MirType::Tuple(elem_types) => {
@@ -5416,6 +6069,24 @@ impl VM {
                             Some(self.struct_metadata.as_map()),
                         )?;
                         Value::some(decoded_struct)
+                    }
+                }
+                MirType::Int | MirType::Bool | MirType::Float | MirType::String => {
+                    if raw_int == 0 {
+                        Value::none()
+                    } else if let Some(val) = self.mir_context.get_handle(raw_int) {
+                        if matches!(&val, Value::Enum(_)) {
+                            val
+                        } else {
+                            Value::some(val)
+                        }
+                    } else {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Missing Option<{:?}> handle {} in Cranelift return decoding",
+                                inner, raw_int
+                            ),
+                        });
                     }
                 }
                 _ => {
@@ -5790,22 +6461,39 @@ impl VM {
                     }
                 },
                 MirType::Array(inner)
-                    if matches!(&**inner, MirType::Int | MirType::Bool | MirType::Float) =>
+                    if matches!(
+                        &**inner,
+                        MirType::Int
+                            | MirType::Bool
+                            | MirType::Float
+                            | MirType::String
+                            | MirType::Struct(_)
+                    ) =>
                 {
-                    let decoded = validate_and_decode_array(
-                        &self.mir_context,
-                        marshalled_arrays,
-                        raw_val,
-                        inner,
-                    )?;
-                    if let Some(orig_rc) = decoded.matched_input_rc {
-                        Value::Array(orig_rc)
+                    if matches!(&**inner, MirType::String | MirType::Struct(_))
+                        && self
+                            .mir_context
+                            .get_active_allocation_record(raw_val as usize)
+                            .is_none()
+                        && let Some(Value::Array(rc)) = self.mir_context.get_handle(raw_val)
+                    {
+                        Value::Array(Rc::clone(&rc))
                     } else {
-                        let rc = materialized_fresh_arrays
-                            .entry(decoded._ptr as usize)
-                            .or_insert_with(|| Rc::new(LustArray::new(decoded.elements)))
-                            .clone();
-                        Value::Array(rc)
+                        let decoded = validate_and_decode_array(
+                            &self.mir_context,
+                            marshalled_arrays,
+                            raw_val,
+                            inner,
+                        )?;
+                        if let Some(orig_rc) = decoded.matched_input_rc {
+                            Value::Array(orig_rc)
+                        } else {
+                            let rc = materialized_fresh_arrays
+                                .entry(decoded._ptr as usize)
+                                .or_insert_with(|| Rc::new(LustArray::new(decoded.elements)))
+                                .clone();
+                            Value::Array(rc)
+                        }
                     }
                 }
                 MirType::Struct(name) => {
@@ -5887,6 +6575,33 @@ impl VM {
                             Value::some(decoded_val)
                         }
                     }
+                    MirType::Int | MirType::Bool | MirType::Float | MirType::String => {
+                        if raw_val == 0 {
+                            Value::none()
+                        } else {
+                            match self.mir_context.get_handle(raw_val) {
+                                Some(Value::Enum(e_rc)) if e_rc.enum_name.as_str() == "Option" => {
+                                    Value::Enum(Rc::clone(&e_rc))
+                                }
+                                Some(other) => {
+                                    return Err(LustError::RuntimeError {
+                                        message: format!(
+                                            "Deopt payload ({source_label}) invalid handle {} for Option<{:?}> local {}: expected Option enum, got {:?}",
+                                            raw_val, inner, loc_idx, other
+                                        ),
+                                    });
+                                }
+                                None => {
+                                    return Err(LustError::RuntimeError {
+                                        message: format!(
+                                            "Deopt payload ({source_label}) missing Option<{:?}> handle {} for local {}",
+                                            inner, raw_val, loc_idx
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
                     _ => {
                         return Err(LustError::RuntimeError {
                             message: format!(
@@ -5896,6 +6611,50 @@ impl VM {
                         });
                     }
                 },
+                MirType::Map(_, _) => match self.mir_context.get_handle(raw_val) {
+                    Some(Value::Map(m_rc)) => Value::Map(Rc::clone(&m_rc)),
+                    Some(other) => {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Deopt payload ({source_label}) invalid handle {} for Map local {}: expected Map, got {:?}",
+                                raw_val, loc_idx, other
+                            ),
+                        });
+                    }
+                    None => {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Deopt payload ({source_label}) missing Map handle {} for local {}",
+                                raw_val, loc_idx
+                            ),
+                        });
+                    }
+                },
+                MirType::Enum(name) => {
+                    if name == "Option" && raw_val == 0 {
+                        Value::none()
+                    } else {
+                        match self.mir_context.get_handle(raw_val) {
+                            Some(Value::Enum(e_rc)) => Value::Enum(Rc::clone(&e_rc)),
+                            Some(other) => {
+                                return Err(LustError::RuntimeError {
+                                    message: format!(
+                                        "Deopt payload ({source_label}) invalid handle {} for Enum('{}') local {}: expected Enum, got {:?}",
+                                        raw_val, name, loc_idx, other
+                                    ),
+                                });
+                            }
+                            None => {
+                                return Err(LustError::RuntimeError {
+                                    message: format!(
+                                        "Deopt payload ({source_label}) missing Enum('{}') handle {} for local {}",
+                                        name, raw_val, loc_idx
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
                 _ => {
                     return Err(LustError::RuntimeError {
                         message: format!(

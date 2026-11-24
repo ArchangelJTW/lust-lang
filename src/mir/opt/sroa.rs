@@ -57,7 +57,30 @@ impl ScalarReplacementOfAggregates {
             }
         }
 
+        if Self::run_multi_def_struct_sroa(func, struct_layouts) {
+            changed = true;
+        }
+
         changed
+    }
+
+    fn lookup_struct_layout<'a>(
+        struct_layouts: &'a HashMap<String, MirStructLayout>,
+        struct_name: &str,
+    ) -> Option<&'a MirStructLayout> {
+        if let Some(layout) = struct_layouts.get(struct_name) {
+            return Some(layout);
+        }
+        let mut matched: Option<&'a MirStructLayout> = None;
+        for (k, layout) in struct_layouts {
+            if Self::struct_names_match(k, struct_name) {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(layout);
+            }
+        }
+        matched
     }
 
     fn resolve_scalar_fields(
@@ -114,7 +137,7 @@ impl ScalarReplacementOfAggregates {
         let struct_name = struct_name.clone();
         let orig_span = decl.span;
 
-        let Some(layout) = struct_layouts.get(&struct_name) else {
+        let Some(layout) = Self::lookup_struct_layout(struct_layouts, &struct_name) else {
             return false;
         };
         let Some((field_types, field_names)) = Self::resolve_scalar_fields(layout) else {
@@ -786,6 +809,609 @@ impl ScalarReplacementOfAggregates {
             }
             Terminator::Return(Some(op), _) | Terminator::Raise(op, _) => {
                 Self::rewrite_operand(op, bases, field_locals);
+            }
+            Terminator::Return(None, _) => {}
+        }
+    }
+    /// Closed-component multi-def & loop-body struct SROA (`NG-W15-2`):
+    ///
+    /// Decomposes non-escaping connected copy/move components of scalar-field structs
+    /// even when locals are defined inside loop bodies or reassigned multiple times
+    /// (e.g. `cur = transform(cur, i)` in `BENCH-NG-07`, `TelemetryEvent` in `BENCH-NG-13`,
+    /// `OrderTick` in `BENCH-NG-15`).
+    ///
+    /// Reference-aliasing soundness:
+    /// - If the component has ZERO field mutations (`Place::Field(Local(x), k) = ...`),
+    ///   every struct instance in the component is immutable and reference copy is
+    ///   observationally identical to field-wise value copy.
+    /// - If the component has field mutations AND copy edges `dst = Copy/Move(src)`,
+    ///   every copied `src` must be a same-block single-def, single-use temporary with
+    ///   zero field accesses (strictly rejecting mutable user aliases like `local b = a`).
+    fn run_multi_def_struct_sroa(
+        func: &mut MirFunction,
+        struct_layouts: &HashMap<String, MirStructLayout>,
+    ) -> bool {
+        if func.blocks.is_empty() || func.entry.0 >= func.blocks.len() || struct_layouts.is_empty()
+        {
+            return false;
+        }
+
+        let mut cleanup_block_set: HashSet<usize> = HashSet::new();
+        for (b_idx, blk) in func.blocks.iter().enumerate() {
+            if blk.is_cleanup {
+                cleanup_block_set.insert(b_idx);
+            }
+        }
+        for entry in &func.cleanup_blocks {
+            cleanup_block_set.insert(entry.block.0);
+        }
+
+        let mut pib_locals: HashSet<LocalId> = HashSet::new();
+        for pairs in func.proven_in_bounds.values() {
+            for &(a, b) in pairs {
+                pib_locals.insert(a);
+                pib_locals.insert(b);
+            }
+        }
+
+        let mut already_sroa: HashSet<LocalId> = func
+            .sroa_decomposed_structs
+            .iter()
+            .map(|r| r.orig_local)
+            .collect();
+
+        // Collect all candidate struct type names appearing in locals or Aggregates.
+        let mut candidate_structs: Vec<String> = Vec::new();
+        let mut seen_structs: HashSet<String> = HashSet::new();
+        for decl in &func.locals {
+            if let MirType::Struct(s) = &decl.ty {
+                if !s.is_empty() && seen_structs.insert(s.clone()) {
+                    candidate_structs.push(s.clone());
+                }
+            }
+        }
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if let Statement::Assign(_, Rvalue::Aggregate(MirType::Struct(s), _), _) = stmt {
+                    if !s.is_empty() && seen_structs.insert(s.clone()) {
+                        candidate_structs.push(s.clone());
+                    }
+                }
+            }
+        }
+
+        let mut overall_changed = false;
+
+        for struct_name in candidate_structs {
+            let Some(layout) = Self::lookup_struct_layout(struct_layouts, &struct_name) else {
+                continue;
+            };
+            let Some((field_types, field_names)) = Self::resolve_scalar_fields(layout) else {
+                continue;
+            };
+            let n_fields = field_types.len();
+
+            // Build undirected copy/move adjacency across all locals in `func`.
+            let mut copy_adj: HashMap<LocalId, Vec<LocalId>> = HashMap::new();
+            let mut seed_locals: Vec<LocalId> = Vec::new();
+            let mut seed_set: HashSet<LocalId> = HashSet::new();
+
+            for (idx, decl) in func.locals.iter().enumerate() {
+                let id = LocalId(idx);
+                if already_sroa.contains(&id) {
+                    continue;
+                }
+                if let MirType::Struct(s) = &decl.ty {
+                    if Self::struct_names_match(s, &struct_name) && seed_set.insert(id) {
+                        seed_locals.push(id);
+                    }
+                }
+            }
+
+            for block in &func.blocks {
+                for stmt in &block.statements {
+                    match stmt {
+                        Statement::Assign(
+                            Place::Local(dst),
+                            Rvalue::Aggregate(MirType::Struct(s), ops),
+                            _,
+                        ) if Self::struct_names_match(s, &struct_name) && ops.len() == n_fields => {
+                            if !already_sroa.contains(dst) && seed_set.insert(*dst) {
+                                seed_locals.push(*dst);
+                            }
+                        }
+                        Statement::Assign(
+                            Place::Local(dst),
+                            Rvalue::Use(
+                                Operand::Copy(Place::Local(src))
+                                | Operand::Move(Place::Local(src)),
+                            ),
+                            _,
+                        ) if *dst != *src => {
+                            copy_adj.entry(*dst).or_default().push(*src);
+                            copy_adj.entry(*src).or_default().push(*dst);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let mut visited: HashSet<LocalId> = HashSet::new();
+            for seed in seed_locals {
+                if !visited.insert(seed) {
+                    continue;
+                }
+
+                // BFS to form the full connected copy/move component.
+                let mut comp: Vec<LocalId> = alloc::vec![seed];
+                let mut queue_idx = 0;
+                while queue_idx < comp.len() {
+                    let cur = comp[queue_idx];
+                    queue_idx += 1;
+                    if let Some(neighbors) = copy_adj.get(&cur) {
+                        for &nb in neighbors {
+                            if visited.insert(nb) {
+                                comp.push(nb);
+                            }
+                        }
+                    }
+                }
+                comp.sort_unstable_by_key(|id| id.0);
+                let comp_set: HashSet<LocalId> = comp.iter().copied().collect();
+
+                // 1. Validate local declarations in `comp`.
+                let mut decls_ok = !comp.is_empty();
+                for &x in &comp {
+                    let Some(decl) = func.locals.get(x.0) else {
+                        decls_ok = false;
+                        break;
+                    };
+                    if decl.is_param
+                        || func.params.contains(&x)
+                        || x == func.return_local
+                        || already_sroa.contains(&x)
+                        || pib_locals.contains(&x)
+                    {
+                        decls_ok = false;
+                        break;
+                    }
+                    if let MirType::Struct(other_s) = &decl.ty {
+                        if !Self::struct_names_match(other_s, &struct_name) {
+                            decls_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !decls_ok {
+                    continue;
+                }
+
+                // 2. Validate every statement and terminator in `func` mentioning any `x in comp`.
+                let mut valid = true;
+                let mut has_aggregate = false;
+                let mut has_field_mutation = false;
+                let mut needs_staging = false;
+                let mut whole_defs: HashMap<LocalId, Vec<(usize, usize)>> = HashMap::new();
+                let mut copy_edges: Vec<(LocalId, LocalId, usize, usize)> = Vec::new();
+                let mut whole_copy_reads: HashMap<LocalId, usize> = HashMap::new();
+                let mut field_access_counts: HashMap<LocalId, usize> = HashMap::new();
+
+                'blocks: for (b_idx, block) in func.blocks.iter().enumerate() {
+                    let is_cleanup_blk = cleanup_block_set.contains(&b_idx);
+                    for (s_idx, stmt) in block.statements.iter().enumerate() {
+                        if !comp.iter().any(|&x| Self::stmt_mentions_local(stmt, x)) {
+                            continue;
+                        }
+                        if is_cleanup_blk {
+                            valid = false;
+                            break 'blocks;
+                        }
+                        match stmt {
+                            Statement::StorageLive(id, _) | Statement::StorageDead(id, _)
+                                if comp_set.contains(id) => {}
+                            Statement::Assign(
+                                Place::Local(dst),
+                                Rvalue::Aggregate(MirType::Struct(s), ops),
+                                _,
+                            ) if comp_set.contains(dst) => {
+                                if !Self::struct_names_match(s, &struct_name)
+                                    || ops.len() != n_fields
+                                {
+                                    valid = false;
+                                    break 'blocks;
+                                }
+                                for op in ops {
+                                    for &x in &comp {
+                                        if Self::operand_mentions_local(op, x) {
+                                            if !Self::operand_uses_only_direct_fields(
+                                                op, x, n_fields,
+                                            ) {
+                                                valid = false;
+                                                break 'blocks;
+                                            }
+                                            *field_access_counts.entry(x).or_insert(0) += 1;
+                                            if x == *dst {
+                                                needs_staging = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                whole_defs.entry(*dst).or_default().push((b_idx, s_idx));
+                                has_aggregate = true;
+                            }
+                            Statement::Assign(
+                                Place::Local(dst),
+                                Rvalue::Use(
+                                    Operand::Copy(Place::Local(src))
+                                    | Operand::Move(Place::Local(src)),
+                                ),
+                                _,
+                            ) if comp_set.contains(dst) || comp_set.contains(src) => {
+                                if !comp_set.contains(dst) || !comp_set.contains(src) {
+                                    valid = false;
+                                    break 'blocks;
+                                }
+                                whole_defs.entry(*dst).or_default().push((b_idx, s_idx));
+                                if *dst != *src {
+                                    copy_edges.push((*dst, *src, b_idx, s_idx));
+                                    *whole_copy_reads.entry(*src).or_insert(0) += 1;
+                                }
+                            }
+                            Statement::Assign(place, rval, _) => {
+                                if let Place::Field(base, field_idx) = place {
+                                    if let Place::Local(x) = base.as_ref() {
+                                        if comp_set.contains(x) {
+                                            if *field_idx >= n_fields {
+                                                valid = false;
+                                                break 'blocks;
+                                            }
+                                            has_field_mutation = true;
+                                            *field_access_counts.entry(*x).or_insert(0) += 1;
+                                        }
+                                    }
+                                }
+                                for &x in &comp {
+                                    if Self::place_mentions_local(place, x) {
+                                        if !Self::place_uses_only_direct_fields(place, x, n_fields)
+                                        {
+                                            valid = false;
+                                            break 'blocks;
+                                        }
+                                    }
+                                    if Self::rvalue_mentions_local(rval, x) {
+                                        if !Self::rvalue_uses_only_direct_fields(rval, x, n_fields)
+                                        {
+                                            valid = false;
+                                            break 'blocks;
+                                        }
+                                        *field_access_counts.entry(x).or_insert(0) += 1;
+                                    }
+                                }
+                            }
+                            _ => {
+                                valid = false;
+                                break 'blocks;
+                            }
+                        }
+                    }
+
+                    if let Some(term) = &block.terminator {
+                        if comp.iter().any(|&x| Self::terminator_mentions_local(term, x)) {
+                            if is_cleanup_blk {
+                                valid = false;
+                                break 'blocks;
+                            }
+                            if let Terminator::Call {
+                                destination: Place::Field(base, _),
+                                ..
+                            } = term
+                            {
+                                if let Place::Local(x) = base.as_ref() {
+                                    if comp_set.contains(x) {
+                                        has_field_mutation = true;
+                                    }
+                                }
+                            }
+                            for &x in &comp {
+                                if Self::terminator_mentions_local(term, x) {
+                                    if !Self::terminator_uses_only_direct_fields(term, x, n_fields)
+                                    {
+                                        valid = false;
+                                        break 'blocks;
+                                    }
+                                    *field_access_counts.entry(x).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !valid || !has_aggregate {
+                    continue;
+                }
+
+                // 3. Enforce reference-aliasing soundness when any field mutation occurs.
+                if has_field_mutation && !copy_edges.is_empty() {
+                    let mut aliases_sound = true;
+                    for &(_dst, src, use_bb, use_stmt) in &copy_edges {
+                        let defs = whole_defs.get(&src).map(|v| v.as_slice()).unwrap_or(&[]);
+                        let copy_reads = whole_copy_reads.get(&src).copied().unwrap_or(0);
+                        let field_uses = field_access_counts.get(&src).copied().unwrap_or(0);
+                        if defs.len() != 1
+                            || copy_reads != 1
+                            || field_uses != 0
+                            || defs[0].0 != use_bb
+                            || defs[0].1 >= use_stmt
+                        {
+                            aliases_sound = false;
+                            break;
+                        }
+                    }
+                    if !aliases_sound {
+                        continue;
+                    }
+                }
+
+                // 4. Enforce hard 250-local cap.
+                let needed_locals = comp
+                    .len()
+                    .saturating_mul(n_fields)
+                    .saturating_add(if needs_staging { n_fields } else { 0 });
+                if func.locals.len().saturating_add(needed_locals) > SROA_MAX_LOCALS_LIMIT {
+                    continue;
+                }
+
+                // --- Component validated! Allocate SSA scalar replacements and rewrite MIR ---
+                let mut field_locals_map: HashMap<LocalId, Vec<LocalId>> =
+                    HashMap::with_capacity(comp.len());
+                for &x in &comp {
+                    let x_span = func.locals[x.0].span;
+                    let mut fls = Vec::with_capacity(n_fields);
+                    for (k, field_ty) in field_types.iter().enumerate() {
+                        let fl_id = LocalId(func.locals.len());
+                        func.locals.push(LocalDecl {
+                            id: fl_id,
+                            name: Some(format!("__sroa_{}_{}", x.0, k)),
+                            ty: field_ty.clone(),
+                            is_mut: true,
+                            span: x_span,
+                            is_stack_promoted: false,
+                            is_param: false,
+                        });
+                        fls.push(fl_id);
+                    }
+                    field_locals_map.insert(x, fls);
+                }
+
+                let stage_locals: Vec<LocalId> = if needs_staging {
+                    let span0 = func.locals[comp[0].0].span;
+                    let mut sls = Vec::with_capacity(n_fields);
+                    for (k, field_ty) in field_types.iter().enumerate() {
+                        let sl_id = LocalId(func.locals.len());
+                        func.locals.push(LocalDecl {
+                            id: sl_id,
+                            name: Some(format!("__sroa_stage_{}_{}", comp[0].0, k)),
+                            ty: field_ty.clone(),
+                            is_mut: true,
+                            span: span0,
+                            is_stack_promoted: false,
+                            is_param: false,
+                        });
+                        sls.push(sl_id);
+                    }
+                    sls
+                } else {
+                    Vec::new()
+                };
+
+                for block in &mut func.blocks {
+                    let mut new_stmts = Vec::with_capacity(block.statements.len() + n_fields * 2);
+                    for stmt in &block.statements {
+                        match stmt {
+                            Statement::StorageLive(id, span) if comp_set.contains(id) => {
+                                for &fl in &field_locals_map[id] {
+                                    new_stmts.push(Statement::StorageLive(fl, *span));
+                                }
+                            }
+                            Statement::StorageDead(id, span) if comp_set.contains(id) => {
+                                for &fl in &field_locals_map[id] {
+                                    new_stmts.push(Statement::StorageDead(fl, *span));
+                                }
+                            }
+                            Statement::Assign(
+                                Place::Local(dst),
+                                Rvalue::Aggregate(MirType::Struct(_), ops),
+                                span,
+                            ) if comp_set.contains(dst) => {
+                                let dst_fields = &field_locals_map[dst];
+                                let self_ref =
+                                    ops.iter().any(|op| Self::operand_mentions_local(op, *dst));
+                                if self_ref {
+                                    for (k, op) in ops.iter().enumerate() {
+                                        let mut rewritten_op = op.clone();
+                                        Self::rewrite_operand_multi(
+                                            &mut rewritten_op,
+                                            &field_locals_map,
+                                        );
+                                        new_stmts.push(Statement::StorageLive(
+                                            stage_locals[k],
+                                            *span,
+                                        ));
+                                        new_stmts.push(Statement::Assign(
+                                            Place::Local(stage_locals[k]),
+                                            Rvalue::Use(rewritten_op),
+                                            *span,
+                                        ));
+                                    }
+                                    for k in 0..n_fields {
+                                        new_stmts.push(Statement::Assign(
+                                            Place::Local(dst_fields[k]),
+                                            Rvalue::Use(Operand::Move(Place::Local(
+                                                stage_locals[k],
+                                            ))),
+                                            *span,
+                                        ));
+                                        new_stmts.push(Statement::StorageDead(
+                                            stage_locals[k],
+                                            *span,
+                                        ));
+                                    }
+                                } else {
+                                    for (k, op) in ops.iter().enumerate() {
+                                        let mut rewritten_op = op.clone();
+                                        Self::rewrite_operand_multi(
+                                            &mut rewritten_op,
+                                            &field_locals_map,
+                                        );
+                                        new_stmts.push(Statement::Assign(
+                                            Place::Local(dst_fields[k]),
+                                            Rvalue::Use(rewritten_op),
+                                            *span,
+                                        ));
+                                    }
+                                }
+                            }
+                            Statement::Assign(
+                                Place::Local(dst),
+                                Rvalue::Use(
+                                    Operand::Copy(Place::Local(src))
+                                    | Operand::Move(Place::Local(src)),
+                                ),
+                                span,
+                            ) if comp_set.contains(dst) && comp_set.contains(src) => {
+                                if *dst != *src {
+                                    let dst_fields = &field_locals_map[dst];
+                                    let src_fields = &field_locals_map[src];
+                                    for k in 0..n_fields {
+                                        new_stmts.push(Statement::Assign(
+                                            Place::Local(dst_fields[k]),
+                                            Rvalue::Use(Operand::Copy(Place::Local(src_fields[k]))),
+                                            *span,
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => {
+                                let mut cloned = stmt.clone();
+                                Self::rewrite_statement_multi(&mut cloned, &field_locals_map);
+                                new_stmts.push(cloned);
+                            }
+                        }
+                    }
+                    block.statements = new_stmts;
+
+                    if let Some(term) = &mut block.terminator {
+                        Self::rewrite_terminator_multi(term, &field_locals_map);
+                    }
+                }
+
+                // Record cold deopt reconstruction recipes for all struct-typed locals in `comp`.
+                for &x in &comp {
+                    already_sroa.insert(x);
+                    if let MirType::Struct(s_name) = &func.locals[x.0].ty {
+                        func.sroa_decomposed_structs.push(SroaStructRecipe {
+                            orig_local: x,
+                            struct_name: s_name.clone(),
+                            field_names: field_names.clone(),
+                            field_locals: field_locals_map[&x].clone(),
+                        });
+                    }
+                }
+
+                overall_changed = true;
+            }
+        }
+
+        overall_changed
+    }
+
+    fn rewrite_place_multi(
+        place: &mut Place,
+        field_locals_map: &HashMap<LocalId, Vec<LocalId>>,
+    ) {
+        if let Place::Field(base, field_idx) = place {
+            if let Place::Local(id) = base.as_ref() {
+                if let Some(fls) = field_locals_map.get(id) {
+                    if *field_idx < fls.len() {
+                        *place = Place::Local(fls[*field_idx]);
+                        return;
+                    }
+                }
+            }
+        }
+        match place {
+            Place::Local(_) => {}
+            Place::Field(base, _) | Place::Index(base, _) => {
+                Self::rewrite_place_multi(base, field_locals_map);
+            }
+        }
+    }
+
+    fn rewrite_operand_multi(
+        op: &mut Operand,
+        field_locals_map: &HashMap<LocalId, Vec<LocalId>>,
+    ) {
+        match op {
+            Operand::Copy(p) | Operand::Move(p) => Self::rewrite_place_multi(p, field_locals_map),
+            Operand::Constant(_) => {}
+        }
+    }
+
+    fn rewrite_rvalue_multi(
+        rval: &mut Rvalue,
+        field_locals_map: &HashMap<LocalId, Vec<LocalId>>,
+    ) {
+        match rval {
+            Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => {
+                Self::rewrite_operand_multi(op, field_locals_map);
+            }
+            Rvalue::BinaryOp(_, l, r) => {
+                Self::rewrite_operand_multi(l, field_locals_map);
+                Self::rewrite_operand_multi(r, field_locals_map);
+            }
+            Rvalue::Aggregate(_, ops) => {
+                for op in ops {
+                    Self::rewrite_operand_multi(op, field_locals_map);
+                }
+            }
+            Rvalue::Closure { captures, .. } => {
+                for (_, op, _) in captures {
+                    Self::rewrite_operand_multi(op, field_locals_map);
+                }
+            }
+        }
+    }
+
+    fn rewrite_statement_multi(
+        stmt: &mut Statement,
+        field_locals_map: &HashMap<LocalId, Vec<LocalId>>,
+    ) {
+        if let Statement::Assign(place, rval, _) = stmt {
+            Self::rewrite_place_multi(place, field_locals_map);
+            Self::rewrite_rvalue_multi(rval, field_locals_map);
+        }
+    }
+
+    fn rewrite_terminator_multi(
+        term: &mut Terminator,
+        field_locals_map: &HashMap<LocalId, Vec<LocalId>>,
+    ) {
+        match term {
+            Terminator::Goto(_, _) | Terminator::Unreachable(_) => {}
+            Terminator::Cond { cond, .. } => Self::rewrite_operand_multi(cond, field_locals_map),
+            Terminator::Switch { discr, .. } => {
+                Self::rewrite_operand_multi(discr, field_locals_map)
+            }
+            Terminator::Call {
+                args, destination, ..
+            } => {
+                Self::rewrite_place_multi(destination, field_locals_map);
+                for arg in args {
+                    Self::rewrite_operand_multi(arg, field_locals_map);
+                }
+            }
+            Terminator::Return(Some(op), _) | Terminator::Raise(op, _) => {
+                Self::rewrite_operand_multi(op, field_locals_map);
             }
             Terminator::Return(None, _) => {}
         }

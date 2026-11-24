@@ -4,6 +4,8 @@ use crate::LustError;
 use crate::bytecode::value::EnumObject;
 use crate::bytecode::value::IteratorState;
 use crate::bytecode::{NativeCallResult, Value, ValueKey, native_fn};
+#[cfg(feature = "std")]
+use crate::mir::runtime_helpers::{SMALL_INT_STRING_COUNT, format_i64_stack};
 use crate::number::{LustFloat, LustInt};
 use alloc::format;
 use alloc::rc::Rc;
@@ -365,8 +367,17 @@ fn create_ipairs_fn() -> Value {
     }))
 }
 
+#[cfg(not(feature = "std"))]
+const SMALL_INT_STRING_COUNT: usize = 256;
+
 thread_local! {
-    static SMALL_INT_STRINGS: [Rc<String>; 256] = core::array::from_fn(|i| Rc::new(i.to_string()));
+    static SMALL_INT_STRINGS: [Rc<String>; SMALL_INT_STRING_COUNT] = core::array::from_fn(|i| {
+        #[cfg(feature = "std")]
+        let text = format_i64_stack(i as i64, &mut [0; 24]).to_string();
+        #[cfg(not(feature = "std"))]
+        let text = i.to_string();
+        Rc::new(text)
+    });
 }
 
 pub(super) fn create_tostring_fn() -> Value {
@@ -376,10 +387,15 @@ pub(super) fn create_tostring_fn() -> Value {
         }
 
         match &args[0] {
-            Value::Int(n) if (0..256).contains(n) => {
+            Value::Int(n) if (0..SMALL_INT_STRING_COUNT as LustInt).contains(n) => {
                 let rc = SMALL_INT_STRINGS.with(|table| table[*n as usize].clone());
                 Ok(NativeCallResult::Return(Value::String(rc)))
             }
+            #[cfg(feature = "std")]
+            Value::Int(n) => Ok(NativeCallResult::Return(Value::string(format_i64_stack(
+                *n,
+                &mut [0; 24],
+            )))),
             Value::Bool(b) => {
                 Ok(NativeCallResult::Return(Value::string(if *b {
                     "true"

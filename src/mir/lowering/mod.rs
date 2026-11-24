@@ -1,8 +1,8 @@
 use crate::ast::{
-    BinaryOp, Expr, ExprKind, FunctionDef, Item, ItemKind, Literal, Stmt, StmtKind, StructDef,
-    Type, TypeKind, UnaryOp,
+    BinaryOp, EnumDef, Expr, ExprKind, FunctionDef, Item, ItemKind, Literal, Stmt, StmtKind,
+    StructDef, Type, TypeKind, UnaryOp,
 };
-use crate::data::layout::{CanonicalTypeTag, LogicalLayoutV1};
+use crate::data::layout::{CanonicalTypeTag, LogicalFieldDesc, LogicalLayoutV1};
 use crate::data::materialize::struct_def_to_layout;
 use crate::mir::ir::*;
 use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
@@ -41,6 +41,44 @@ pub(super) enum ScopeBinding {
     Thunk(LocalThunk),
 }
 
+#[derive(Debug, Clone)]
+struct PendingMapGetCall {
+    call_bb: BlockId,
+    tmp_local: LocalId,
+    assign_bb: BlockId,
+    map_local: Option<LocalId>,
+    key_local: Option<LocalId>,
+    val_ty: MirType,
+}
+
+#[derive(Debug, Clone)]
+struct PendingMapGetLocal {
+    call_bb: BlockId,
+    tmp_local: LocalId,
+    assign_bb: BlockId,
+    map_local: Option<LocalId>,
+    key_local: Option<LocalId>,
+    val_ty: MirType,
+    var_name: String,
+    exclusive_in_current_stmt: bool,
+}
+
+#[derive(Debug, Clone)]
+enum ConditionBinding {
+    Place {
+        name: String,
+        ty: MirType,
+        place: Place,
+        unwrap_option: bool,
+    },
+    CallUnwrap {
+        name: String,
+        ty: MirType,
+        callee: String,
+        args: Vec<Operand>,
+    },
+}
+
 pub struct AstLowering<'a> {
     current_fn: &'a mut MirFunction,
     current_block: BlockId,
@@ -51,9 +89,14 @@ pub struct AstLowering<'a> {
     struct_field_types: HashMap<String, Vec<MirType>>,
     struct_field_substructs: HashMap<String, Vec<Option<String>>>,
     struct_layouts: HashMap<String, LogicalLayoutV1>,
+    enum_defs: HashMap<String, Vec<(String, Vec<MirType>)>>,
+    scalar_enum_layouts: HashMap<String, (String, Vec<MirType>)>,
     struct_ops: Vec<MirStructOp>,
     local_field_names: HashMap<LocalId, Vec<String>>,
     known_typed_locals: HashSet<LocalId>,
+    last_map_get_call: Option<PendingMapGetCall>,
+    last_map_get_defs: HashMap<LocalId, PendingMapGetLocal>,
+    field_call_counter: usize,
     thunk_return_target: Option<(LocalId, BlockId)>,
     lifted_functions: Option<&'a mut Vec<MirFunction>>,
     lambda_counter: Option<&'a mut usize>,
@@ -92,12 +135,203 @@ impl<'a> AstLowering<'a> {
             struct_field_types: HashMap::new(),
             struct_field_substructs: HashMap::new(),
             struct_layouts: HashMap::new(),
+            enum_defs: HashMap::new(),
+            scalar_enum_layouts: HashMap::new(),
             struct_ops: Vec::new(),
             local_field_names: HashMap::new(),
             known_typed_locals,
+            last_map_get_call: None,
+            last_map_get_defs: HashMap::new(),
+            field_call_counter: 0,
             thunk_return_target: None,
             lifted_functions,
             lambda_counter,
+        }
+    }
+
+    fn mir_type_for_ast_with_enums(
+        ty: &Type,
+        enum_defs: &HashMap<String, Vec<(String, Vec<MirType>)>>,
+        scalar_enum_layouts: &HashMap<String, (String, Vec<MirType>)>,
+    ) -> MirType {
+        match &ty.kind {
+            TypeKind::Int => MirType::Int,
+            TypeKind::Float => MirType::Float,
+            TypeKind::Bool => MirType::Bool,
+            TypeKind::String => MirType::String,
+            TypeKind::Unit => MirType::Unit,
+            TypeKind::Unknown => MirType::Unknown,
+            TypeKind::Named(s) => {
+                if let Some((synth_name, _)) = scalar_enum_layouts.get(s) {
+                    MirType::Struct(synth_name.clone())
+                } else if enum_defs.contains_key(s) {
+                    MirType::Enum(s.clone())
+                } else {
+                    MirType::Struct(s.clone())
+                }
+            }
+            TypeKind::Tuple(types) => MirType::Tuple(
+                types
+                    .iter()
+                    .map(|t| Self::mir_type_for_ast_with_enums(t, enum_defs, scalar_enum_layouts))
+                    .collect(),
+            ),
+            TypeKind::Array(inner) => MirType::Array(Box::new(Self::mir_type_for_ast_with_enums(
+                inner,
+                enum_defs,
+                scalar_enum_layouts,
+            ))),
+            TypeKind::Map(k, v) => MirType::Map(
+                Box::new(Self::mir_type_for_ast_with_enums(
+                    k,
+                    enum_defs,
+                    scalar_enum_layouts,
+                )),
+                Box::new(Self::mir_type_for_ast_with_enums(
+                    v,
+                    enum_defs,
+                    scalar_enum_layouts,
+                )),
+            ),
+            TypeKind::Function {
+                params,
+                return_type,
+            } => MirType::Function {
+                params: params
+                    .iter()
+                    .map(|t| Self::mir_type_for_ast_with_enums(t, enum_defs, scalar_enum_layouts))
+                    .collect(),
+                return_type: Box::new(Self::mir_type_for_ast_with_enums(
+                    return_type,
+                    enum_defs,
+                    scalar_enum_layouts,
+                )),
+            },
+            TypeKind::Option(inner) => MirType::Option(Box::new(
+                Self::mir_type_for_ast_with_enums(inner, enum_defs, scalar_enum_layouts),
+            )),
+            TypeKind::Result(_, _) => MirType::Enum("Result".to_string()),
+            TypeKind::Effect { success, error, .. } => MirType::Effect {
+                return_type: Box::new(Self::mir_type_for_ast_with_enums(
+                    success,
+                    enum_defs,
+                    scalar_enum_layouts,
+                )),
+                error_type: Box::new(Self::mir_type_for_ast_with_enums(
+                    error,
+                    enum_defs,
+                    scalar_enum_layouts,
+                )),
+            },
+            TypeKind::Typeof(s) => MirType::Struct(s.clone()),
+            TypeKind::InferType(inner)
+            | TypeKind::InferInput(inner)
+            | TypeKind::InferOutput(inner) => {
+                Self::mir_type_for_ast_with_enums(inner, enum_defs, scalar_enum_layouts)
+            }
+            TypeKind::Schema { output, .. } => {
+                Self::mir_type_for_ast_with_enums(output, enum_defs, scalar_enum_layouts)
+            }
+            _ => MirType::Int,
+        }
+    }
+
+    fn mir_type_for_ast(&self, ty: &Type) -> MirType {
+        Self::mir_type_for_ast_with_enums(ty, &self.enum_defs, &self.scalar_enum_layouts)
+    }
+
+    fn try_build_scalar_enum_layout(
+        enum_name: &str,
+        variants: &[(String, Vec<MirType>)],
+        type_id: u64,
+    ) -> Option<(LogicalLayoutV1, Vec<MirType>)> {
+        if variants.is_empty() {
+            return None;
+        }
+        let max_arity = variants.iter().map(|(_, fs)| fs.len()).max().unwrap_or(0);
+        if max_arity > 4 {
+            return None;
+        }
+        let mut slot_types: Vec<Option<MirType>> = vec![None; max_arity];
+        for (_, fields) in variants {
+            for (idx, fty) in fields.iter().enumerate() {
+                if !matches!(fty, MirType::Int | MirType::Bool | MirType::Float) {
+                    return None;
+                }
+                match &slot_types[idx] {
+                    None => slot_types[idx] = Some(fty.clone()),
+                    Some(prev) if prev == fty => {}
+                    Some(_) => return None,
+                }
+            }
+        }
+        let resolved_slots: Vec<MirType> = slot_types
+            .into_iter()
+            .map(|o| o.unwrap_or(MirType::Int))
+            .collect();
+        let synth_name = format!("__Enum_{enum_name}");
+        let mut fields = Vec::with_capacity(1 + resolved_slots.len());
+        fields.push(LogicalFieldDesc::new(0, "__tag", CanonicalTypeTag::Int64));
+        for (i, st) in resolved_slots.iter().enumerate() {
+            let tag = match st {
+                MirType::Int => CanonicalTypeTag::Int64,
+                MirType::Float => CanonicalTypeTag::Float64,
+                MirType::Bool => CanonicalTypeTag::Bool,
+                _ => return None,
+            };
+            fields.push(LogicalFieldDesc::new((i + 1) as u16, format!("__f{i}"), tag));
+        }
+        let layout = LogicalLayoutV1::new(type_id, synth_name, fields);
+        Some((layout, resolved_slots))
+    }
+
+    fn scalar_enum_default_const(ty: &MirType) -> MirConstant {
+        match ty {
+            MirType::Int => MirConstant::Int(0),
+            MirType::Float => MirConstant::Float(0.0),
+            MirType::Bool => MirConstant::Bool(false),
+            _ => MirConstant::Int(0),
+        }
+    }
+
+    pub fn register_enum_def(&mut self, enum_def: &EnumDef) {
+        let variants: Vec<(String, Vec<MirType>)> = enum_def
+            .variants
+            .iter()
+            .map(|v| {
+                let field_tys = v
+                    .fields
+                    .as_ref()
+                    .map(|fs| fs.iter().map(mir_type_from_ast).collect())
+                    .unwrap_or_default();
+                (v.name.clone(), field_tys)
+            })
+            .collect();
+        if let Some((layout, slot_types)) = Self::try_build_scalar_enum_layout(
+            &enum_def.name,
+            &variants,
+            0xE000u64.wrapping_add(self.enum_defs.len() as u64),
+        ) {
+            let synth_name = layout.type_name.clone();
+            let mut full_types = Vec::with_capacity(1 + slot_types.len());
+            full_types.push(MirType::Int);
+            full_types.extend(slot_types.iter().cloned());
+            self.struct_field_types.insert(synth_name.clone(), full_types);
+            self.struct_field_substructs
+                .insert(synth_name.clone(), vec![None; 1 + slot_types.len()]);
+            self.register_struct_layout(layout);
+            self.scalar_enum_layouts
+                .insert(enum_def.name.clone(), (synth_name, slot_types));
+        }
+        self.enum_defs.insert(enum_def.name.clone(), variants);
+    }
+
+    fn operand_is_explicit_unknown(&self, op: &Operand) -> bool {
+        match op {
+            Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
+                self.current_fn.locals[loc.0].ty == MirType::Unknown
+            }
+            _ => false,
         }
     }
 
@@ -202,6 +436,8 @@ impl<'a> AstLowering<'a> {
     ) -> Result<MirModule, MirLowerError> {
         let mut module = MirModule::new(module_name.into());
         let mut defs = Vec::new();
+        let mut enum_defs_ast: Vec<&EnumDef> = Vec::new();
+        let mut next_enum_type_id = 0xE000u64;
         for item in items {
             match &item.kind {
                 ItemKind::Struct(def) => {
@@ -210,7 +446,7 @@ impl<'a> AstLowering<'a> {
                     defs.push(def);
                 }
                 ItemKind::Enum(enum_def) => {
-                    let variants = enum_def
+                    let variants: Vec<(String, Vec<MirType>)> = enum_def
                         .variants
                         .iter()
                         .map(|v| {
@@ -222,10 +458,19 @@ impl<'a> AstLowering<'a> {
                             (v.name.clone(), field_tys)
                         })
                         .collect();
+                    if let Some((layout, _)) = Self::try_build_scalar_enum_layout(
+                        &enum_def.name,
+                        &variants,
+                        next_enum_type_id,
+                    ) {
+                        next_enum_type_id = next_enum_type_id.wrapping_add(1);
+                        module.register_struct_layout(MirStructLayout::from(&layout));
+                    }
                     module.register_enum_def(MirEnumDef {
                         name: enum_def.name.clone(),
                         variants,
                     });
+                    enum_defs_ast.push(enum_def);
                 }
                 _ => {}
             }
@@ -239,6 +484,7 @@ impl<'a> AstLowering<'a> {
                         func_def,
                         None,
                         &defs,
+                        &enum_defs_ast,
                         Some(&mut lifted_functions),
                         Some(&mut lambda_counter),
                     )?;
@@ -259,6 +505,7 @@ impl<'a> AstLowering<'a> {
                             method_fn,
                             Some(&target_name),
                             &defs,
+                            &enum_defs_ast,
                             Some(&mut lifted_functions),
                             Some(&mut lambda_counter),
                         )?;
@@ -292,16 +539,42 @@ impl<'a> AstLowering<'a> {
         owner_struct: Option<&str>,
         struct_defs: &[&StructDef],
     ) -> Result<(MirFunction, Vec<MirStructOp>), MirLowerError> {
-        Self::lower_function_inner(func_def, owner_struct, struct_defs, None, None)
+        Self::lower_function_inner(func_def, owner_struct, struct_defs, &[], None, None)
     }
 
     fn lower_function_inner(
         func_def: &FunctionDef,
         owner_struct: Option<&str>,
         struct_defs: &[&StructDef],
+        enum_defs_ast: &[&EnumDef],
         lifted_functions: Option<&mut Vec<MirFunction>>,
         lambda_counter: Option<&mut usize>,
     ) -> Result<(MirFunction, Vec<MirStructOp>), MirLowerError> {
+        let mut enum_defs_map: HashMap<String, Vec<(String, Vec<MirType>)>> = HashMap::new();
+        let mut scalar_enum_map: HashMap<String, (String, Vec<MirType>)> = HashMap::new();
+        for (idx, edef) in enum_defs_ast.iter().enumerate() {
+            let variants: Vec<(String, Vec<MirType>)> = edef
+                .variants
+                .iter()
+                .map(|v| {
+                    let field_tys = v
+                        .fields
+                        .as_ref()
+                        .map(|fs| fs.iter().map(mir_type_from_ast).collect())
+                        .unwrap_or_default();
+                    (v.name.clone(), field_tys)
+                })
+                .collect();
+            if let Some((layout, slot_types)) = Self::try_build_scalar_enum_layout(
+                &edef.name,
+                &variants,
+                0xE000u64.wrapping_add(idx as u64),
+            ) {
+                scalar_enum_map.insert(edef.name.clone(), (layout.type_name, slot_types));
+            }
+            enum_defs_map.insert(edef.name.clone(), variants);
+        }
+
         let sig = FunctionSignature {
             name: func_def.name.clone(),
             param_types: func_def
@@ -318,7 +591,7 @@ impl<'a> AstLowering<'a> {
                             return MirType::Struct(owner.to_string());
                         }
                     }
-                    mir_type_from_ast(&p.ty)
+                    Self::mir_type_for_ast_with_enums(&p.ty, &enum_defs_map, &scalar_enum_map)
                 })
                 .collect(),
             return_type: func_def
@@ -330,7 +603,7 @@ impl<'a> AstLowering<'a> {
                     {
                         MirType::Struct(owner.to_string())
                     } else {
-                        mir_type_from_ast(rt)
+                        Self::mir_type_for_ast_with_enums(rt, &enum_defs_map, &scalar_enum_map)
                     }
                 })
                 .unwrap_or(MirType::Unit),
@@ -350,9 +623,10 @@ impl<'a> AstLowering<'a> {
             for def in struct_defs {
                 lowering.register_struct_def(def);
             }
-            for stmt in &func_def.body {
-                lowering.lower_statement(stmt)?;
+            for edef in enum_defs_ast {
+                lowering.register_enum_def(edef);
             }
+            lowering.lower_statements(&func_def.body)?;
 
             let cur_block = lowering.current_block;
             if lowering.current_fn.blocks[cur_block.0].terminator.is_none() {
@@ -611,9 +885,7 @@ impl<'a> AstLowering<'a> {
 
         {
             let mut lowering = AstLowering::new(&mut mir_fn);
-            for stmt in &func_def.body {
-                lowering.lower_statement(stmt)?;
-            }
+            lowering.lower_statements(&func_def.body)?;
 
             // Ensure current block has a terminator
             let cur_block = lowering.current_block;
@@ -648,9 +920,7 @@ impl<'a> AstLowering<'a> {
         let mut mir_fn = MirFunction::new(sig, crate::ast::Span::dummy());
         {
             let mut lowering = AstLowering::new(&mut mir_fn);
-            for stmt in stmts {
-                lowering.lower_statement(stmt)?;
-            }
+            lowering.lower_statements(stmts)?;
 
             let cur_block = lowering.current_block;
             if lowering.current_fn.blocks[cur_block.0].terminator.is_none() {
@@ -672,12 +942,92 @@ impl<'a> AstLowering<'a> {
         Ok(mir_fn)
     }
 
+    fn lower_statements(&mut self, stmts: &[Stmt]) -> Result<(), MirLowerError> {
+        for (idx, stmt) in stmts.iter().enumerate() {
+            if !self.last_map_get_defs.is_empty() {
+                let remaining = &stmts[idx + 1..];
+                for pending in self.last_map_get_defs.values_mut() {
+                    let count_in_cur = count_ident_in_stmt(stmt, &pending.var_name);
+                    let used_later = stmts_mention_ident(remaining, &pending.var_name);
+                    pending.exclusive_in_current_stmt = count_in_cur == 1 && !used_later;
+                }
+            }
+            self.lower_statement(stmt)?;
+        }
+        Ok(())
+    }
+
+    fn emit_condition_bindings(
+        &mut self,
+        bindings: Vec<ConditionBinding>,
+        span: crate::ast::Span,
+    ) {
+        for binding in bindings {
+            match binding {
+                ConditionBinding::Place {
+                    name,
+                    ty,
+                    place,
+                    unwrap_option,
+                } => {
+                    let binding_local =
+                        self.current_fn
+                            .add_local(Some(name.clone()), ty.clone(), false, span);
+                    if ty != MirType::Unknown {
+                        self.known_typed_locals.insert(binding_local);
+                    }
+                    self.emit_stmt(Statement::StorageLive(binding_local, span));
+                    let rval = if unwrap_option {
+                        Rvalue::Cast(Operand::Copy(place), ty)
+                    } else {
+                        Rvalue::Use(Operand::Copy(place))
+                    };
+                    self.emit_stmt(Statement::Assign(
+                        Place::Local(binding_local),
+                        rval,
+                        span,
+                    ));
+                    self.insert_var(name, binding_local);
+                }
+                ConditionBinding::CallUnwrap {
+                    name,
+                    ty,
+                    callee,
+                    args,
+                } => {
+                    let binding_local =
+                        self.current_fn
+                            .add_local(Some(name.clone()), ty.clone(), false, span);
+                    if ty != MirType::Unknown {
+                        self.known_typed_locals.insert(binding_local);
+                    }
+                    let succ_bb = self.current_fn.new_block();
+                    self.emit_stmt(Statement::StorageLive(binding_local, span));
+                    self.terminate_block(Terminator::Call {
+                        callee,
+                        args,
+                        destination: Place::Local(binding_local),
+                        success: succ_bb,
+                        error: None,
+                        span,
+                    });
+                    self.current_block = succ_bb;
+                    self.insert_var(name, binding_local);
+                }
+            }
+        }
+    }
+
     pub fn lower_statement(&mut self, stmt: &Stmt) -> Result<(), MirLowerError> {
         if self.current_fn.blocks[self.current_block.0].terminator.is_some() {
             let dead_bb = self.current_fn.new_block();
             self.current_fn.blocks[dead_bb.0].terminator = Some(Terminator::Unreachable(stmt.span));
             self.current_block = dead_bb;
         }
+        // Keep only pending map.get definitions that belong to the current basic block.
+        let cur_bb = self.current_block;
+        self.last_map_get_defs
+            .retain(|_, p| p.assign_bb == cur_bb);
 
         match &stmt.kind {
             StmtKind::Local { bindings, initializer } => {
@@ -695,14 +1045,19 @@ impl<'a> AstLowering<'a> {
                     }
                 }
 
+                let mut init_map_gets: Vec<Option<PendingMapGetCall>> = Vec::new();
                 let init_operands = if let Some(inits) = initializer {
                     let mut ops = Vec::with_capacity(inits.len());
                     for (idx, expr) in inits.iter().enumerate() {
                         let expected_ty = bindings
                             .get(idx)
                             .and_then(|b| b.type_annotation.as_ref())
-                            .map(mir_type_from_ast);
-                        ops.push(self.lower_expr_with_expected(expr, expected_ty.as_ref())?);
+                            .map(|t| self.mir_type_for_ast(t));
+                        self.last_map_get_call = None;
+                        let op = self.lower_expr_with_expected(expr, expected_ty.as_ref())?;
+                        let pending_mg = self.last_map_get_call.take();
+                        ops.push(op);
+                        init_map_gets.push(pending_mg);
                     }
                     ops
                 } else {
@@ -720,7 +1075,7 @@ impl<'a> AstLowering<'a> {
                     let ty = b
                         .type_annotation
                         .as_ref()
-                        .map(mir_type_from_ast)
+                        .map(|t| self.mir_type_for_ast(t))
                         .unwrap_or(inferred_ty);
                     // Part A (`sieve.lust`): when an explicitly annotated `Array<T>` local is initialized
                     // with an empty array literal `[]`, specialize the temporary local and its empty
@@ -750,7 +1105,7 @@ impl<'a> AstLowering<'a> {
                             && (!has_init || matches!(init_op, Operand::Constant(MirConstant::Int(_)))));
                     let local_id = self.current_fn.add_local(
                         Some(b.name.clone()),
-                        ty,
+                        ty.clone(),
                         true,
                         b.span,
                     );
@@ -762,6 +1117,28 @@ impl<'a> AstLowering<'a> {
                     if let Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)) = &init_op {
                         if let Some(names) = self.local_field_names.get(src).cloned() {
                             self.local_field_names.insert(local_id, names);
+                        }
+                        if let Some(Some(mg)) = init_map_gets.get(idx)
+                            && mg.tmp_local == *src
+                            && mg.assign_bb == self.current_block
+                        {
+                            let val_ty = match (&mg.val_ty, &ty) {
+                                (MirType::Unknown, MirType::Option(inner)) => (**inner).clone(),
+                                (v, _) => v.clone(),
+                            };
+                            self.last_map_get_defs.insert(
+                                local_id,
+                                PendingMapGetLocal {
+                                    call_bb: mg.call_bb,
+                                    tmp_local: mg.tmp_local,
+                                    assign_bb: mg.assign_bb,
+                                    map_local: mg.map_local,
+                                    key_local: mg.key_local,
+                                    val_ty,
+                                    var_name: b.name.clone(),
+                                    exclusive_in_current_stmt: false,
+                                },
+                            );
                         }
                     }
 
@@ -813,6 +1190,13 @@ impl<'a> AstLowering<'a> {
                     let rval_op = self.lower_expr_with_expected(val, expected_ty.as_ref())?;
                     let place = self.lower_place(target)?
                         .ok_or_else(|| MirLowerError::UnsupportedLvalue(format!("{:?}", target.kind)))?;
+                    if let Place::Local(mutated_loc) = &place {
+                        self.last_map_get_defs.retain(|k, p| {
+                            *k != *mutated_loc
+                                && p.map_local != Some(*mutated_loc)
+                                && p.key_local != Some(*mutated_loc)
+                        });
+                    }
                     self.emit_stmt(Statement::Assign(place, Rvalue::Use(rval_op), stmt.span));
                 }
             }
@@ -827,6 +1211,13 @@ impl<'a> AstLowering<'a> {
                 let mir_op = mir_binop_from_ast(*op)?;
                 let place = self.lower_place(target)?
                     .ok_or_else(|| MirLowerError::UnsupportedLvalue(format!("{:?}", target.kind)))?;
+                if let Place::Local(mutated_loc) = &place {
+                    self.last_map_get_defs.retain(|k, p| {
+                        *k != *mutated_loc
+                            && p.map_local != Some(*mutated_loc)
+                            && p.key_local != Some(*mutated_loc)
+                    });
+                }
                 let lhs_op = Operand::Copy(place.clone());
                 let rhs_op = self.lower_expr(value)?;
                 self.emit_stmt(Statement::Assign(
@@ -877,27 +1268,8 @@ impl<'a> AstLowering<'a> {
                 self.current_block = body_block;
                 self.loop_stack.push((header, exit_block));
                 self.push_scope();
-                for (name, ty, place, unwrap_option) in body_bindings {
-                    let binding_local = self.current_fn.add_local(Some(name.clone()), ty.clone(), false, stmt.span);
-                    if ty != MirType::Unknown {
-                        self.known_typed_locals.insert(binding_local);
-                    }
-                    self.emit_stmt(Statement::StorageLive(binding_local, stmt.span));
-                    let rval = if unwrap_option {
-                        Rvalue::Cast(Operand::Copy(place), ty)
-                    } else {
-                        Rvalue::Use(Operand::Copy(place))
-                    };
-                    self.emit_stmt(Statement::Assign(
-                        Place::Local(binding_local),
-                        rval,
-                        stmt.span,
-                    ));
-                    self.insert_var(name, binding_local);
-                }
-                for s in body {
-                    self.lower_statement(s)?;
-                }
+                self.emit_condition_bindings(body_bindings, stmt.span);
+                self.lower_statements(body)?;
                 self.pop_scope()?;
                 self.loop_stack.pop();
 
@@ -1111,9 +1483,7 @@ impl<'a> AstLowering<'a> {
                 self.push_scope();
                 self.insert_var(variable.clone(), var_local);
                 self.loop_stack.push((step_bb, exit_bb));
-                for s in body {
-                    self.lower_statement(s)?;
-                }
+                self.lower_statements(body)?;
                 self.loop_stack.pop();
                 self.pop_scope()?;
                 if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
@@ -1474,9 +1844,7 @@ impl<'a> AstLowering<'a> {
             }
             StmtKind::Block(stmts) => {
                 self.push_scope();
-                for s in stmts {
-                    self.lower_statement(s)?;
-                }
+                self.lower_statements(stmts)?;
                 self.pop_scope()?;
             }
             StmtKind::Defer(s) => {
@@ -1499,9 +1867,7 @@ impl<'a> AstLowering<'a> {
             }
             StmtKind::Scoped(stmts) => {
                 self.push_scope();
-                for s in stmts {
-                    self.lower_statement(s)?;
-                }
+                self.lower_statements(stmts)?;
                 self.pop_scope()?;
             }
         }
@@ -1601,6 +1967,139 @@ impl<'a> AstLowering<'a> {
         in_bounds_temp
     }
 
+    fn resolve_enum_variant_for_type(
+        &self,
+        scrutinee_ty: Option<&MirType>,
+        explicit_enum_name: &str,
+        variant: &str,
+    ) -> Option<(String, usize, Vec<MirType>, bool)> {
+        let candidate_enum = if !explicit_enum_name.is_empty() {
+            Some(explicit_enum_name.to_string())
+        } else {
+            match scrutinee_ty {
+                Some(MirType::Struct(sname)) if sname.starts_with("__Enum_") => {
+                    Some(sname.trim_start_matches("__Enum_").to_string())
+                }
+                Some(MirType::Enum(ename)) => Some(ename.clone()),
+                _ => None,
+            }
+        }?;
+        let variants = self.enum_defs.get(&candidate_enum)?;
+        let (vidx, (_, field_tys)) = variants
+            .iter()
+            .enumerate()
+            .find(|(_, (vname, _))| vname == variant)?;
+        let is_scalar = self.scalar_enum_layouts.contains_key(&candidate_enum);
+        Some((candidate_enum, vidx, field_tys.clone(), is_scalar))
+    }
+
+    fn lower_enum_variant_condition(
+        &mut self,
+        scrutinee: &Expr,
+        enum_name: &str,
+        vidx: usize,
+        field_tys: &[MirType],
+        is_scalar: bool,
+        bindings: &[crate::ast::Pattern],
+        span: crate::ast::Span,
+    ) -> Result<(Operand, Vec<ConditionBinding>, Option<(LocalId, LocalId)>), MirLowerError> {
+        let base_place = if let Some(p) = self.lower_place(scrutinee)? {
+            p
+        } else {
+            let op = self.lower_expr(scrutinee)?;
+            let ty = if is_scalar {
+                MirType::Struct(format!("__Enum_{enum_name}"))
+            } else {
+                MirType::Enum(enum_name.to_string())
+            };
+            let tmp = self.current_fn.add_local(None, ty, true, span);
+            self.known_typed_locals.insert(tmp);
+            self.emit_stmt(Statement::StorageLive(tmp, span));
+            self.emit_stmt(Statement::Assign(Place::Local(tmp), Rvalue::Use(op), span));
+            Place::Local(tmp)
+        };
+
+        if is_scalar {
+            let tag_tmp = self.current_fn.add_local(None, MirType::Int, true, span);
+            self.known_typed_locals.insert(tag_tmp);
+            self.emit_stmt(Statement::StorageLive(tag_tmp, span));
+            self.emit_stmt(Statement::Assign(
+                Place::Local(tag_tmp),
+                Rvalue::Use(Operand::Copy(Place::Field(Box::new(base_place.clone()), 0))),
+                span,
+            ));
+
+            let cond_tmp = self.current_fn.add_local(None, MirType::Bool, true, span);
+            self.emit_stmt(Statement::StorageLive(cond_tmp, span));
+            self.emit_stmt(Statement::Assign(
+                Place::Local(cond_tmp),
+                Rvalue::BinaryOp(
+                    MirBinaryOp::Eq,
+                    Operand::Move(Place::Local(tag_tmp)),
+                    Operand::Constant(MirConstant::Int(vidx as i64)),
+                ),
+                span,
+            ));
+
+            let mut out_bindings = Vec::new();
+            for (idx, pat) in bindings.iter().enumerate() {
+                if let crate::ast::Pattern::Identifier(bname) = pat {
+                    let fty = field_tys.get(idx).cloned().unwrap_or(MirType::Int);
+                    out_bindings.push(ConditionBinding::Place {
+                        name: bname.clone(),
+                        ty: fty,
+                        place: Place::Field(Box::new(base_place.clone()), idx + 1),
+                        unwrap_option: false,
+                    });
+                }
+            }
+            Ok((Operand::Move(Place::Local(cond_tmp)), out_bindings, None))
+        } else {
+            let tag_tmp = self.current_fn.add_local(None, MirType::Int, true, span);
+            self.known_typed_locals.insert(tag_tmp);
+            let succ_bb = self.current_fn.new_block();
+            self.emit_stmt(Statement::StorageLive(tag_tmp, span));
+            self.terminate_block(Terminator::Call {
+                callee: "enum.tag".into(),
+                args: vec![Operand::Copy(base_place.clone())],
+                destination: Place::Local(tag_tmp),
+                success: succ_bb,
+                error: None,
+                span,
+            });
+            self.current_block = succ_bb;
+
+            let cond_tmp = self.current_fn.add_local(None, MirType::Bool, true, span);
+            self.emit_stmt(Statement::StorageLive(cond_tmp, span));
+            self.emit_stmt(Statement::Assign(
+                Place::Local(cond_tmp),
+                Rvalue::BinaryOp(
+                    MirBinaryOp::Eq,
+                    Operand::Move(Place::Local(tag_tmp)),
+                    Operand::Constant(MirConstant::Int(vidx as i64)),
+                ),
+                span,
+            ));
+
+            let mut out_bindings = Vec::new();
+            for (idx, pat) in bindings.iter().enumerate() {
+                if let crate::ast::Pattern::Identifier(bname) = pat {
+                    let fty = field_tys.get(idx).cloned().unwrap_or(MirType::Unknown);
+                    out_bindings.push(ConditionBinding::CallUnwrap {
+                        name: bname.clone(),
+                        ty: fty,
+                        callee: "enum.payload".into(),
+                        args: vec![
+                            Operand::Copy(base_place.clone()),
+                            Operand::Constant(MirConstant::Int(idx as i64)),
+                        ],
+                    });
+                }
+            }
+            Ok((Operand::Move(Place::Local(cond_tmp)), out_bindings, None))
+        }
+    }
+
     fn lower_condition_with_bindings(
         &mut self,
         condition: &Expr,
@@ -1608,7 +2107,7 @@ impl<'a> AstLowering<'a> {
     ) -> Result<
         (
             Operand,
-            Vec<(String, MirType, Place, bool)>,
+            Vec<ConditionBinding>,
             Option<(LocalId, LocalId)>,
         ),
         MirLowerError,
@@ -1617,8 +2116,8 @@ impl<'a> AstLowering<'a> {
             ExprKind::Paren(inner) => self.lower_condition_with_bindings(inner, span),
             ExprKind::IsPattern { expr: scrutinee, pattern } => {
                 match pattern {
-                    crate::ast::Pattern::Enum { variant, bindings, .. }
-                        if (variant == "Ok" || variant == "Some") =>
+                    crate::ast::Pattern::Enum { enum_name, variant, bindings }
+                        if (variant == "Ok" || variant == "Some") && enum_name.is_empty() =>
                     {
                         let indexed_parts = Self::extract_index_operands(scrutinee);
                         if let Some((object, index)) = indexed_parts {
@@ -1676,7 +2175,12 @@ impl<'a> AstLowering<'a> {
                             let elem_place = Place::Index(Box::new(base_place), idx_local);
                             let mut out_bindings = Vec::new();
                             if let Some(crate::ast::Pattern::Identifier(binding_name)) = bindings.first() {
-                                out_bindings.push((binding_name.clone(), elem_ty, elem_place, false));
+                                out_bindings.push(ConditionBinding::Place {
+                                    name: binding_name.clone(),
+                                    ty: elem_ty,
+                                    place: elem_place,
+                                    unwrap_option: false,
+                                });
                             }
 
                             return Ok((
@@ -1686,8 +2190,8 @@ impl<'a> AstLowering<'a> {
                             ));
                         }
 
-                        // PERF-T2-5: Lower `if place is Some(binding)` on struct fields or locals of
-                        // type `Option<Struct(S)>` into a zero-boxing null-pointer check (`val != 0`).
+                        // Lower `if place is Some(binding)` on `Option<T>` (zero-boxing for Option<Struct>,
+                        // general Option check for Option<Int|Float|Bool|String|...>).
                         if variant == "Some" && bindings.len() <= 1 {
                             let valid_binding = bindings.first().is_none_or(|p| {
                                 matches!(
@@ -1704,11 +2208,8 @@ impl<'a> AstLowering<'a> {
                                     let ty = Some(self.operand_definite_mir_type(&op));
                                     (op, ty)
                                 };
-                                if let Some(MirType::Option(inner)) = scrutinee_ty
-                                    && let MirType::Struct(struct_name) = *inner
-                                    && !struct_name.is_empty()
-                                {
-                                    let opt_ty = MirType::Option(Box::new(MirType::Struct(struct_name.clone())));
+                                if let Some(MirType::Option(inner)) = scrutinee_ty {
+                                    let opt_ty = MirType::Option(inner.clone());
                                     let opt_tmp = self.current_fn.add_local(None, opt_ty, true, span);
                                     self.known_typed_locals.insert(opt_tmp);
                                     self.emit_stmt(Statement::StorageLive(opt_tmp, span));
@@ -1732,12 +2233,12 @@ impl<'a> AstLowering<'a> {
 
                                     let mut out_bindings = Vec::new();
                                     if let Some(crate::ast::Pattern::Identifier(binding_name)) = bindings.first() {
-                                        out_bindings.push((
-                                            binding_name.clone(),
-                                            MirType::Struct(struct_name),
-                                            Place::Local(opt_tmp),
-                                            true,
-                                        ));
+                                        out_bindings.push(ConditionBinding::Place {
+                                            name: binding_name.clone(),
+                                            ty: *inner,
+                                            place: Place::Local(opt_tmp),
+                                            unwrap_option: true,
+                                        });
                                     }
                                     return Ok((Operand::Move(Place::Local(cond_tmp)), out_bindings, None));
                                 }
@@ -1748,8 +2249,8 @@ impl<'a> AstLowering<'a> {
                             "non-indexed is-pattern '{variant}' is not supported in MIR lowering"
                         )))
                     }
-                    crate::ast::Pattern::Enum { variant, bindings, .. }
-                        if variant == "None" && bindings.is_empty() =>
+                    crate::ast::Pattern::Enum { enum_name, variant, bindings }
+                        if variant == "None" && bindings.is_empty() && enum_name.is_empty() =>
                     {
                         let (scrutinee_op, scrutinee_ty) = if let Some(p) = self.lower_place(scrutinee)? {
                             let ty = self.get_place_mir_type(&p);
@@ -1759,11 +2260,8 @@ impl<'a> AstLowering<'a> {
                             let ty = Some(self.operand_definite_mir_type(&op));
                             (op, ty)
                         };
-                        if let Some(MirType::Option(inner)) = scrutinee_ty
-                            && let MirType::Struct(struct_name) = *inner
-                            && !struct_name.is_empty()
-                        {
-                            let opt_ty = MirType::Option(Box::new(MirType::Struct(struct_name)));
+                        if let Some(MirType::Option(inner)) = scrutinee_ty {
+                            let opt_ty = MirType::Option(inner);
                             let opt_tmp = self.current_fn.add_local(None, opt_ty, true, span);
                             self.known_typed_locals.insert(opt_tmp);
                             self.emit_stmt(Statement::StorageLive(opt_tmp, span));
@@ -1791,10 +2289,110 @@ impl<'a> AstLowering<'a> {
                             "non-indexed is-pattern 'None' is not supported in MIR lowering".to_string(),
                         ))
                     }
+                    crate::ast::Pattern::Enum { enum_name, variant, bindings } => {
+                        let scrutinee_ty = if let Some(p) = self.lower_place(scrutinee)? {
+                            self.get_place_mir_type(&p)
+                        } else {
+                            self.peek_place_expected_type(scrutinee)
+                        };
+
+                        // 1. User enum pattern match (`if op is Lit(v)` / `if op is Add(a, b)` / `if op is Reset`)
+                        if let Some((resolved_enum, vidx, field_tys, is_scalar)) =
+                            self.resolve_enum_variant_for_type(scrutinee_ty.as_ref(), enum_name, variant)
+                        {
+                            return self.lower_enum_variant_condition(
+                                scrutinee,
+                                &resolved_enum,
+                                vidx,
+                                &field_tys,
+                                is_scalar,
+                                bindings,
+                                span,
+                            );
+                        }
+
+                        // 2. Primitive runtime type-tag pattern on `LuaValue` / `unknown`:
+                        //    `if lv is Int(v)` / `Float(v)` / `String(v)` / `Bool(v)` (BENCH-NG-09)
+                        let is_dynamic_scrutinee = matches!(
+                            scrutinee_ty.as_ref(),
+                            None | Some(MirType::Unknown)
+                        ) || matches!(
+                            scrutinee_ty.as_ref(),
+                            Some(MirType::Struct(s)) if s == "LuaValue"
+                        );
+                        if is_dynamic_scrutinee && bindings.len() <= 1 {
+                            let tag_info = match variant.as_str() {
+                                "Int" => Some(("__mir_unknown_is_int", "__mir_unknown_unwrap_int", MirType::Int)),
+                                "Float" => Some(("__mir_unknown_is_float", "__mir_unknown_unwrap_float", MirType::Float)),
+                                "String" => Some(("__mir_unknown_is_string", "__mir_unknown_unwrap_string", MirType::String)),
+                                "Bool" => Some(("__mir_unknown_is_bool", "__mir_unknown_unwrap_bool", MirType::Bool)),
+                                _ => None,
+                            };
+                            if let Some((is_callee, unwrap_callee, bind_ty)) = tag_info {
+                                let base_place = if let Some(p) = self.lower_place(scrutinee)? {
+                                    p
+                                } else {
+                                    let op = self.lower_expr(scrutinee)?;
+                                    let tmp = self.current_fn.add_local(None, MirType::Unknown, true, span);
+                                    self.known_typed_locals.insert(tmp);
+                                    self.emit_stmt(Statement::StorageLive(tmp, span));
+                                    self.emit_stmt(Statement::Assign(Place::Local(tmp), Rvalue::Use(op), span));
+                                    Place::Local(tmp)
+                                };
+                                let cond_tmp = self.current_fn.add_local(None, MirType::Bool, true, span);
+                                self.known_typed_locals.insert(cond_tmp);
+                                let succ_bb = self.current_fn.new_block();
+                                self.emit_stmt(Statement::StorageLive(cond_tmp, span));
+                                self.terminate_block(Terminator::Call {
+                                    callee: is_callee.into(),
+                                    args: vec![Operand::Copy(base_place.clone())],
+                                    destination: Place::Local(cond_tmp),
+                                    success: succ_bb,
+                                    error: None,
+                                    span,
+                                });
+                                self.current_block = succ_bb;
+
+                                let mut out_bindings = Vec::new();
+                                if let Some(crate::ast::Pattern::Identifier(bname)) = bindings.first() {
+                                    out_bindings.push(ConditionBinding::CallUnwrap {
+                                        name: bname.clone(),
+                                        ty: bind_ty,
+                                        callee: unwrap_callee.into(),
+                                        args: vec![Operand::Copy(base_place)],
+                                    });
+                                }
+                                return Ok((Operand::Move(Place::Local(cond_tmp)), out_bindings, None));
+                            }
+                        }
+
+                        Err(MirLowerError::UnlowerableExpression(format!(
+                            "unsupported is-pattern '{variant}' in MIR lowering"
+                        )))
+                    }
                     crate::ast::Pattern::Wildcard => {
                         Ok((Operand::Constant(MirConstant::Bool(true)), Vec::new(), None))
                     }
                     crate::ast::Pattern::Identifier(name) => {
+                        let scrutinee_ty = if let Some(p) = self.lower_place(scrutinee)? {
+                            self.get_place_mir_type(&p)
+                        } else {
+                            self.peek_place_expected_type(scrutinee)
+                        };
+                        if let Some((resolved_enum, vidx, field_tys, is_scalar)) =
+                            self.resolve_enum_variant_for_type(scrutinee_ty.as_ref(), "", name)
+                            && field_tys.is_empty()
+                        {
+                            return self.lower_enum_variant_condition(
+                                scrutinee,
+                                &resolved_enum,
+                                vidx,
+                                &field_tys,
+                                is_scalar,
+                                &[],
+                                span,
+                            );
+                        }
                         let (place, ty) = if let Some(p) = self.lower_place(scrutinee)? {
                             let ty = match &p {
                                 Place::Local(loc) => self.current_fn.locals[loc.0].ty.clone(),
@@ -1810,7 +2408,12 @@ impl<'a> AstLowering<'a> {
                         };
                         Ok((
                             Operand::Constant(MirConstant::Bool(true)),
-                            vec![(name.clone(), ty, place, false)],
+                            vec![ConditionBinding::Place {
+                                name: name.clone(),
+                                ty,
+                                place,
+                                unwrap_option: false,
+                            }],
                             None,
                         ))
                     }
@@ -1837,47 +2440,74 @@ impl<'a> AstLowering<'a> {
                 }
             }
             ExprKind::TypeCheck { expr: scrutinee, check_type }
-                if matches!(&check_type.kind, TypeKind::Named(n) if n == "None") =>
+                if matches!(&check_type.kind, TypeKind::Named(_)) =>
             {
-                let (scrutinee_op, scrutinee_ty) = if let Some(p) = self.lower_place(scrutinee)? {
-                    let ty = self.get_place_mir_type(&p);
-                    (Operand::Copy(p), ty)
-                } else {
-                    let op = self.lower_expr(scrutinee)?;
-                    let ty = Some(self.operand_definite_mir_type(&op));
-                    (op, ty)
+                let TypeKind::Named(type_name) = &check_type.kind else {
+                    unreachable!();
                 };
-                if let Some(MirType::Option(inner)) = scrutinee_ty
-                    && let MirType::Struct(struct_name) = *inner
-                    && !struct_name.is_empty()
-                {
-                    let opt_ty = MirType::Option(Box::new(MirType::Struct(struct_name)));
-                    let opt_tmp = self.current_fn.add_local(None, opt_ty, true, span);
-                    self.known_typed_locals.insert(opt_tmp);
-                    self.emit_stmt(Statement::StorageLive(opt_tmp, span));
-                    self.emit_stmt(Statement::Assign(
-                        Place::Local(opt_tmp),
-                        Rvalue::Use(scrutinee_op),
-                        span,
-                    ));
+                if type_name == "None" {
+                    let (scrutinee_op, scrutinee_ty) = if let Some(p) = self.lower_place(scrutinee)? {
+                        let ty = self.get_place_mir_type(&p);
+                        (Operand::Copy(p), ty)
+                    } else {
+                        let op = self.lower_expr(scrutinee)?;
+                        let ty = Some(self.operand_definite_mir_type(&op));
+                        (op, ty)
+                    };
+                    if let Some(MirType::Option(inner)) = scrutinee_ty {
+                        let opt_ty = MirType::Option(inner);
+                        let opt_tmp = self.current_fn.add_local(None, opt_ty, true, span);
+                        self.known_typed_locals.insert(opt_tmp);
+                        self.emit_stmt(Statement::StorageLive(opt_tmp, span));
+                        self.emit_stmt(Statement::Assign(
+                            Place::Local(opt_tmp),
+                            Rvalue::Use(scrutinee_op),
+                            span,
+                        ));
 
-                    let cond_tmp = self.current_fn.add_local(None, MirType::Bool, true, span);
-                    self.emit_stmt(Statement::StorageLive(cond_tmp, span));
-                    self.emit_stmt(Statement::Assign(
-                        Place::Local(cond_tmp),
-                        Rvalue::BinaryOp(
-                            MirBinaryOp::Eq,
-                            Operand::Copy(Place::Local(opt_tmp)),
-                            Operand::Constant(MirConstant::Int(0)),
-                        ),
-                        span,
+                        let cond_tmp = self.current_fn.add_local(None, MirType::Bool, true, span);
+                        self.emit_stmt(Statement::StorageLive(cond_tmp, span));
+                        self.emit_stmt(Statement::Assign(
+                            Place::Local(cond_tmp),
+                            Rvalue::BinaryOp(
+                                MirBinaryOp::Eq,
+                                Operand::Copy(Place::Local(opt_tmp)),
+                                Operand::Constant(MirConstant::Int(0)),
+                            ),
+                            span,
+                        ));
+                        return Ok((Operand::Move(Place::Local(cond_tmp)), Vec::new(), None));
+                    }
+                    return Err(MirLowerError::UnlowerableExpression(
+                        "TypeCheck 'is None' on non-Option is not supported in MIR lowering"
+                            .to_string(),
                     ));
-                    return Ok((Operand::Move(Place::Local(cond_tmp)), Vec::new(), None));
                 }
-                Err(MirLowerError::UnlowerableExpression(
-                    "TypeCheck 'is None' on non-Option<Struct> is not supported in MIR lowering"
-                        .to_string(),
-                ))
+
+                // Unit enum variant check parsed as `TypeCheck` (e.g. `if op is Reset`)
+                let scrutinee_ty = if let Some(p) = self.lower_place(scrutinee)? {
+                    self.get_place_mir_type(&p)
+                } else {
+                    self.peek_place_expected_type(scrutinee)
+                };
+                if let Some((resolved_enum, vidx, field_tys, is_scalar)) =
+                    self.resolve_enum_variant_for_type(scrutinee_ty.as_ref(), "", type_name)
+                    && field_tys.is_empty()
+                {
+                    return self.lower_enum_variant_condition(
+                        scrutinee,
+                        &resolved_enum,
+                        vidx,
+                        &field_tys,
+                        is_scalar,
+                        &[],
+                        span,
+                    );
+                }
+
+                Err(MirLowerError::UnlowerableExpression(format!(
+                    "TypeCheck 'is {type_name}' is not supported in MIR lowering"
+                )))
             }
             _ => Ok((self.lower_expr(condition)?, Vec::new(), None)),
         }
@@ -1920,27 +2550,8 @@ impl<'a> AstLowering<'a> {
         // Lower Then Block
         self.current_block = then_bb;
         self.push_scope();
-        for (name, ty, place, unwrap_option) in then_bindings {
-            let binding_local = self.current_fn.add_local(Some(name.clone()), ty.clone(), false, span);
-            if ty != MirType::Unknown {
-                self.known_typed_locals.insert(binding_local);
-            }
-            self.emit_stmt(Statement::StorageLive(binding_local, span));
-            let rval = if unwrap_option {
-                Rvalue::Cast(Operand::Copy(place), ty)
-            } else {
-                Rvalue::Use(Operand::Copy(place))
-            };
-            self.emit_stmt(Statement::Assign(
-                Place::Local(binding_local),
-                rval,
-                span,
-            ));
-            self.insert_var(name, binding_local);
-        }
-        for s in then_block {
-            self.lower_statement(s)?;
-        }
+        self.emit_condition_bindings(then_bindings, span);
+        self.lower_statements(then_block)?;
         self.pop_scope()?;
         if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
             self.terminate_block(Terminator::Goto(merge_bb, span));
@@ -1979,27 +2590,8 @@ impl<'a> AstLowering<'a> {
 
             self.current_block = elif_then;
             self.push_scope();
-            for (name, ty, place, unwrap_option) in elif_bindings {
-                let binding_local = self.current_fn.add_local(Some(name.clone()), ty.clone(), false, span);
-                if ty != MirType::Unknown {
-                    self.known_typed_locals.insert(binding_local);
-                }
-                self.emit_stmt(Statement::StorageLive(binding_local, span));
-                let rval = if unwrap_option {
-                    Rvalue::Cast(Operand::Copy(place), ty)
-                } else {
-                    Rvalue::Use(Operand::Copy(place))
-                };
-                self.emit_stmt(Statement::Assign(
-                    Place::Local(binding_local),
-                    rval,
-                    span,
-                ));
-                self.insert_var(name, binding_local);
-            }
-            for s in elif_body {
-                self.lower_statement(s)?;
-            }
+            self.emit_condition_bindings(elif_bindings, span);
+            self.lower_statements(elif_body)?;
             self.pop_scope()?;
             if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
                 self.terminate_block(Terminator::Goto(merge_bb, span));
@@ -2013,9 +2605,7 @@ impl<'a> AstLowering<'a> {
             if cur_else_bb != merge_bb {
                 self.current_block = cur_else_bb;
                 self.push_scope();
-                for s in eb {
-                    self.lower_statement(s)?;
-                }
+                self.lower_statements(eb)?;
                 self.pop_scope()?;
                 if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
                     self.terminate_block(Terminator::Goto(merge_bb, span));
@@ -2205,12 +2795,29 @@ impl<'a> AstLowering<'a> {
                 let lhs = self.lower_expr(left)?;
                 let rhs = self.lower_expr(right)?;
                 let mir_op = mir_binop_from_ast(*op)?;
+                let any_unknown =
+                    self.operand_is_explicit_unknown(&lhs) || self.operand_is_explicit_unknown(&rhs);
                 let res_ty = match mir_op {
-                    MirBinaryOp::Eq | MirBinaryOp::NotEq | MirBinaryOp::Lt | MirBinaryOp::LtEq | MirBinaryOp::Gt | MirBinaryOp::GtEq => MirType::Bool,
-                    MirBinaryOp::Concat => MirType::String,
+                    MirBinaryOp::Eq
+                    | MirBinaryOp::NotEq
+                    | MirBinaryOp::Lt
+                    | MirBinaryOp::LtEq
+                    | MirBinaryOp::Gt
+                    | MirBinaryOp::GtEq => MirType::Bool,
+                    MirBinaryOp::Concat => {
+                        if any_unknown {
+                            MirType::Unknown
+                        } else {
+                            MirType::String
+                        }
+                    }
+                    _ if any_unknown => MirType::Unknown,
                     _ => MirType::Int,
                 };
-                let temp = self.current_fn.add_local(None, res_ty, true, expr.span);
+                let temp = self.current_fn.add_local(None, res_ty.clone(), true, expr.span);
+                if res_ty == MirType::Unknown {
+                    self.known_typed_locals.insert(temp);
+                }
                 self.emit_stmt(Statement::StorageLive(temp, expr.span));
                 self.emit_stmt(Statement::Assign(
                     Place::Local(temp),
@@ -2270,24 +2877,7 @@ impl<'a> AstLowering<'a> {
 
                 self.current_block = then_bb;
                 self.push_scope();
-                for (name, ty, place, unwrap_option) in bindings {
-                    let binding_local = self.current_fn.add_local(Some(name.clone()), ty.clone(), false, expr.span);
-                    if ty != MirType::Unknown {
-                        self.known_typed_locals.insert(binding_local);
-                    }
-                    self.emit_stmt(Statement::StorageLive(binding_local, expr.span));
-                    let rval = if unwrap_option {
-                        Rvalue::Cast(Operand::Copy(place), ty)
-                    } else {
-                        Rvalue::Use(Operand::Copy(place))
-                    };
-                    self.emit_stmt(Statement::Assign(
-                        Place::Local(binding_local),
-                        rval,
-                        expr.span,
-                    ));
-                    self.insert_var(name, binding_local);
-                }
+                self.emit_condition_bindings(bindings, expr.span);
                 let then_op = self.lower_expr_with_expected(then_branch, expected_ty)?;
                 self.emit_stmt(Statement::Assign(
                     Place::Local(res_local),
@@ -2450,11 +3040,26 @@ impl<'a> AstLowering<'a> {
                     }
                 }
                 if Self::is_index_expr(receiver) {
-                    self.lower_expr(receiver)
-                } else {
-                    let rec_op = self.lower_expr(receiver)?;
-                    if let MirType::Struct(struct_name) = self.operand_definite_mir_type(&rec_op)
-                        && !struct_name.is_empty()
+                    return self.lower_expr(receiver);
+                }
+                if let ExprKind::Identifier(var_name) = &unwrapped_recv.kind
+                    && let Some(loc_id) = self.lookup_var(var_name)
+                    && let Some(fused_op) = self.try_fuse_pending_map_get_unwrap(loc_id, expected_ty)
+                {
+                    return Ok(fused_op);
+                }
+                let rec_op = self.lower_expr(receiver)?;
+                let rec_ty = self.operand_definite_mir_type(&rec_op);
+                match rec_ty {
+                    MirType::Option(inner) => {
+                        self.lower_option_unwrap(rec_op, *inner, expr.span)
+                    }
+                    MirType::Enum(ref ename) if ename == "Option" || ename == "Result" => {
+                        let out_ty = expected_ty.cloned().unwrap_or(MirType::Unknown);
+                        self.lower_enum_option_unwrap(rec_op, out_ty, expr.span)
+                    }
+                    MirType::Struct(struct_name)
+                        if !struct_name.is_empty() && struct_name != "LuaValue" =>
                     {
                         self.lower_struct_method_call(
                             struct_name,
@@ -2463,11 +3068,153 @@ impl<'a> AstLowering<'a> {
                             args,
                             expr.span,
                         )
-                    } else {
-                        Err(MirLowerError::UnlowerableExpression(format!(
-                            "method call ':{method}' on non-index non-struct receiver is not supported in MIR lowering"
-                        )))
                     }
+                    MirType::Unknown | MirType::Struct(_) => {
+                        self.lower_unknown_method_call(rec_op, method, args, expr.span)
+                    }
+                    _ => Err(MirLowerError::UnlowerableExpression(format!(
+                        "method call ':{method}' on non-index non-struct receiver is not supported in MIR lowering"
+                    ))),
+                }
+            }
+            ExprKind::MethodCall { receiver, method, args, .. } if method == "unwrap_or" && args.len() == 1 => {
+                let mut unwrapped_recv = receiver.as_ref();
+                while let ExprKind::Paren(inner) = &unwrapped_recv.kind {
+                    unwrapped_recv = inner;
+                }
+                if let ExprKind::Call { callee, args: call_args, .. } = &unwrapped_recv.kind
+                    && call_args.len() == 2
+                    && Self::call_callee_name(callee).as_deref() == Some("map.get")
+                {
+                    let m_op = self.lower_expr(&call_args[0])?;
+                    let k_op = self.lower_expr(&call_args[1])?;
+                    let d_op = self.lower_expr_with_expected(&args[0], expected_ty)?;
+                    let res_ty = match self.operand_definite_mir_type(&m_op) {
+                        MirType::Map(_, v_ty) if *v_ty != MirType::Unknown => *v_ty,
+                        _ => expected_ty
+                            .cloned()
+                            .unwrap_or_else(|| self.operand_definite_mir_type(&d_op)),
+                    };
+                    let temp = self.current_fn.add_local(None, res_ty.clone(), true, expr.span);
+                    if res_ty != MirType::Unknown {
+                        self.known_typed_locals.insert(temp);
+                    }
+                    let succ_bb = self.current_fn.new_block();
+                    self.emit_stmt(Statement::StorageLive(temp, expr.span));
+                    self.terminate_block(Terminator::Call {
+                        callee: "map.get_unwrap_or".into(),
+                        args: vec![m_op, k_op, d_op],
+                        destination: Place::Local(temp),
+                        success: succ_bb,
+                        error: None,
+                        span: expr.span,
+                    });
+                    self.current_block = succ_bb;
+                    return Ok(Operand::Move(Place::Local(temp)));
+                }
+                let rec_op = self.lower_expr(receiver)?;
+                let rec_ty = self.operand_definite_mir_type(&rec_op);
+                match rec_ty {
+                    MirType::Option(inner) => {
+                        self.lower_option_unwrap_or(rec_op, *inner, &args[0], expr.span)
+                    }
+                    MirType::Enum(ref ename) if ename == "Option" || ename == "Result" => {
+                        let out_ty = expected_ty.cloned().unwrap_or(MirType::Unknown);
+                        self.lower_enum_option_unwrap_or(rec_op, out_ty, &args[0], expr.span)
+                    }
+                    MirType::Struct(struct_name)
+                        if !struct_name.is_empty() && struct_name != "LuaValue" =>
+                    {
+                        self.lower_struct_method_call(
+                            struct_name,
+                            method,
+                            rec_op,
+                            args,
+                            expr.span,
+                        )
+                    }
+                    MirType::Unknown | MirType::Struct(_) => {
+                        self.lower_unknown_method_call(rec_op, method, args, expr.span)
+                    }
+                    _ => Err(MirLowerError::UnlowerableExpression(format!(
+                        "method call ':{method}' on non-option receiver is not supported in MIR lowering"
+                    ))),
+                }
+            }
+            ExprKind::MethodCall { receiver, method, args, .. }
+                if matches!(method.as_str(), "is_some" | "is_none" | "is_ok" | "is_err")
+                    && args.is_empty() =>
+            {
+                let rec_op = self.lower_expr(receiver)?;
+                let rec_ty = self.operand_definite_mir_type(&rec_op);
+                let positive = matches!(method.as_str(), "is_some" | "is_ok");
+                match rec_ty {
+                    MirType::Option(_) => {
+                        let op = if positive {
+                            MirBinaryOp::NotEq
+                        } else {
+                            MirBinaryOp::Eq
+                        };
+                        let temp = self.current_fn.add_local(None, MirType::Bool, true, expr.span);
+                        self.known_typed_locals.insert(temp);
+                        self.emit_stmt(Statement::StorageLive(temp, expr.span));
+                        self.emit_stmt(Statement::Assign(
+                            Place::Local(temp),
+                            Rvalue::BinaryOp(op, rec_op, Operand::Constant(MirConstant::Int(0))),
+                            expr.span,
+                        ));
+                        Ok(Operand::Move(Place::Local(temp)))
+                    }
+                    MirType::Enum(ref ename) if ename == "Option" || ename == "Result" => {
+                        let tag_tmp = self.current_fn.add_local(None, MirType::Int, true, expr.span);
+                        self.known_typed_locals.insert(tag_tmp);
+                        let succ_bb = self.current_fn.new_block();
+                        self.emit_stmt(Statement::StorageLive(tag_tmp, expr.span));
+                        self.terminate_block(Terminator::Call {
+                            callee: "enum.tag".into(),
+                            args: vec![rec_op],
+                            destination: Place::Local(tag_tmp),
+                            success: succ_bb,
+                            error: None,
+                            span: expr.span,
+                        });
+                        self.current_block = succ_bb;
+                        let cmp_op = if positive {
+                            MirBinaryOp::Eq
+                        } else {
+                            MirBinaryOp::NotEq
+                        };
+                        let cond_tmp = self.current_fn.add_local(None, MirType::Bool, true, expr.span);
+                        self.known_typed_locals.insert(cond_tmp);
+                        self.emit_stmt(Statement::StorageLive(cond_tmp, expr.span));
+                        self.emit_stmt(Statement::Assign(
+                            Place::Local(cond_tmp),
+                            Rvalue::BinaryOp(
+                                cmp_op,
+                                Operand::Move(Place::Local(tag_tmp)),
+                                Operand::Constant(MirConstant::Int(0)),
+                            ),
+                            expr.span,
+                        ));
+                        Ok(Operand::Move(Place::Local(cond_tmp)))
+                    }
+                    MirType::Struct(struct_name)
+                        if !struct_name.is_empty() && struct_name != "LuaValue" =>
+                    {
+                        self.lower_struct_method_call(
+                            struct_name,
+                            method,
+                            rec_op,
+                            args,
+                            expr.span,
+                        )
+                    }
+                    MirType::Unknown | MirType::Struct(_) => {
+                        self.lower_unknown_method_call(rec_op, method, args, expr.span)
+                    }
+                    _ => Err(MirLowerError::UnlowerableExpression(format!(
+                        "method call ':{method}' on non-option receiver is not supported in MIR lowering"
+                    ))),
                 }
             }
             ExprKind::MethodCall { receiver, method, args, .. } if method == "run_sync" => {
@@ -2613,6 +3360,9 @@ impl<'a> AstLowering<'a> {
                 } else if enum_name == "Option" && variant == "Some" && args.len() == 1 {
                     return self.lower_option_struct_some(&args[0], expected_ty, expr.span);
                 }
+                if let Some(op) = self.try_lower_user_enum_constructor(enum_name, variant, args, expr.span)? {
+                    return Ok(op);
+                }
                 Err(MirLowerError::UnlowerableExpression(format!(
                     "enum constructor '{enum_name}.{variant}' is not supported in MIR lowering"
                 )))
@@ -2625,6 +3375,9 @@ impl<'a> AstLowering<'a> {
                         if let Some(none_op) = self.lower_option_struct_none(expected_ty, expr.span) {
                             return Ok(none_op);
                         }
+                    }
+                    if let Some(op) = self.try_lower_user_enum_constructor(name, field, &[], expr.span)? {
+                        return Ok(op);
                     }
                     return Err(MirLowerError::UnlowerableExpression(format!(
                         "field access on non-local '{name}.{field}' is not supported in MIR lowering"
@@ -2643,11 +3396,35 @@ impl<'a> AstLowering<'a> {
                         }
                     }
                 };
-                let field_idx = self.resolve_field_idx(&base_place, field).ok_or_else(|| {
-                    MirLowerError::UnlowerableExpression(format!(
+                let Some(field_idx) = self.resolve_field_idx(&base_place, field) else {
+                    let base_ty = self.get_place_mir_type(&base_place);
+                    let is_dynamic_base = matches!(
+                        base_ty.as_ref(),
+                        None | Some(MirType::Unknown)
+                    ) || matches!(base_ty.as_ref(), Some(MirType::Struct(s)) if s == "LuaValue");
+                    if is_dynamic_base {
+                        let temp = self.current_fn.add_local(None, MirType::Unknown, true, expr.span);
+                        self.known_typed_locals.insert(temp);
+                        let succ_bb = self.current_fn.new_block();
+                        self.emit_stmt(Statement::StorageLive(temp, expr.span));
+                        self.terminate_block(Terminator::Call {
+                            callee: "__mir_unknown_get_field".into(),
+                            args: vec![
+                                Operand::Copy(base_place),
+                                Operand::Constant(MirConstant::String(field.clone())),
+                            ],
+                            destination: Place::Local(temp),
+                            success: succ_bb,
+                            error: None,
+                            span: expr.span,
+                        });
+                        self.current_block = succ_bb;
+                        return Ok(Operand::Move(Place::Local(temp)));
+                    }
+                    return Err(MirLowerError::UnlowerableExpression(format!(
                         "cannot resolve field '{field}' in MIR lowering"
-                    ))
-                })?;
+                    )));
+                };
                 let field_place = Place::Field(Box::new(base_place.clone()), field_idx);
                 let mut field_mir_ty = MirType::Int;
                 let mut recorded_load: Option<(String, u16, usize, CanonicalTypeTag)> = None;
@@ -2765,6 +3542,63 @@ impl<'a> AstLowering<'a> {
                 }
             }
             ExprKind::Call { callee, args, .. } => {
+                // Direct field-call on a local variable (e.g. `q.offer(x)` or `s.cb(x)`):
+                // resolve field access into a named local and invoke it as a dynamic/closure call.
+                if let ExprKind::FieldAccess { object, field } = &callee.kind {
+                    let is_local_obj = match &object.kind {
+                        ExprKind::Identifier(obj_name) => self.lookup_var(obj_name).is_some(),
+                        _ => true,
+                    };
+                    if is_local_obj {
+                        let fn_op = self.lower_expr(callee)?;
+                        let fn_ty = self.operand_definite_mir_type(&fn_op);
+                        let call_var_name = format!("__field_call_{}", self.field_call_counter);
+                        self.field_call_counter += 1;
+                        let fn_loc = self.current_fn.add_local(
+                            Some(call_var_name.clone()),
+                            fn_ty.clone(),
+                            true,
+                            expr.span,
+                        );
+                        self.known_typed_locals.insert(fn_loc);
+                        self.emit_stmt(Statement::StorageLive(fn_loc, expr.span));
+                        self.emit_stmt(Statement::Assign(
+                            Place::Local(fn_loc),
+                            Rvalue::Use(fn_op),
+                            expr.span,
+                        ));
+                        let mut lowered_args = Vec::with_capacity(args.len());
+                        for a in args {
+                            lowered_args.push(self.lower_expr(a)?);
+                        }
+                        let ret_ty = match &fn_ty {
+                            MirType::Function { return_type, .. } => (**return_type).clone(),
+                            _ => expected_ty.cloned().unwrap_or(MirType::Unknown),
+                        };
+                        let temp = self.current_fn.add_local(None, ret_ty.clone(), true, expr.span);
+                        if ret_ty != MirType::Unknown {
+                            self.known_typed_locals.insert(temp);
+                        }
+                        let succ_bb = self.current_fn.new_block();
+                        self.emit_stmt(Statement::StorageLive(temp, expr.span));
+                        self.terminate_block(Terminator::Call {
+                            callee: call_var_name,
+                            args: lowered_args,
+                            destination: Place::Local(temp),
+                            success: succ_bb,
+                            error: None,
+                            span: expr.span,
+                        });
+                        self.current_block = succ_bb;
+                        return Ok(Operand::Move(Place::Local(temp)));
+                    }
+                    if let ExprKind::Identifier(enum_name) = &object.kind
+                        && let Some(op) =
+                            self.try_lower_user_enum_constructor(enum_name, field, args, expr.span)?
+                    {
+                        return Ok(op);
+                    }
+                }
                 let callee_name = match &callee.kind {
                     ExprKind::Identifier(name) => name.clone(),
                     ExprKind::FieldAccess { object, field } => {
@@ -2881,13 +3715,73 @@ impl<'a> AstLowering<'a> {
                 for a in args {
                     lowered_args.push(self.lower_expr(a)?);
                 }
-                let call_ret_ty = if callee_name == "tostring" {
-                    MirType::String
+                let is_map_get = callee_name == "map.get" && lowered_args.len() == 2;
+                let map_get_val_ty = if is_map_get {
+                    match self.operand_definite_mir_type(&lowered_args[0]) {
+                        MirType::Map(_, v_ty) => (*v_ty).clone(),
+                        _ => MirType::Unknown,
+                    }
                 } else {
-                    MirType::Int
+                    MirType::Unknown
+                };
+                let local_callee_ty = if !callee_name.contains('.') && !callee_name.contains(':') {
+                    self.lookup_var(&callee_name)
+                        .map(|loc| self.current_fn.locals[loc.0].ty.clone())
+                } else {
+                    None
+                };
+                let (call_ret_ty, mark_known) = if callee_name == "tostring" {
+                    (MirType::String, true)
+                } else if matches!(
+                    callee_name.as_str(),
+                    "Queue" | "sync.Queue" | "@std/sync.Queue"
+                ) {
+                    (MirType::Unknown, true)
+                } else if let Some(MirType::Function { return_type, .. }) = local_callee_ty {
+                    ((*return_type).clone(), true)
+                } else if matches!(local_callee_ty, Some(MirType::Unknown)) {
+                    (MirType::Unknown, true)
+                } else if is_map_get {
+                    if let Some(MirType::Option(inner)) = expected_ty {
+                        (MirType::Option(inner.clone()), true)
+                    } else {
+                        (MirType::Int, false)
+                    }
+                } else {
+                    (MirType::Int, false)
                 };
                 let temp = self.current_fn.add_local(None, call_ret_ty, true, expr.span);
+                if mark_known {
+                    self.known_typed_locals.insert(temp);
+                }
+                let call_bb = self.current_block;
                 let succ_bb = self.current_fn.new_block();
+
+                let map_get_meta = if is_map_get {
+                    let map_local = match &lowered_args[0] {
+                        Operand::Copy(Place::Local(l)) | Operand::Move(Place::Local(l)) => Some(*l),
+                        _ => None,
+                    };
+                    let key_local = match &lowered_args[1] {
+                        Operand::Copy(Place::Local(l)) | Operand::Move(Place::Local(l)) => Some(*l),
+                        _ => None,
+                    };
+                    Some(PendingMapGetCall {
+                        call_bb,
+                        tmp_local: temp,
+                        assign_bb: succ_bb,
+                        map_local,
+                        key_local,
+                        val_ty: map_get_val_ty,
+                    })
+                } else {
+                    None
+                };
+
+                // Any non-read call may mutate maps, so invalidate pending map.get fusions.
+                if callee_name != "map.get" && callee_name != "map.has" && callee_name != "map.len" {
+                    self.last_map_get_defs.clear();
+                }
 
                 self.emit_stmt(Statement::StorageLive(temp, expr.span));
                 self.terminate_block(Terminator::Call {
@@ -2900,23 +3794,28 @@ impl<'a> AstLowering<'a> {
                 });
 
                 self.current_block = succ_bb;
+                self.last_map_get_call = map_get_meta;
                 Ok(Operand::Move(Place::Local(temp)))
             }
             ExprKind::MethodCall { receiver, method, args, .. } => {
                 let rec_op = self.lower_expr(receiver)?;
-                if let MirType::Struct(struct_name) = self.operand_definite_mir_type(&rec_op)
-                    && !struct_name.is_empty()
-                {
-                    self.lower_struct_method_call(struct_name, method, rec_op, args, expr.span)
-                } else {
-                    Err(MirLowerError::UnlowerableExpression(format!(
+                match self.operand_definite_mir_type(&rec_op) {
+                    MirType::Struct(struct_name)
+                        if !struct_name.is_empty() && struct_name != "LuaValue" =>
+                    {
+                        self.lower_struct_method_call(struct_name, method, rec_op, args, expr.span)
+                    }
+                    MirType::Unknown | MirType::Struct(_) => {
+                        self.lower_unknown_method_call(rec_op, method, args, expr.span)
+                    }
+                    _ => Err(MirLowerError::UnlowerableExpression(format!(
                         "method call ':{method}' on non-struct receiver is not supported in MIR lowering"
-                    )))
+                    ))),
                 }
             }
             ExprKind::Cast { expr: inner, target_type } => {
                 let inner_op = self.lower_expr(inner)?;
-                let mir_target_ty = mir_type_from_ast(target_type);
+                let mir_target_ty = self.mir_type_for_ast(target_type);
                 let temp = self.current_fn.add_local(None, mir_target_ty.clone(), true, expr.span);
                 self.emit_stmt(Statement::StorageLive(temp, expr.span));
                 self.emit_stmt(Statement::Assign(
@@ -3159,14 +4058,17 @@ impl<'a> AstLowering<'a> {
 
         let mut lambda_param_types: Vec<MirType> = Vec::with_capacity(params.len());
         for (p_name, p_ty) in params {
-            let mir_ty = p_ty.as_ref().map(mir_type_from_ast).unwrap_or(MirType::Int);
+            let mir_ty = p_ty
+                .as_ref()
+                .map(|t| self.mir_type_for_ast(t))
+                .unwrap_or(MirType::Int);
             lambda_param_types.push(mir_ty.clone());
             lifted_param_names.push(p_name.clone());
             lifted_param_types.push(mir_ty);
         }
 
         let lambda_ret_ty = return_type
-            .map(mir_type_from_ast)
+            .map(|t| self.mir_type_for_ast(t))
             .unwrap_or(MirType::Unknown);
 
         let lambda_id = {
@@ -3194,6 +4096,8 @@ impl<'a> AstLowering<'a> {
         let struct_field_types = self.struct_field_types.clone();
         let struct_field_substructs = self.struct_field_substructs.clone();
         let struct_layouts = self.struct_layouts.clone();
+        let enum_defs = self.enum_defs.clone();
+        let scalar_enum_layouts = self.scalar_enum_layouts.clone();
 
         let nested_ops = {
             let mut nested = AstLowering::new_with_module_sink(
@@ -3205,6 +4109,8 @@ impl<'a> AstLowering<'a> {
             nested.struct_field_types = struct_field_types;
             nested.struct_field_substructs = struct_field_substructs;
             nested.struct_layouts = struct_layouts;
+            nested.enum_defs = enum_defs;
+            nested.scalar_enum_layouts = scalar_enum_layouts;
 
             match &body.kind {
                 ExprKind::Block(stmts) => {
@@ -3281,6 +4187,450 @@ impl<'a> AstLowering<'a> {
             },
             span,
         ));
+        Ok(Operand::Move(Place::Local(temp)))
+    }
+
+    fn try_fuse_pending_map_get_unwrap(
+        &mut self,
+        loc_id: LocalId,
+        expected_ty: Option<&MirType>,
+    ) -> Option<Operand> {
+        let pending = self.last_map_get_defs.get(&loc_id)?;
+        if pending.assign_bb != self.current_block || !pending.exclusive_in_current_stmt {
+            return None;
+        }
+        let pending = self.last_map_get_defs.remove(&loc_id)?;
+        let resolved_val_ty = if pending.val_ty != MirType::Unknown {
+            pending.val_ty
+        } else if let Some(et) = expected_ty
+            && !matches!(et, MirType::Option(_) | MirType::Unknown)
+        {
+            et.clone()
+        } else {
+            MirType::Int
+        };
+        if let Some(Terminator::Call { callee, .. }) =
+            &mut self.current_fn.blocks[pending.call_bb.0].terminator
+            && callee == "map.get"
+        {
+            *callee = "map.get_unwrap".into();
+            self.current_fn.locals[pending.tmp_local.0].ty = resolved_val_ty.clone();
+            self.current_fn.locals[loc_id.0].ty = resolved_val_ty.clone();
+            if resolved_val_ty != MirType::Unknown {
+                self.known_typed_locals.insert(pending.tmp_local);
+                self.known_typed_locals.insert(loc_id);
+            }
+            return Some(Operand::Copy(Place::Local(loc_id)));
+        }
+        None
+    }
+
+    fn lower_option_unwrap(
+        &mut self,
+        rec_op: Operand,
+        inner_ty: MirType,
+        span: crate::ast::Span,
+    ) -> Result<Operand, MirLowerError> {
+        let opt_ty = MirType::Option(Box::new(inner_ty.clone()));
+        let opt_tmp = self.current_fn.add_local(None, opt_ty, true, span);
+        self.known_typed_locals.insert(opt_tmp);
+        self.emit_stmt(Statement::StorageLive(opt_tmp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(opt_tmp),
+            Rvalue::Use(rec_op),
+            span,
+        ));
+
+        let is_some_tmp = self.current_fn.add_local(None, MirType::Bool, true, span);
+        self.known_typed_locals.insert(is_some_tmp);
+        self.emit_stmt(Statement::StorageLive(is_some_tmp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(is_some_tmp),
+            Rvalue::BinaryOp(
+                MirBinaryOp::NotEq,
+                Operand::Copy(Place::Local(opt_tmp)),
+                Operand::Constant(MirConstant::Int(0)),
+            ),
+            span,
+        ));
+
+        let ok_bb = self.current_fn.new_block();
+        let err_bb = self.current_fn.new_block();
+        let err_done_bb = self.current_fn.new_block();
+        self.terminate_block(Terminator::Cond {
+            cond: Operand::Move(Place::Local(is_some_tmp)),
+            then_block: ok_bb,
+            else_block: err_bb,
+            span,
+        });
+
+        self.current_block = err_bb;
+        let err_dst = self.current_fn.add_local(None, MirType::Unit, true, span);
+        self.emit_stmt(Statement::StorageLive(err_dst, span));
+        self.terminate_block(Terminator::Call {
+            callee: "error".into(),
+            args: vec![Operand::Constant(MirConstant::String(
+                "called unwrap() on None".into(),
+            ))],
+            destination: Place::Local(err_dst),
+            success: err_done_bb,
+            error: None,
+            span,
+        });
+        self.current_block = err_done_bb;
+        self.terminate_block(Terminator::Unreachable(span));
+
+        self.current_block = ok_bb;
+        let res_local = self.current_fn.add_local(None, inner_ty.clone(), true, span);
+        if inner_ty != MirType::Unknown {
+            self.known_typed_locals.insert(res_local);
+        }
+        self.emit_stmt(Statement::StorageLive(res_local, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(res_local),
+            Rvalue::Cast(Operand::Copy(Place::Local(opt_tmp)), inner_ty),
+            span,
+        ));
+        Ok(Operand::Move(Place::Local(res_local)))
+    }
+
+    fn lower_enum_option_unwrap(
+        &mut self,
+        rec_op: Operand,
+        out_ty: MirType,
+        span: crate::ast::Span,
+    ) -> Result<Operand, MirLowerError> {
+        let opt_ty = self.operand_definite_mir_type(&rec_op);
+        let opt_tmp = self.current_fn.add_local(None, opt_ty, true, span);
+        self.known_typed_locals.insert(opt_tmp);
+        self.emit_stmt(Statement::StorageLive(opt_tmp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(opt_tmp),
+            Rvalue::Use(rec_op),
+            span,
+        ));
+
+        let tag_tmp = self.current_fn.add_local(None, MirType::Int, true, span);
+        self.known_typed_locals.insert(tag_tmp);
+        let after_tag_bb = self.current_fn.new_block();
+        self.emit_stmt(Statement::StorageLive(tag_tmp, span));
+        self.terminate_block(Terminator::Call {
+            callee: "enum.tag".into(),
+            args: vec![Operand::Copy(Place::Local(opt_tmp))],
+            destination: Place::Local(tag_tmp),
+            success: after_tag_bb,
+            error: None,
+            span,
+        });
+        self.current_block = after_tag_bb;
+
+        let is_ok_tmp = self.current_fn.add_local(None, MirType::Bool, true, span);
+        self.known_typed_locals.insert(is_ok_tmp);
+        self.emit_stmt(Statement::StorageLive(is_ok_tmp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(is_ok_tmp),
+            Rvalue::BinaryOp(
+                MirBinaryOp::Eq,
+                Operand::Move(Place::Local(tag_tmp)),
+                Operand::Constant(MirConstant::Int(0)),
+            ),
+            span,
+        ));
+
+        let ok_bb = self.current_fn.new_block();
+        let err_bb = self.current_fn.new_block();
+        let err_done_bb = self.current_fn.new_block();
+        self.terminate_block(Terminator::Cond {
+            cond: Operand::Move(Place::Local(is_ok_tmp)),
+            then_block: ok_bb,
+            else_block: err_bb,
+            span,
+        });
+
+        self.current_block = err_bb;
+        let err_dst = self.current_fn.add_local(None, MirType::Unit, true, span);
+        self.emit_stmt(Statement::StorageLive(err_dst, span));
+        self.terminate_block(Terminator::Call {
+            callee: "error".into(),
+            args: vec![Operand::Constant(MirConstant::String(
+                "called unwrap() on None/Err".into(),
+            ))],
+            destination: Place::Local(err_dst),
+            success: err_done_bb,
+            error: None,
+            span,
+        });
+        self.current_block = err_done_bb;
+        self.terminate_block(Terminator::Unreachable(span));
+
+        self.current_block = ok_bb;
+        let res_local = self.current_fn.add_local(None, out_ty.clone(), true, span);
+        if out_ty != MirType::Unknown {
+            self.known_typed_locals.insert(res_local);
+        }
+        let succ_bb = self.current_fn.new_block();
+        self.emit_stmt(Statement::StorageLive(res_local, span));
+        self.terminate_block(Terminator::Call {
+            callee: "enum.payload".into(),
+            args: vec![
+                Operand::Copy(Place::Local(opt_tmp)),
+                Operand::Constant(MirConstant::Int(0)),
+            ],
+            destination: Place::Local(res_local),
+            success: succ_bb,
+            error: None,
+            span,
+        });
+        self.current_block = succ_bb;
+        Ok(Operand::Move(Place::Local(res_local)))
+    }
+
+    fn lower_option_unwrap_or(
+        &mut self,
+        rec_op: Operand,
+        inner_ty: MirType,
+        default_expr: &Expr,
+        span: crate::ast::Span,
+    ) -> Result<Operand, MirLowerError> {
+        let opt_ty = MirType::Option(Box::new(inner_ty.clone()));
+        let opt_tmp = self.current_fn.add_local(None, opt_ty, true, span);
+        self.known_typed_locals.insert(opt_tmp);
+        self.emit_stmt(Statement::StorageLive(opt_tmp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(opt_tmp),
+            Rvalue::Use(rec_op),
+            span,
+        ));
+
+        let is_some_tmp = self.current_fn.add_local(None, MirType::Bool, true, span);
+        self.known_typed_locals.insert(is_some_tmp);
+        self.emit_stmt(Statement::StorageLive(is_some_tmp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(is_some_tmp),
+            Rvalue::BinaryOp(
+                MirBinaryOp::NotEq,
+                Operand::Copy(Place::Local(opt_tmp)),
+                Operand::Constant(MirConstant::Int(0)),
+            ),
+            span,
+        ));
+
+        let res_local = self.current_fn.add_local(None, inner_ty.clone(), true, span);
+        if inner_ty != MirType::Unknown {
+            self.known_typed_locals.insert(res_local);
+        }
+        self.emit_stmt(Statement::StorageLive(res_local, span));
+
+        let then_bb = self.current_fn.new_block();
+        let else_bb = self.current_fn.new_block();
+        let merge_bb = self.current_fn.new_block();
+        self.terminate_block(Terminator::Cond {
+            cond: Operand::Move(Place::Local(is_some_tmp)),
+            then_block: then_bb,
+            else_block: else_bb,
+            span,
+        });
+
+        self.current_block = then_bb;
+        self.emit_stmt(Statement::Assign(
+            Place::Local(res_local),
+            Rvalue::Cast(Operand::Copy(Place::Local(opt_tmp)), inner_ty.clone()),
+            span,
+        ));
+        self.terminate_block(Terminator::Goto(merge_bb, span));
+
+        self.current_block = else_bb;
+        let def_op = self.lower_expr_with_expected(default_expr, Some(&inner_ty))?;
+        self.emit_stmt(Statement::Assign(
+            Place::Local(res_local),
+            Rvalue::Use(def_op),
+            span,
+        ));
+        if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
+            self.terminate_block(Terminator::Goto(merge_bb, span));
+        }
+
+        self.current_block = merge_bb;
+        Ok(Operand::Move(Place::Local(res_local)))
+    }
+
+    fn lower_enum_option_unwrap_or(
+        &mut self,
+        rec_op: Operand,
+        out_ty: MirType,
+        default_expr: &Expr,
+        span: crate::ast::Span,
+    ) -> Result<Operand, MirLowerError> {
+        let opt_ty = self.operand_definite_mir_type(&rec_op);
+        let opt_tmp = self.current_fn.add_local(None, opt_ty, true, span);
+        self.known_typed_locals.insert(opt_tmp);
+        self.emit_stmt(Statement::StorageLive(opt_tmp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(opt_tmp),
+            Rvalue::Use(rec_op),
+            span,
+        ));
+
+        let tag_tmp = self.current_fn.add_local(None, MirType::Int, true, span);
+        self.known_typed_locals.insert(tag_tmp);
+        let after_tag_bb = self.current_fn.new_block();
+        self.emit_stmt(Statement::StorageLive(tag_tmp, span));
+        self.terminate_block(Terminator::Call {
+            callee: "enum.tag".into(),
+            args: vec![Operand::Copy(Place::Local(opt_tmp))],
+            destination: Place::Local(tag_tmp),
+            success: after_tag_bb,
+            error: None,
+            span,
+        });
+        self.current_block = after_tag_bb;
+
+        let is_ok_tmp = self.current_fn.add_local(None, MirType::Bool, true, span);
+        self.known_typed_locals.insert(is_ok_tmp);
+        self.emit_stmt(Statement::StorageLive(is_ok_tmp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(is_ok_tmp),
+            Rvalue::BinaryOp(
+                MirBinaryOp::Eq,
+                Operand::Move(Place::Local(tag_tmp)),
+                Operand::Constant(MirConstant::Int(0)),
+            ),
+            span,
+        ));
+
+        let res_local = self.current_fn.add_local(None, out_ty.clone(), true, span);
+        if out_ty != MirType::Unknown {
+            self.known_typed_locals.insert(res_local);
+        }
+        self.emit_stmt(Statement::StorageLive(res_local, span));
+
+        let then_bb = self.current_fn.new_block();
+        let else_bb = self.current_fn.new_block();
+        let merge_bb = self.current_fn.new_block();
+        self.terminate_block(Terminator::Cond {
+            cond: Operand::Move(Place::Local(is_ok_tmp)),
+            then_block: then_bb,
+            else_block: else_bb,
+            span,
+        });
+
+        self.current_block = then_bb;
+        self.terminate_block(Terminator::Call {
+            callee: "enum.payload".into(),
+            args: vec![
+                Operand::Copy(Place::Local(opt_tmp)),
+                Operand::Constant(MirConstant::Int(0)),
+            ],
+            destination: Place::Local(res_local),
+            success: merge_bb,
+            error: None,
+            span,
+        });
+
+        self.current_block = else_bb;
+        let def_op = self.lower_expr_with_expected(default_expr, Some(&out_ty))?;
+        self.emit_stmt(Statement::Assign(
+            Place::Local(res_local),
+            Rvalue::Use(def_op),
+            span,
+        ));
+        if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
+            self.terminate_block(Terminator::Goto(merge_bb, span));
+        }
+
+        self.current_block = merge_bb;
+        Ok(Operand::Move(Place::Local(res_local)))
+    }
+
+    fn try_lower_user_enum_constructor(
+        &mut self,
+        enum_name: &str,
+        variant: &str,
+        args: &[Expr],
+        span: crate::ast::Span,
+    ) -> Result<Option<Operand>, MirLowerError> {
+        let Some(variants) = self.enum_defs.get(enum_name).cloned() else {
+            return Ok(None);
+        };
+        let Some((vidx, (_, field_tys))) = variants
+            .iter()
+            .enumerate()
+            .find(|(_, (vname, _))| vname == variant)
+        else {
+            return Ok(None);
+        };
+
+        let mut lowered_args = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            let expected = field_tys.get(i);
+            lowered_args.push(self.lower_expr_with_expected(a, expected)?);
+        }
+
+        if let Some((synth_name, slot_types)) = self.scalar_enum_layouts.get(enum_name).cloned() {
+            let mut elems = Vec::with_capacity(1 + slot_types.len());
+            elems.push(Operand::Constant(MirConstant::Int(vidx as i64)));
+            for (i, st) in slot_types.iter().enumerate() {
+                if let Some(arg_op) = lowered_args.get(i) {
+                    elems.push(arg_op.clone());
+                } else {
+                    elems.push(Operand::Constant(Self::scalar_enum_default_const(st)));
+                }
+            }
+            let struct_ty = MirType::Struct(synth_name);
+            let temp = self.current_fn.add_local(None, struct_ty.clone(), true, span);
+            self.known_typed_locals.insert(temp);
+            self.emit_stmt(Statement::StorageLive(temp, span));
+            self.emit_stmt(Statement::Assign(
+                Place::Local(temp),
+                Rvalue::Aggregate(struct_ty, elems),
+                span,
+            ));
+            return Ok(Some(Operand::Move(Place::Local(temp))));
+        }
+
+        let enum_ty = MirType::Enum(enum_name.to_string());
+        let temp = self.current_fn.add_local(None, enum_ty, true, span);
+        self.known_typed_locals.insert(temp);
+        let succ_bb = self.current_fn.new_block();
+        self.emit_stmt(Statement::StorageLive(temp, span));
+        self.terminate_block(Terminator::Call {
+            callee: format!("{enum_name}.{variant}"),
+            args: lowered_args,
+            destination: Place::Local(temp),
+            success: succ_bb,
+            error: None,
+            span,
+        });
+        self.current_block = succ_bb;
+        Ok(Some(Operand::Move(Place::Local(temp))))
+    }
+
+    fn lower_unknown_method_call(
+        &mut self,
+        rec_op: Operand,
+        method: &str,
+        args: &[Expr],
+        span: crate::ast::Span,
+    ) -> Result<Operand, MirLowerError> {
+        let mut all_args = Vec::with_capacity(2 + args.len());
+        all_args.push(rec_op);
+        all_args.push(Operand::Constant(MirConstant::String(method.to_string())));
+        for a in args {
+            all_args.push(self.lower_expr(a)?);
+        }
+        let temp = self.current_fn.add_local(None, MirType::Unknown, true, span);
+        self.known_typed_locals.insert(temp);
+        let succ_bb = self.current_fn.new_block();
+        self.emit_stmt(Statement::StorageLive(temp, span));
+        self.terminate_block(Terminator::Call {
+            callee: "__mir_unknown_call_method".into(),
+            args: all_args,
+            destination: Place::Local(temp),
+            success: succ_bb,
+            error: None,
+            span,
+        });
+        self.current_block = succ_bb;
         Ok(Operand::Move(Place::Local(temp)))
     }
 
@@ -3920,6 +5270,130 @@ fn const_int_from_expr(expr: &Expr) -> Option<i64> {
     }
 }
 
+fn count_ident_in_expr(expr: &Expr, target: &str) -> usize {
+    match &expr.kind {
+        ExprKind::Literal(_) | ExprKind::RegexLiteral { .. } => 0,
+        ExprKind::Identifier(name) => usize::from(name == target),
+        ExprKind::Binary { left, right, .. } => {
+            count_ident_in_expr(left, target) + count_ident_in_expr(right, target)
+        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::FieldAccess { object: operand, .. }
+        | ExprKind::Paren(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::TypeCheck { expr: operand, .. }
+        | ExprKind::IsPattern { expr: operand, .. } => count_ident_in_expr(operand, target),
+        ExprKind::Call { callee, args, .. } => {
+            count_ident_in_expr(callee, target)
+                + args.iter().map(|a| count_ident_in_expr(a, target)).sum::<usize>()
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            count_ident_in_expr(receiver, target)
+                + args.iter().map(|a| count_ident_in_expr(a, target)).sum::<usize>()
+        }
+        ExprKind::Index { object, index } => {
+            count_ident_in_expr(object, target) + count_ident_in_expr(index, target)
+        }
+        ExprKind::Array(elems) | ExprKind::Tuple(elems) | ExprKind::Return(elems) => {
+            elems.iter().map(|e| count_ident_in_expr(e, target)).sum()
+        }
+        ExprKind::Map(pairs) => pairs
+            .iter()
+            .map(|(k, v)| count_ident_in_expr(k, target) + count_ident_in_expr(v, target))
+            .sum(),
+        ExprKind::StructLiteral { fields, .. } => fields
+            .iter()
+            .map(|f| count_ident_in_expr(&f.value, target))
+            .sum(),
+        ExprKind::EnumConstructor { args, .. } => {
+            args.iter().map(|a| count_ident_in_expr(a, target)).sum()
+        }
+        ExprKind::Lambda { body, .. } => count_ident_in_expr(body, target),
+        ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            count_ident_in_expr(condition, target)
+                + count_ident_in_expr(then_branch, target)
+                + else_branch
+                    .as_ref()
+                    .map_or(0, |e| count_ident_in_expr(e, target))
+        }
+        ExprKind::Block(stmts) | ExprKind::EffectBlock(stmts) => {
+            stmts.iter().map(|s| count_ident_in_stmt(s, target)).sum()
+        }
+        ExprKind::Range { start, end, .. } => {
+            count_ident_in_expr(start, target) + count_ident_in_expr(end, target)
+        }
+    }
+}
+
+fn count_ident_in_stmt(stmt: &Stmt, target: &str) -> usize {
+    match &stmt.kind {
+        StmtKind::Local { initializer, .. } => initializer.as_ref().map_or(0, |inits| {
+            inits.iter().map(|e| count_ident_in_expr(e, target)).sum()
+        }),
+        StmtKind::Assign { targets, values } => {
+            targets.iter().map(|e| count_ident_in_expr(e, target)).sum::<usize>()
+                + values.iter().map(|e| count_ident_in_expr(e, target)).sum::<usize>()
+        }
+        StmtKind::CompoundAssign { target: t, value, .. } => {
+            count_ident_in_expr(t, target) + count_ident_in_expr(value, target)
+        }
+        StmtKind::Expr(e) => count_ident_in_expr(e, target),
+        StmtKind::If {
+            condition,
+            then_block,
+            elseif_branches,
+            else_block,
+        } => {
+            count_ident_in_expr(condition, target)
+                + then_block.iter().map(|s| count_ident_in_stmt(s, target)).sum::<usize>()
+                + elseif_branches
+                    .iter()
+                    .map(|(c, b)| {
+                        count_ident_in_expr(c, target)
+                            + b.iter().map(|s| count_ident_in_stmt(s, target)).sum::<usize>()
+                    })
+                    .sum::<usize>()
+                + else_block
+                    .as_ref()
+                    .map_or(0, |b| b.iter().map(|s| count_ident_in_stmt(s, target)).sum())
+        }
+        StmtKind::While { condition, body } => {
+            count_ident_in_expr(condition, target)
+                + body.iter().map(|s| count_ident_in_stmt(s, target)).sum::<usize>()
+        }
+        StmtKind::ForNumeric {
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            count_ident_in_expr(start, target)
+                + count_ident_in_expr(end, target)
+                + step.as_ref().map_or(0, |s| count_ident_in_expr(s, target))
+                + body.iter().map(|s| count_ident_in_stmt(s, target)).sum::<usize>()
+        }
+        StmtKind::ForIn { iterator, body, .. } => {
+            count_ident_in_expr(iterator, target)
+                + body.iter().map(|s| count_ident_in_stmt(s, target)).sum::<usize>()
+        }
+        StmtKind::Return(exprs) => exprs.iter().map(|e| count_ident_in_expr(e, target)).sum(),
+        StmtKind::Break | StmtKind::Continue => 0,
+        StmtKind::Block(stmts) | StmtKind::Scoped(stmts) => {
+            stmts.iter().map(|s| count_ident_in_stmt(s, target)).sum()
+        }
+        StmtKind::Defer(s) | StmtKind::ErrDefer(s) => count_ident_in_stmt(s, target),
+    }
+}
+
+fn stmts_mention_ident(stmts: &[Stmt], target: &str) -> bool {
+    stmts.iter().any(|s| count_ident_in_stmt(s, target) > 0)
+}
+
 pub fn mir_type_from_ast(ty: &Type) -> MirType {
     match &ty.kind {
         TypeKind::Int => MirType::Int,
@@ -3927,18 +5401,21 @@ pub fn mir_type_from_ast(ty: &Type) -> MirType {
         TypeKind::Bool => MirType::Bool,
         TypeKind::String => MirType::String,
         TypeKind::Unit => MirType::Unit,
+        TypeKind::Unknown => MirType::Unknown,
         TypeKind::Named(s) => MirType::Struct(s.clone()),
         TypeKind::Tuple(types) => MirType::Tuple(types.iter().map(mir_type_from_ast).collect()),
         TypeKind::Array(inner) => MirType::Array(Box::new(mir_type_from_ast(inner))),
         TypeKind::Map(k, v) => {
             MirType::Map(Box::new(mir_type_from_ast(k)), Box::new(mir_type_from_ast(v)))
         }
-        TypeKind::Option(inner) => match mir_type_from_ast(inner) {
-            MirType::Struct(name) if !name.is_empty() => {
-                MirType::Option(Box::new(MirType::Struct(name)))
-            }
-            _ => MirType::Enum("Option".to_string()),
+        TypeKind::Function {
+            params,
+            return_type,
+        } => MirType::Function {
+            params: params.iter().map(mir_type_from_ast).collect(),
+            return_type: Box::new(mir_type_from_ast(return_type)),
         },
+        TypeKind::Option(inner) => MirType::Option(Box::new(mir_type_from_ast(inner))),
         TypeKind::Result(_, _) => MirType::Enum("Result".to_string()),
         TypeKind::Effect { success, error, .. } => MirType::Effect {
             return_type: Box::new(mir_type_from_ast(success)),

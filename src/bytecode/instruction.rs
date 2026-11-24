@@ -133,6 +133,9 @@ impl PackedInstruction {
             Instruction::Move(dest, src) => Self::encode_abc(OpCode::Move, dest, src, 0),
             Instruction::Return(reg) => Self::encode_abc(OpCode::Return, reg, 0, 0),
             Instruction::NewMap(dest) => Self::encode_abc(OpCode::NewMap, dest, 0, 0),
+            Instruction::MapGetUnwrap(a, b, c) => Self::encode_abc(OpCode::MapGetUnwrap, a, b, c),
+            Instruction::MapSet(a, b, c) => Self::encode_abc(OpCode::MapSet, a, b, c),
+            Instruction::MapGet(a, b, c) => Self::encode_abc(OpCode::MapGet, a, b, c),
             Instruction::Neg(d, s) => Self::encode_abc(OpCode::Neg, d, s, 0),
             Instruction::NegInt(d, s) => Self::encode_abc(OpCode::NegInt, d, s, 0),
             Instruction::NegFloat(d, s) => Self::encode_abc(OpCode::NegFloat, d, s, 0),
@@ -420,6 +423,9 @@ impl PackedInstruction {
             OpCode::Return => Instruction::Return(self.a()),
             OpCode::NewArray => Instruction::NewArray(self.a(), self.b(), self.c()),
             OpCode::NewMap => Instruction::NewMap(self.a()),
+            OpCode::MapGetUnwrap => Instruction::MapGetUnwrap(self.a(), self.b(), self.c()),
+            OpCode::MapSet => Instruction::MapSet(self.a(), self.b(), self.c()),
+            OpCode::MapGet => Instruction::MapGet(self.a(), self.b(), self.c()),
             OpCode::NewStruct => {
                 let (w0, w1) = extra2(self.bx())?;
                 Instruction::NewStruct(
@@ -599,6 +605,9 @@ pub enum Instruction {
     Return(Register),
     NewArray(Register, Register, u8),
     NewMap(Register),
+    MapGet(Register, Register, Register),
+    MapSet(Register, Register, Register),
+    MapGetUnwrap(Register, Register, Register),
     NewStruct(Register, ConstIndex, ConstIndex, Register, u8),
     NewEnumUnit(Register, ConstIndex, ConstIndex),
     NewEnumVariant(Register, ConstIndex, ConstIndex, Register, u8),
@@ -729,6 +738,9 @@ pub enum OpCode {
     // Packed-only forms. The legacy encoding keeps the original field opcodes.
     GetFieldCompact,
     SetFieldCompact,
+    MapGet = 95,
+    MapSet = 96,
+    MapGetUnwrap = 97,
 }
 
 impl Instruction {
@@ -798,6 +810,9 @@ impl Instruction {
             Instruction::Return(_) => OpCode::Return,
             Instruction::NewArray(_, _, _) => OpCode::NewArray,
             Instruction::NewMap(_) => OpCode::NewMap,
+            Instruction::MapGetUnwrap(..) => OpCode::MapGetUnwrap,
+            Instruction::MapSet(..) => OpCode::MapSet,
+            Instruction::MapGet(..) => OpCode::MapGet,
             Instruction::NewStruct(_, _, _, _, _) => OpCode::NewStruct,
             Instruction::NewEnumUnit(_, _, _) => OpCode::NewEnumUnit,
             Instruction::NewEnumVariant(_, _, _, _, _) => OpCode::NewEnumVariant,
@@ -907,6 +922,8 @@ impl Instruction {
             | Instruction::Call(_, _, _, dest)
             | Instruction::NewArray(dest, _, _)
             | Instruction::NewMap(dest)
+            | Instruction::MapGet(dest, _, _)
+            | Instruction::MapGetUnwrap(dest, _, _)
             | Instruction::NewStruct(dest, _, _, _, _)
             | Instruction::NewEnumUnit(dest, _, _)
             | Instruction::NewEnumVariant(dest, _, _, _, _)
@@ -940,6 +957,7 @@ impl Instruction {
             | Instruction::SetIndex(_, _, _)
             | Instruction::ArrayIndexOk(_, _, _, _)
             | Instruction::ArrayPush(_, _)
+            | Instruction::MapSet(..)
             | Instruction::StoreUpvalue(_, _) => None,
         }
     }
@@ -1015,10 +1033,13 @@ impl Instruction {
             | Instruction::ArrayIndexOk(_, _, lhs, rhs)
             | Instruction::ArrayPush(lhs, rhs)
             | Instruction::ArrayGetUnwrap(_, lhs, rhs)
+            | Instruction::MapGet(_, lhs, rhs)
+            | Instruction::MapGetUnwrap(_, lhs, rhs)
             | Instruction::Concat(_, lhs, rhs)
             | Instruction::BranchLtInt(lhs, rhs, _)
             | Instruction::BranchLeInt(lhs, rhs, _) => register == lhs || register == rhs,
-            Instruction::SetIndex(collection, index, value) => {
+            Instruction::SetIndex(collection, index, value)
+            | Instruction::MapSet(collection, index, value) => {
                 register == collection || register == index || register == value
             }
             Instruction::SetField(object, _, value)
@@ -1208,6 +1229,9 @@ impl fmt::Display for Instruction {
             }
 
             Instruction::NewMap(r) => write!(f, "NewMap R{}", r),
+            Instruction::MapGetUnwrap(a, b, c) => write!(f, "MapGetUnwrap R{}, R{}, R{}", a, b, c),
+            Instruction::MapSet(a, b, c) => write!(f, "MapSet R{}, R{}, R{}", a, b, c),
+            Instruction::MapGet(a, b, c) => write!(f, "MapGet R{}, R{}, R{}", a, b, c),
             Instruction::NewStruct(d, name, field_names, fields, cnt) => {
                 if *cnt == 0 {
                     write!(
@@ -1487,6 +1511,9 @@ impl OpCode {
             92 => Ok(OpCode::GetFieldAddSetInt),
             93 => Ok(OpCode::GetFieldCompact),
             94 => Ok(OpCode::SetFieldCompact),
+            95 => Ok(OpCode::MapGet),
+            96 => Ok(OpCode::MapSet),
+            97 => Ok(OpCode::MapGetUnwrap),
             other => Err(DecodeError::UnknownOpCode(other)),
         }
     }
@@ -1527,6 +1554,13 @@ impl Instruction {
             Instruction::Move(dest, src) => {
                 buf[1] = dest;
                 buf[2] = src;
+            }
+            Instruction::MapGet(a, b, c)
+            | Instruction::MapSet(a, b, c)
+            | Instruction::MapGetUnwrap(a, b, c) => {
+                buf[1] = a;
+                buf[2] = b;
+                buf[3] = c;
             }
             Instruction::Add(d, l, r)
             | Instruction::Sub(d, l, r)
@@ -1861,6 +1895,9 @@ impl Instruction {
             OpCode::Return => Ok(Instruction::Return(bytes[1])),
             OpCode::NewArray => Ok(Instruction::NewArray(bytes[1], bytes[2], bytes[3])),
             OpCode::NewMap => Ok(Instruction::NewMap(bytes[1])),
+            OpCode::MapGetUnwrap => Ok(Instruction::MapGetUnwrap(bytes[1], bytes[2], bytes[3])),
+            OpCode::MapSet => Ok(Instruction::MapSet(bytes[1], bytes[2], bytes[3])),
+            OpCode::MapGet => Ok(Instruction::MapGet(bytes[1], bytes[2], bytes[3])),
             OpCode::NewStruct => Ok(Instruction::NewStruct(
                 bytes[1],
                 u16_at(2),

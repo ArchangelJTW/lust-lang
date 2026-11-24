@@ -336,6 +336,10 @@ impl Compiler {
                     Instruction::ArrayGetUnwrap(_, obj, idx) => {
                         Some(Instruction::ArrayGetUnwrap(dest, obj, idx))
                     }
+                    Instruction::MapGet(_, map, key) => Some(Instruction::MapGet(dest, map, key)),
+                    Instruction::MapGetUnwrap(_, map, key) => {
+                        Some(Instruction::MapGetUnwrap(dest, map, key))
+                    }
                     Instruction::ArrayLen(_, obj) => Some(Instruction::ArrayLen(dest, obj)),
                     Instruction::Call(f, args, argc, _) => Some(Instruction::Call(f, args, argc, dest)),
                     Instruction::CallMethod(obj, m, args, argc, _) => {

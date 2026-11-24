@@ -2753,6 +2753,7 @@ fn run_file_with_options(
         }
     }
     vm.register_structs(&struct_defs);
+    lust::mir::vm_backend::register_struct_value_decoders(&mut vm, &struct_defs);
     for (type_name, trait_name) in trait_impls {
         vm.register_trait_impl(type_name, trait_name);
     }
@@ -2895,9 +2896,9 @@ fn run_file_rust_aot(filename: &str, pure_core: bool) {
         all_items.extend(module.items.clone());
     }
     let filtered_items = lust::codegen_zig::tree_shake_items(&all_items, false);
-    let prepared_items = lust::codegen_zig::aot::prepare_items_for_mir(&filtered_items);
     let mir_module =
-        match lust::mir::lowering::AstLowering::lower_module_items("main_module", &prepared_items) {
+        match lust::codegen_zig::aot::compiler::prepare_and_lower_items_for_rust_aot(&filtered_items)
+        {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("MIR lowering error: {}", e);

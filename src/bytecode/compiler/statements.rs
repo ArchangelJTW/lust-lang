@@ -16,6 +16,145 @@ impl HoistedScalarConst {
 }
 
 impl Compiler {
+    fn compile_scoped_statements(&mut self, mut statements: &[Stmt]) -> Result<()> {
+        while let Some((first, tail)) = statements.split_first() {
+            if let Some((second, rest)) = tail.split_first()
+                && let Some(fused) = self.fuse_map_get_local(first, second, rest)
+            {
+                self.compile_stmt(&fused)?;
+                statements = rest;
+            } else {
+                self.compile_stmt(first)?;
+                statements = tail;
+            }
+        }
+        Ok(())
+    }
+
+    fn fuse_map_get_local(&self, first: &Stmt, second: &Stmt, rest: &[Stmt]) -> Option<Stmt> {
+        let StmtKind::Local {
+            bindings,
+            initializer: Some(values),
+        } = &first.kind
+        else {
+            return None;
+        };
+        let ([found], [get]) = (bindings.as_slice(), values.as_slice()) else {
+            return None;
+        };
+        self.builtin_map_args(get, "get")?;
+        let StmtKind::Local {
+            bindings,
+            initializer: Some(values),
+        } = &second.kind
+        else {
+            return None;
+        };
+        let ([_], [unwrap]) = (bindings.as_slice(), values.as_slice()) else {
+            return None;
+        };
+        let ExprKind::MethodCall {
+            receiver,
+            method,
+            type_args: None,
+            args,
+        } = &unwrap.kind
+        else {
+            return None;
+        };
+        if method != "unwrap"
+            || !args.is_empty()
+            || !matches!(&receiver.kind, ExprKind::Identifier(name) if name == &found.name)
+            || self.should_wrap_option(get.span)
+        {
+            return None;
+        }
+        // Refuse nested scopes and deferred statements in the tail unless
+        // their references can be checked without relying on shadowing.
+        if rest
+            .iter()
+            .any(|stmt| Self::may_reference_local(stmt, &found.name))
+        {
+            return None;
+        }
+        // Earlier cleanups are compiled at scope exit and can still read locals.
+        if self.scopes.iter().any(|scope| !scope.cleanups.is_empty()) {
+            return None;
+        }
+        Some(Stmt::new(
+            StmtKind::Local {
+                bindings: bindings.clone(),
+                initializer: Some(vec![Expr::new(
+                    ExprKind::MethodCall {
+                        receiver: Box::new(get.clone()),
+                        method: method.clone(),
+                        type_args: None,
+                        args: Vec::new(),
+                    },
+                    unwrap.span,
+                )]),
+            },
+            second.span,
+        ))
+    }
+
+    fn may_reference_local(stmt: &Stmt, name: &str) -> bool {
+        fn mentions(expr: &Expr, name: &str) -> bool {
+            let contains = |expr: &Expr| mentions(expr, name);
+            match &expr.kind {
+                ExprKind::Identifier(identifier) => identifier == name,
+                ExprKind::Literal(_) | ExprKind::RegexLiteral { .. } => false,
+                ExprKind::Binary { left, right, .. }
+                | ExprKind::Range {
+                    start: left,
+                    end: right,
+                    ..
+                }
+                | ExprKind::Index {
+                    object: left,
+                    index: right,
+                } => contains(left) || contains(right),
+                ExprKind::Unary { operand, .. }
+                | ExprKind::Paren(operand)
+                | ExprKind::FieldAccess {
+                    object: operand, ..
+                }
+                | ExprKind::Cast { expr: operand, .. }
+                | ExprKind::TypeCheck { expr: operand, .. }
+                | ExprKind::IsPattern { expr: operand, .. } => contains(operand),
+                ExprKind::Call { callee, args, .. }
+                | ExprKind::MethodCall {
+                    receiver: callee,
+                    args,
+                    ..
+                } => contains(callee) || args.iter().any(contains),
+                ExprKind::Array(args)
+                | ExprKind::Tuple(args)
+                | ExprKind::Return(args)
+                | ExprKind::EnumConstructor { args, .. } => args.iter().any(contains),
+                ExprKind::Map(entries) => entries
+                    .iter()
+                    .any(|(key, value)| contains(key) || contains(value)),
+                ExprKind::StructLiteral { fields, .. } => {
+                    fields.iter().any(|field| contains(&field.value))
+                }
+                _ => true,
+            }
+        }
+        let contains = |expr: &Expr| mentions(expr, name);
+        match &stmt.kind {
+            StmtKind::Local { initializer, .. } => initializer
+                .as_ref()
+                .is_some_and(|values| values.iter().any(contains)),
+            StmtKind::Assign { targets, values } => targets.iter().chain(values).any(contains),
+            StmtKind::CompoundAssign { target, value, .. } => contains(target) || contains(value),
+            StmtKind::Expr(expr) => contains(expr),
+            StmtKind::Return(values) => values.iter().any(contains),
+            StmtKind::Break | StmtKind::Continue => false,
+            _ => true,
+        }
+    }
+
     pub fn compile_stmt(&mut self, stmt: &Stmt) -> Result<()> {
         self.current_line = stmt.span.start_line;
         match &stmt.kind {
@@ -332,7 +471,7 @@ impl Compiler {
             }
 
             StmtKind::Expr(expr) => {
-                if !self.try_compile_array_void_call(expr)? {
+                if !self.try_compile_array_void_call(expr)? && !self.try_compile_map_set(expr)? {
                     let reg = self.compile_expr(expr)?;
                     self.free_register(reg);
                 }
@@ -446,10 +585,7 @@ impl Compiler {
 
             StmtKind::Block(stmts) => {
                 self.begin_scope();
-                for stmt in stmts {
-                    self.compile_stmt(stmt)?;
-                    self.reset_temp_registers();
-                }
+                self.compile_scoped_statements(stmts)?;
 
                 self.end_scope()?;
             }
@@ -524,9 +660,7 @@ impl Compiler {
 
             StmtKind::Scoped(stmts) => {
                 self.begin_scope();
-                for s in stmts {
-                    self.compile_stmt(s)?;
-                }
+                self.compile_scoped_statements(stmts)?;
                 self.end_scope()?;
             }
         }
@@ -587,9 +721,7 @@ impl Compiler {
         }
         self.reset_temp_registers();
 
-        for stmt in then_block {
-            self.compile_stmt(stmt)?;
-        }
+        self.compile_scoped_statements(then_block)?;
 
         self.end_scope()?;
         let mut jumps_to_end = Vec::new();
@@ -643,9 +775,7 @@ impl Compiler {
             }
             self.reset_temp_registers();
 
-            for stmt in elseif_body {
-                self.compile_stmt(stmt)?;
-            }
+            self.compile_scoped_statements(elseif_body)?;
 
             self.end_scope()?;
             let is_last_elseif = idx + 1 == elseif_branches.len();
@@ -660,9 +790,7 @@ impl Compiler {
         if let Some(else_stmts) = else_block {
             self.begin_scope();
             self.reset_temp_registers();
-            for stmt in else_stmts {
-                self.compile_stmt(stmt)?;
-            }
+            self.compile_scoped_statements(else_stmts)?;
 
             self.end_scope()?;
         }
@@ -1128,9 +1256,7 @@ impl Compiler {
             break_jumps: Vec::new(),
         });
         self.begin_scope();
-        for stmt in body {
-            self.compile_stmt(stmt)?;
-        }
+        self.compile_scoped_statements(body)?;
 
         self.end_scope()?;
         let loop_ctx = self.loop_contexts.pop().unwrap();
@@ -1279,9 +1405,7 @@ impl Compiler {
             continue_jumps: Vec::new(),
             break_jumps: Vec::new(),
         });
-        for stmt in body {
-            self.compile_stmt(stmt)?;
-        }
+        self.compile_scoped_statements(body)?;
 
         let loop_ctx = self.loop_contexts.pop().unwrap();
         let increment_pos = self.current_chunk().instructions.len();
@@ -1351,9 +1475,7 @@ impl Compiler {
                 break_jumps: Vec::new(),
             });
 
-            for stmt in body {
-                self.compile_stmt(stmt)?;
-            }
+            self.compile_scoped_statements(body)?;
 
             let loop_ctx = self.loop_contexts.pop().unwrap();
             let increment_pos = self.current_chunk().instructions.len();
@@ -1411,9 +1533,7 @@ impl Compiler {
                 break_jumps: Vec::new(),
             });
             self.emit(Instruction::GetIndex(elem_reg, array_reg, i_reg), 0);
-            for stmt in body {
-                self.compile_stmt(stmt)?;
-            }
+            self.compile_scoped_statements(body)?;
 
             let loop_ctx = self.loop_contexts.pop().unwrap();
             let increment_pos = self.current_chunk().instructions.len();
@@ -1517,9 +1637,7 @@ impl Compiler {
             }
         }
 
-        for stmt in body {
-            self.compile_stmt(stmt)?;
-        }
+        self.compile_scoped_statements(body)?;
 
         let loop_ctx = self.loop_contexts.pop().unwrap();
         for continue_jump in loop_ctx.continue_jumps {

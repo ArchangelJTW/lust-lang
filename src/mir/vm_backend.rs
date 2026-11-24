@@ -1,8 +1,12 @@
-use crate::bytecode::{Chunk, Function, Instruction, Register, StructLayout, Value};
+use crate::ast::{FieldOwnership, StructDef};
+use crate::bytecode::{
+    Chunk, FieldStorage, Function, Instruction, Register, StructLayout, StructObject, Value,
+};
 use crate::bytecode::value::{native_fn, NativeCallResult};
 use crate::data::layout::CanonicalTypeTag;
 use crate::data::materialize::{
-    decode_json_into_contiguous, ContiguousDecodeOptions, ContiguousStruct, LayoutPerfCounters,
+    decode_json_into_contiguous, struct_def_to_layout, ContiguousDecodeOptions, ContiguousStruct,
+    LayoutPerfCounters,
 };
 use crate::mir::ir::*;
 use crate::number::{LustFloat, LustInt, NumericType};
@@ -1560,7 +1564,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
                             );
                         }
                     }
-                    MirType::Struct(_) if self.operand_is_option(op) => {
+                    _ if self.operand_is_option(op) => {
                         let r_op = self.operand_to_reg(op, line);
                         self.chunk.emit(Instruction::GetEnumValue(dst_reg, r_op, 0), line);
                     }
@@ -2025,6 +2029,230 @@ impl<'a> MirToBytecodeCompiler<'a> {
                             }
                             return;
                         }
+                        ("map.new", 0) => {
+                            let dest_reg = self.place_to_reg(destination);
+                            self.chunk.emit(Instruction::NewMap(dest_reg), line);
+                            if !is_fallthrough(*success) {
+                                let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
+                                self.pending_jumps.push((jump_idx, *success));
+                            }
+                            return;
+                        }
+                        ("map.get_unwrap", 2) => {
+                            let arg_base = self.next_scratch();
+                            let arg1 = self.next_scratch();
+                            let m_reg = self.operand_to_reg(&args[0], line);
+                            let k_reg = self.operand_to_reg(&args[1], line);
+                            self.chunk.emit(Instruction::Move(arg_base, m_reg), line);
+                            self.chunk.emit(Instruction::Move(arg1, k_reg), line);
+
+                            let fn_reg = self.next_scratch();
+                            let map_idx = self.chunk.add_constant(Value::string("map".to_string()));
+                            let get_idx = self.chunk.add_constant(Value::string("get".to_string()));
+                            self.chunk.emit(Instruction::LoadGlobal(fn_reg, map_idx), line);
+                            self.chunk.emit(Instruction::GetField(fn_reg, fn_reg, get_idx), line);
+
+                            let opt_reg = self.next_scratch();
+                            self.chunk.emit(Instruction::Call(fn_reg, arg_base, 2, opt_reg), line);
+
+                            let is_some_reg = self.next_scratch();
+                            let opt_name_idx =
+                                self.chunk.add_constant(Value::string("Option".to_string()));
+                            let some_name_idx =
+                                self.chunk.add_constant(Value::string("Some".to_string()));
+                            self.chunk.emit(
+                                Instruction::IsEnumVariant(
+                                    is_some_reg,
+                                    opt_reg,
+                                    opt_name_idx,
+                                    some_name_idx,
+                                ),
+                                line,
+                            );
+
+                            let j_ok = self.chunk.emit(Instruction::JumpIf(is_some_reg, 0), line);
+                            let err_fn_reg = self.next_scratch();
+                            let err_arg_reg = self.next_scratch();
+                            let err_name_idx =
+                                self.chunk.add_constant(Value::string("error".to_string()));
+                            let err_msg_idx = self
+                                .chunk
+                                .add_constant(Value::string("called unwrap() on None".to_string()));
+                            self.chunk
+                                .emit(Instruction::LoadGlobal(err_fn_reg, err_name_idx), line);
+                            self.chunk
+                                .emit(Instruction::LoadConst(err_arg_reg, err_msg_idx), line);
+                            let dest_reg = self.place_to_reg(destination);
+                            self.chunk
+                                .emit(Instruction::Call(err_fn_reg, err_arg_reg, 1, dest_reg), line);
+
+                            let ok_pc = self.chunk.instructions.len();
+                            self.chunk.patch_jump(j_ok, ok_pc);
+                            self.chunk
+                                .emit(Instruction::GetEnumValue(dest_reg, opt_reg, 0), line);
+
+                            if !is_fallthrough(*success) {
+                                let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
+                                self.pending_jumps.push((jump_idx, *success));
+                            }
+                            return;
+                        }
+                        ("map.get_unwrap_or", 3) => {
+                            let arg_base = self.next_scratch();
+                            let arg1 = self.next_scratch();
+                            let m_reg = self.operand_to_reg(&args[0], line);
+                            let k_reg = self.operand_to_reg(&args[1], line);
+                            let def_reg = self.operand_to_reg(&args[2], line);
+                            self.chunk.emit(Instruction::Move(arg_base, m_reg), line);
+                            self.chunk.emit(Instruction::Move(arg1, k_reg), line);
+
+                            let fn_reg = self.next_scratch();
+                            let map_idx = self.chunk.add_constant(Value::string("map".to_string()));
+                            let get_idx = self.chunk.add_constant(Value::string("get".to_string()));
+                            self.chunk.emit(Instruction::LoadGlobal(fn_reg, map_idx), line);
+                            self.chunk.emit(Instruction::GetField(fn_reg, fn_reg, get_idx), line);
+
+                            let opt_reg = self.next_scratch();
+                            self.chunk.emit(Instruction::Call(fn_reg, arg_base, 2, opt_reg), line);
+
+                            let is_some_reg = self.next_scratch();
+                            let opt_name_idx =
+                                self.chunk.add_constant(Value::string("Option".to_string()));
+                            let some_name_idx =
+                                self.chunk.add_constant(Value::string("Some".to_string()));
+                            self.chunk.emit(
+                                Instruction::IsEnumVariant(
+                                    is_some_reg,
+                                    opt_reg,
+                                    opt_name_idx,
+                                    some_name_idx,
+                                ),
+                                line,
+                            );
+
+                            let dest_reg = self.place_to_reg(destination);
+                            let j_ok = self.chunk.emit(Instruction::JumpIf(is_some_reg, 0), line);
+                            self.chunk.emit(Instruction::Move(dest_reg, def_reg), line);
+                            let j_done = self.chunk.emit(Instruction::Jump(0), line);
+
+                            let ok_pc = self.chunk.instructions.len();
+                            self.chunk.patch_jump(j_ok, ok_pc);
+                            self.chunk
+                                .emit(Instruction::GetEnumValue(dest_reg, opt_reg, 0), line);
+
+                            let done_pc = self.chunk.instructions.len();
+                            self.chunk.patch_jump(j_done, done_pc);
+
+                            if !is_fallthrough(*success) {
+                                let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
+                                self.pending_jumps.push((jump_idx, *success));
+                            }
+                            return;
+                        }
+                        ("__mir_unknown_get_field", 2) => {
+                            if let Operand::Constant(MirConstant::String(field_name)) = &args[1] {
+                                let obj_reg = self.operand_to_reg(&args[0], line);
+                                let field_idx =
+                                    self.chunk.add_constant(Value::string(field_name.clone()));
+                                let dest_reg = self.place_to_reg(destination);
+                                self.chunk.emit(
+                                    Instruction::GetField(dest_reg, obj_reg, field_idx),
+                                    line,
+                                );
+                                if !is_fallthrough(*success) {
+                                    let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
+                                    self.pending_jumps.push((jump_idx, *success));
+                                }
+                                return;
+                            }
+                        }
+                        ("__mir_unknown_call_method", n) if n >= 2 => {
+                            if let Operand::Constant(MirConstant::String(method_name)) = &args[1] {
+                                let obj_reg = self.operand_to_reg(&args[0], line);
+                                let rest = &args[2..];
+                                let rest_count = rest.len() as u8;
+                                let first_arg_reg = if rest_count > 0 {
+                                    let scratch_base = self.next_scratch();
+                                    for _ in 1..rest.len() {
+                                        self.next_scratch();
+                                    }
+                                    for (i, arg) in rest.iter().enumerate() {
+                                        let target_reg = scratch_base + i as u8;
+                                        let r = self.operand_to_reg(arg, line);
+                                        if r != target_reg {
+                                            self.chunk.emit(Instruction::Move(target_reg, r), line);
+                                        }
+                                    }
+                                    scratch_base
+                                } else {
+                                    0
+                                };
+                                let method_idx =
+                                    self.chunk.add_constant(Value::string(method_name.clone()));
+                                let dest_reg = self.place_to_reg(destination);
+                                self.chunk.emit(
+                                    Instruction::CallMethod(
+                                        obj_reg,
+                                        method_idx,
+                                        first_arg_reg,
+                                        rest_count,
+                                        dest_reg,
+                                    ),
+                                    line,
+                                );
+                                if !is_fallthrough(*success) {
+                                    let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
+                                    self.pending_jumps.push((jump_idx, *success));
+                                }
+                                return;
+                            }
+                        }
+                        (
+                            "__mir_unknown_is_int"
+                            | "__mir_unknown_is_float"
+                            | "__mir_unknown_is_string"
+                            | "__mir_unknown_is_bool",
+                            1,
+                        ) => {
+                            let variant = match callee.as_str() {
+                                "__mir_unknown_is_int" => "Int",
+                                "__mir_unknown_is_float" => "Float",
+                                "__mir_unknown_is_string" => "String",
+                                _ => "Bool",
+                            };
+                            let val_reg = self.operand_to_reg(&args[0], line);
+                            let enum_idx =
+                                self.chunk.add_constant(Value::string("LuaValue".to_string()));
+                            let var_idx =
+                                self.chunk.add_constant(Value::string(variant.to_string()));
+                            let dest_reg = self.place_to_reg(destination);
+                            self.chunk.emit(
+                                Instruction::IsEnumVariant(dest_reg, val_reg, enum_idx, var_idx),
+                                line,
+                            );
+                            if !is_fallthrough(*success) {
+                                let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
+                                self.pending_jumps.push((jump_idx, *success));
+                            }
+                            return;
+                        }
+                        (
+                            "__mir_unknown_unwrap_int"
+                            | "__mir_unknown_unwrap_float"
+                            | "__mir_unknown_unwrap_string"
+                            | "__mir_unknown_unwrap_bool",
+                            1,
+                        ) => {
+                            let val_reg = self.operand_to_reg(&args[0], line);
+                            let dest_reg = self.place_to_reg(destination);
+                            self.chunk
+                                .emit(Instruction::GetEnumValue(dest_reg, val_reg, 0), line);
+                            if !is_fallthrough(*success) {
+                                let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
+                                self.pending_jumps.push((jump_idx, *success));
+                            }
+                            return;
+                        }
                         _ => {}
                     }
                 }
@@ -2059,7 +2287,27 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 };
 
                 let func_reg = self.next_scratch();
-                if let Some(&callee_idx) = self
+                let local_callee = if !callee.contains('.') && !callee.contains(':') {
+                    self.func
+                        .locals
+                        .iter()
+                        .rev()
+                        .find(|l| l.name.as_deref() == Some(callee.as_str()))
+                        .map(|l| l.id)
+                } else {
+                    None
+                };
+                if let Some(loc_id) = local_callee {
+                    self.chunk
+                        .emit(Instruction::Move(func_reg, loc_id.0 as Register), line);
+                } else if self.use_field_slots
+                    && let Some(struct_name) = parse_mir_struct_decode_callee(callee)
+                {
+                    let name_idx = self
+                        .chunk
+                        .add_constant(Value::string(alloc::format!("{struct_name}.decode")));
+                    self.chunk.emit(Instruction::LoadGlobal(func_reg, name_idx), line);
+                } else if let Some(&callee_idx) = self
                     .direct_callee_indices
                     .and_then(|map| map.get(callee.as_str()))
                 {
@@ -2244,5 +2492,221 @@ pub fn register_struct_decode_natives_with_counters(
             Ok(NativeCallResult::Return(slots))
         });
         vm.register_native(callee, Value::NativeFunction(func));
+    }
+}
+
+fn contiguous_to_vm_struct(
+    s: &ContiguousStruct,
+    vm_layouts: &HashMap<String, Rc<StructLayout>>,
+) -> Result<Value, String> {
+    let mut values = Vec::with_capacity(s.layout.fields.len());
+    for field in &s.layout.fields {
+        let ord = field.ordinal;
+        let off = field.byte_offset;
+        if s.is_null(ord) || !s.is_initialized(ord) {
+            values.push(Value::Nil);
+            continue;
+        }
+        let val = match field.tag {
+            CanonicalTypeTag::Bool => Value::Bool(
+                s.read_bool_at(ord, off, None)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(false),
+            ),
+            CanonicalTypeTag::Int64 | CanonicalTypeTag::DateTimeUtc => Value::Int(
+                s.read_i64_at(ord, off, None)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(0) as LustInt,
+            ),
+            CanonicalTypeTag::UInt64 => {
+                let u = s
+                    .read_u64_at(ord, off, None)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(0);
+                let i = i64::try_from(u).map_err(|_| "UInt64 overflows VM Int".to_string())?;
+                Value::Int(i as LustInt)
+            }
+            CanonicalTypeTag::Float64 => Value::Float(
+                s.read_f64_at(ord, off, None)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(0.0) as LustFloat,
+            ),
+            CanonicalTypeTag::StringSlice => {
+                let text = s
+                    .read_str_at(ord, off, None)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or("");
+                Value::string(text.to_string())
+            }
+            CanonicalTypeTag::BinarySlice => {
+                let bytes = s
+                    .read_bytes_at(ord, off, None)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(&[]);
+                Value::string(String::from_utf8_lossy(bytes).into_owned())
+            }
+            CanonicalTypeTag::NestedStruct(_) => {
+                if let Some(nested) = s.read_nested_at(ord, None).map_err(|e| e.to_string())? {
+                    contiguous_to_vm_struct(nested, vm_layouts)?
+                } else {
+                    Value::Nil
+                }
+            }
+            CanonicalTypeTag::ObjectId => {
+                let oid = s
+                    .read_object_id_at(ord, off, None)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or([0u8; 12]);
+                let mut hex = String::with_capacity(24);
+                for b in oid {
+                    use core::fmt::Write;
+                    let _ = write!(&mut hex, "{:02x}", b);
+                }
+                Value::string(hex)
+            }
+            CanonicalTypeTag::Decimal128 => {
+                let dec = s
+                    .read_decimal128_at(ord, off, None)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(0);
+                Value::Int(dec as LustInt)
+            }
+        };
+        values.push(val);
+    }
+    if let Some(layout) = vm_layouts.get(&s.layout.type_name) {
+        Ok(Value::Struct(StructObject::new(
+            s.layout.type_name.clone(),
+            Rc::clone(layout),
+            values,
+        )))
+    } else {
+        Ok(Value::array(values))
+    }
+}
+
+/// Registers both MIR (`__mir_struct_decode_into:<Name>`) and VM (`<Name>.decode`)
+/// JSON struct decoders onto `vm` from parsed/typechecked `StructDef` definitions.
+pub fn register_struct_value_decoders(
+    vm: &mut crate::vm::VM,
+    struct_defs: &HashMap<String, StructDef>,
+) {
+    if struct_defs.is_empty() {
+        return;
+    }
+
+    let mut mir_module = MirModule::new("cli_struct_decoders".to_string());
+    let mut vm_layouts: HashMap<String, Rc<StructLayout>> = HashMap::new();
+    let mut nested_map = std::collections::HashMap::new();
+    let mut def_entries: Vec<(String, crate::data::layout::LogicalLayoutV1)> = Vec::new();
+
+    for (name, def) in struct_defs {
+        let logical = struct_def_to_layout(def);
+        mir_module.register_struct_layout(MirStructLayout::from(&logical));
+        let simple_def_name = def
+            .name
+            .rsplit('.')
+            .next()
+            .unwrap_or(def.name.as_str())
+            .to_string();
+        if simple_def_name != logical.type_name {
+            let mut simple_logical = logical.clone();
+            simple_logical.type_name = simple_def_name.clone();
+            mir_module.register_struct_layout(MirStructLayout::from(&simple_logical));
+        }
+        let simple_reg_name = name
+            .rsplit('.')
+            .next()
+            .unwrap_or(name.as_str())
+            .to_string();
+        if simple_reg_name != logical.type_name && simple_reg_name != simple_def_name {
+            let mut simple_logical = logical.clone();
+            simple_logical.type_name = simple_reg_name.clone();
+            mir_module.register_struct_layout(MirStructLayout::from(&simple_logical));
+        }
+        nested_map.insert(logical.type_id, logical.clone());
+        def_entries.push((name.clone(), logical));
+
+        let field_names: Vec<Rc<String>> = def
+            .fields
+            .iter()
+            .map(|field| Rc::new(field.name.clone()))
+            .collect();
+        let field_storage: Vec<FieldStorage> = def
+            .fields
+            .iter()
+            .map(|field| match field.ownership {
+                FieldOwnership::Weak => FieldStorage::Weak,
+                FieldOwnership::Strong => FieldStorage::Strong,
+            })
+            .collect();
+        let field_types: Vec<crate::ast::Type> =
+            def.fields.iter().map(|field| field.ty.clone()).collect();
+        let weak_targets: Vec<Option<crate::ast::Type>> = def
+            .fields
+            .iter()
+            .map(|field| field.weak_target.clone())
+            .collect();
+        let layout = Rc::new(StructLayout::new(
+            def.name.clone(),
+            field_names,
+            field_storage,
+            field_types,
+            weak_targets,
+        ));
+        vm_layouts.insert(def.name.clone(), Rc::clone(&layout));
+        vm_layouts.insert(simple_def_name, Rc::clone(&layout));
+        vm_layouts.insert(name.clone(), Rc::clone(&layout));
+        vm_layouts.insert(simple_reg_name, layout);
+    }
+
+    // 1. Register MIR-VM `__mir_struct_decode_into:<Name>` native decoders (slot-array ABI).
+    register_module_struct_decoders(vm, &mir_module);
+
+    // 2. Register `<Name>.decode` native decoders returning typed `Value::Struct` instances
+    //    for AST bytecode and field-slot MIR bytecode execution.
+    let nested_ref = Rc::new(nested_map);
+    let vm_layouts_ref = Rc::new(vm_layouts);
+    let counters = Rc::new(RefCell::new(LayoutPerfCounters::default()));
+
+    for (reg_name, logical) in def_entries {
+        let make_decoder = |logical: crate::data::layout::LogicalLayoutV1| {
+            let nested_ref = Rc::clone(&nested_ref);
+            let vm_layouts_ref = Rc::clone(&vm_layouts_ref);
+            let counters_ref = Rc::clone(&counters);
+            native_fn(move |args: &[Value]| {
+                let input_str = args
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .ok_or_else(|| "Struct.decode expects a JSON string argument".to_string())?;
+                let opts = ContiguousDecodeOptions {
+                    cancel_check: None,
+                    nested_layouts: Some(nested_ref.as_ref()),
+                    require_nominal_tag: false,
+                };
+                let mut c = counters_ref.borrow_mut();
+                let decoded =
+                    decode_json_into_contiguous(&logical, input_str.as_bytes(), &mut c, &opts)
+                        .map_err(|e| e.to_string())?;
+                let val = contiguous_to_vm_struct(&decoded, &vm_layouts_ref)?;
+                Ok(NativeCallResult::Return(val))
+            })
+        };
+
+        let simple = reg_name
+            .rsplit('.')
+            .next()
+            .unwrap_or(reg_name.as_str())
+            .to_string();
+        vm.register_native(
+            alloc::format!("{reg_name}.decode"),
+            Value::NativeFunction(make_decoder(logical.clone())),
+        );
+        if simple != reg_name {
+            vm.register_native(
+                alloc::format!("{simple}.decode"),
+                Value::NativeFunction(make_decoder(logical)),
+            );
+        }
     }
 }

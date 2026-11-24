@@ -101,37 +101,186 @@ pub struct SafepointStats {
 pub struct Safepoints;
 
 impl Safepoints {
-    /// Detects all loop headers in the given block slice.
+    /// Detects all loop headers in the given block slice starting from `BlockId(0)`.
     ///
-    /// In a reducible control-flow graph, a loop header is a block that is the target
-    /// of a back-edge (an edge whose destination block index is <= source block index).
+    /// Uses dominance-verified backedges (`succ` dominates `src`) combined with a DFS
+    /// grey-ancestor fallback to remain sound on irreducible control-flow graphs,
+    /// eliminating false loop headers caused by index-order forward merge edges
+    /// (e.g. `if` merge blocks allocated before nested `then` subgraphs).
     pub fn find_loop_headers(blocks: &[BasicBlock]) -> HashSet<BlockId> {
-        let mut loop_headers = HashSet::new();
-        for (src_idx, block) in blocks.iter().enumerate() {
+        Self::find_loop_headers_from_entry(blocks, BlockId(0))
+    }
+
+    /// Detects all loop headers reachable from `entry` in `blocks`.
+    pub fn find_loop_headers_from_entry(blocks: &[BasicBlock], entry: BlockId) -> HashSet<BlockId> {
+        Self::find_loop_backedges_from_entry(blocks, entry)
+            .into_iter()
+            .map(|(_, header)| header)
+            .collect()
+    }
+
+    /// Detects all loop headers in `func` using `func.entry` as the CFG root.
+    pub(crate) fn find_loop_headers_in_fn(func: &MirFunction) -> HashSet<BlockId> {
+        Self::find_loop_headers_from_entry(&func.blocks, func.entry)
+    }
+
+    /// Finds all dominance-verified (and DFS grey-ancestor irreducible) loop back-edges
+    /// `(from, to)` reachable from `BlockId(0)`.
+    pub fn find_loop_backedges(blocks: &[BasicBlock]) -> Vec<(BlockId, BlockId)> {
+        Self::find_loop_backedges_from_entry(blocks, BlockId(0))
+    }
+
+    /// Finds all dominance-verified (and DFS grey-ancestor irreducible) loop back-edges
+    /// `(from, to)` reachable from `entry`.
+    pub fn find_loop_backedges_from_entry(
+        blocks: &[BasicBlock],
+        entry: BlockId,
+    ) -> Vec<(BlockId, BlockId)> {
+        let n = blocks.len();
+        if n == 0 || entry.0 >= n {
+            return Vec::new();
+        }
+
+        // 1. Collect valid outgoing successor indices per block.
+        let mut succs: Vec<Vec<usize>> = Vec::with_capacity(n);
+        for block in blocks {
+            let mut out = Vec::new();
             if let Some(term) = &block.terminator {
                 for succ in Self::terminator_successors(term) {
-                    if succ.0 <= src_idx {
-                        loop_headers.insert(succ);
+                    if succ.0 < n {
+                        out.push(succ.0);
                     }
                 }
             }
+            succs.push(out);
         }
-        loop_headers
-    }
 
-    /// Finds all loop back-edges `(from, to)` where `to.0 <= from.0`.
-    pub fn find_loop_backedges(blocks: &[BasicBlock]) -> Vec<(BlockId, BlockId)> {
-        let mut backedges = Vec::new();
-        for (src_idx, block) in blocks.iter().enumerate() {
-            if let Some(term) = &block.terminator {
-                for succ in Self::terminator_successors(term) {
-                    if succ.0 <= src_idx {
-                        backedges.push((BlockId(src_idx), succ));
+        // 2. Iterative DFS from `entry` to compute reachability, RPO order, and
+        //    DFS grey-ancestor retreating edges (covers irreducible loops).
+        let mut color = alloc::vec![0u8; n]; // 0 = white, 1 = grey, 2 = black
+        let mut reachable = alloc::vec![false; n];
+        let mut dfs_backedges: HashSet<(usize, usize)> = HashSet::new();
+        let mut postorder: Vec<usize> = Vec::with_capacity(n);
+        let mut stack: Vec<(usize, usize)> = Vec::with_capacity(n);
+
+        color[entry.0] = 1;
+        reachable[entry.0] = true;
+        stack.push((entry.0, 0));
+
+        while let Some((u, next_idx)) = stack.last_mut() {
+            let u_val = *u;
+            if *next_idx < succs[u_val].len() {
+                let v = succs[u_val][*next_idx];
+                *next_idx += 1;
+                if color[v] == 1 {
+                    dfs_backedges.insert((u_val, v));
+                } else if color[v] == 0 {
+                    color[v] = 1;
+                    reachable[v] = true;
+                    stack.push((v, 0));
+                }
+            } else {
+                color[u_val] = 2;
+                postorder.push(u_val);
+                stack.pop();
+            }
+        }
+
+        // 3. Build reachable-only predecessor lists.
+        let mut preds: Vec<Vec<usize>> = alloc::vec![Vec::new(); n];
+        for (u, out) in succs.iter().enumerate() {
+            if !reachable[u] {
+                continue;
+            }
+            for &v in out {
+                preds[v].push(u);
+            }
+        }
+
+        // 4. Iterative bitset dominance over reachable blocks in RPO order.
+        let words = n.div_ceil(64);
+        let last_word_mask = if n % 64 == 0 {
+            !0u64
+        } else {
+            (1u64 << (n % 64)) - 1
+        };
+        let mut dom = alloc::vec![0u64; n * words];
+
+        for b in 0..n {
+            if !reachable[b] {
+                continue;
+            }
+            let base = b * words;
+            if b == entry.0 {
+                dom[base + b / 64] = 1u64 << (b % 64);
+            } else {
+                for w in 0..words {
+                    dom[base + w] = if w + 1 == words { last_word_mask } else { !0u64 };
+                }
+            }
+        }
+
+        let mut rpo = postorder;
+        rpo.reverse();
+        let mut scratch = alloc::vec![0u64; words];
+
+        loop {
+            let mut changed = false;
+            for &b in &rpo {
+                if b == entry.0 || preds[b].is_empty() {
+                    continue;
+                }
+                for w in 0..words {
+                    scratch[w] = if w + 1 == words { last_word_mask } else { !0u64 };
+                }
+                for &p in &preds[b] {
+                    let p_base = p * words;
+                    for w in 0..words {
+                        scratch[w] &= dom[p_base + w];
                     }
+                }
+                scratch[b / 64] |= 1u64 << (b % 64);
+
+                let b_base = b * words;
+                let mut diff = false;
+                for w in 0..words {
+                    if dom[b_base + w] != scratch[w] {
+                        dom[b_base + w] = scratch[w];
+                        diff = true;
+                    }
+                }
+                if diff {
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // 5. Emit backedges in deterministic block/successor order:
+        //    `src -> succ` is a backedge iff `src` is reachable AND
+        //    (`succ` dominates `src` OR `(src, succ)` is a DFS grey-ancestor edge).
+        let mut backedges = Vec::new();
+        for (src_idx, out) in succs.iter().enumerate() {
+            if !reachable[src_idx] {
+                continue;
+            }
+            let src_base = src_idx * words;
+            for &succ_idx in out {
+                let succ_dominates_src =
+                    (dom[src_base + succ_idx / 64] & (1u64 << (succ_idx % 64))) != 0;
+                if succ_dominates_src || dfs_backedges.contains(&(src_idx, succ_idx)) {
+                    backedges.push((BlockId(src_idx), BlockId(succ_idx)));
                 }
             }
         }
         backedges
+    }
+
+    /// Finds all dominance-verified loop back-edges in `func` using `func.entry`.
+    pub(crate) fn find_loop_backedges_in_fn(func: &MirFunction) -> Vec<(BlockId, BlockId)> {
+        Self::find_loop_backedges_from_entry(&func.blocks, func.entry)
     }
 
     /// Extracts all successor BlockIds from a block terminator.
@@ -184,7 +333,7 @@ impl Safepoints {
 
         let mut inserted = 0;
         let loop_headers = if config.instrument_loops {
-            Self::find_loop_headers(&func.blocks)
+            Self::find_loop_headers_in_fn(func)
         } else {
             HashSet::new()
         };
@@ -299,7 +448,7 @@ impl Safepoints {
             };
 
             let headers = if config.instrument_loops {
-                Self::find_loop_headers(&func.blocks)
+                Self::find_loop_headers_in_fn(func)
             } else {
                 HashSet::new()
             };

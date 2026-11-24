@@ -127,6 +127,9 @@ const OP_ARRAY_GET_UNWRAP: u8 = OpCode::ArrayGetUnwrap as u8;
 const OP_ARRAY_PUSH: u8 = OpCode::ArrayPush as u8;
 const OP_SET_INDEX: u8 = OpCode::SetIndex as u8;
 const OP_ARRAY_INDEX_OK: u8 = OpCode::ArrayIndexOk as u8;
+const OP_MAP_GET: u8 = OpCode::MapGet as u8;
+const OP_MAP_SET: u8 = OpCode::MapSet as u8;
+const OP_MAP_GET_UNWRAP: u8 = OpCode::MapGetUnwrap as u8;
 const OP_ARRAY_LEN: u8 = OpCode::ArrayLen as u8;
 const OP_LOAD_UPVALUE: u8 = OpCode::LoadUpvalue as u8;
 const OP_STORE_UPVALUE: u8 = OpCode::StoreUpvalue as u8;
@@ -151,6 +154,7 @@ pub static MUTATION_M1_EXECUTION_COUNT: core::sync::atomic::AtomicU64 = core::sy
 #[cfg(all(feature = "std", debug_assertions))]
 std::thread_local! {
     static FRAME_HOIST_RELOAD_COUNT: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static CLOSURE_UPVALUE_BUFFER_GROWTHS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
 
 #[inline(always)]
@@ -267,6 +271,58 @@ fn write_frame_reg_fast(
     cycle_collector.is_enabled() && cycle_collector.should_collect()
 }
 
+#[inline]
+fn map_read(map: &Value, key: &Value, unwrap: bool) -> Result<Value> {
+    let Value::Map(map) = map else {
+        return Err(LustError::RuntimeError {
+            message: format!("map.get expects a map, got {:?}", map.type_of()),
+        });
+    };
+    let found = map
+        .borrow()
+        .get(&ValueKey::from_value(key))
+        .map(Value::fast_clone);
+    match (found, unwrap) {
+        (Some(value), true) => Ok(value),
+        (Some(value), false) => Ok(Value::some(value)),
+        (None, false) => Ok(Value::none()),
+        (None, true) => Err(LustError::RuntimeError {
+            message: "Called unwrap() on Option::None".to_string(),
+        }),
+    }
+}
+
+#[inline]
+fn map_write(
+    map: &Value,
+    key: &Value,
+    value: &Value,
+    budgets: &mut crate::vm::budget::BudgetState,
+    cycle_collector: &mut cycle::CycleCollector,
+) -> Result<bool> {
+    let Value::Map(map) = map else {
+        return Err(LustError::RuntimeError {
+            message: format!("map.set expects a map, got {:?}", map.type_of()),
+        });
+    };
+    let stores_container =
+        !cycle::CycleCollector::is_leaf(key) || !cycle::CycleCollector::is_leaf(value);
+    let key = ValueKey::from_value(key);
+    let mut map = map.borrow_mut();
+    if budgets.mem_budget_enabled() && !map.contains_key(&key) {
+        budgets
+            .charge_map_entry_estimate()
+            .map_err(|err| LustError::RuntimeError {
+                message: err.to_string(),
+            })?;
+    }
+    map.insert(key, value.fast_clone());
+    if stores_container {
+        cycle_collector.record_mutation();
+    }
+    Ok(stores_container)
+}
+
 #[inline(always)]
 fn frame_int_binary_op<F>(
     regs: &mut [Value; BYTECODE_REGISTER_WINDOW],
@@ -378,6 +434,7 @@ enum FrameExit {
 enum FastStep {
     InLoopCall {
         target_func_idx: usize,
+        closure_reg: Option<Register>,
         first_arg: Register,
         arg_count: u8,
         dest: Register,
@@ -479,6 +536,12 @@ impl VM {
         {
             0
         }
+    }
+
+    /// Counts capacity growths of in-loop closure upvalue buffers in debug builds.
+    #[cfg(all(feature = "std", debug_assertions))]
+    pub fn closure_upvalue_buffer_growths() -> u64 {
+        CLOSURE_UPVALUE_BUFFER_GROWTHS.with(core::cell::Cell::get)
     }
 
     fn is_loop_in_hierarchy(
@@ -693,6 +756,8 @@ impl VM {
         let mut cur_func_idx: usize = 0;
         let mut cur_chunk_len: usize = 0;
         let mut cur_has_packed: bool = false;
+        // Keep the allocations from returned closure frames for the next call.
+        let mut closure_upvalue_pool = Vec::new();
         #[cfg(feature = "std")]
         let mut cur_has_osr_entries: bool = false;
 
@@ -775,7 +840,6 @@ impl VM {
                     let call_stack = &mut self.call_stack;
                     let vm_registers = &mut self.vm_registers;
                     let last_frame_pop_cleanup_iters = &mut self.last_frame_pop_cleanup_iters;
-                    let method_cache = &mut self.method_cache;
                     let budgets = &mut self.budgets;
                     let cycle_collector = &mut self.cycle_collector;
                     let struct_tostring_cache = &mut self.struct_tostring_cache;
@@ -1624,18 +1688,32 @@ impl VM {
                                 let value_reg = (w1 & 0xFF) as u8;
                                 let enum_name_idx = (w0 & 0xFFFF) as u16;
                                 let variant_idx = (w0 >> 16) as u16;
-                                let enum_name = constants[enum_name_idx as usize]
-                                    .as_string()
-                                    .ok_or_else(|| LustError::RuntimeError {
-                                        message: "Enum name must be a string".to_string(),
-                                    })?;
-                                let variant_name = constants[variant_idx as usize]
-                                    .as_string()
-                                    .ok_or_else(|| LustError::RuntimeError {
-                                        message: "Variant name must be a string".to_string(),
-                                    })?;
-                                let is_variant = regs[value_reg as usize]
-                                    .is_enum_variant(enum_name, variant_name);
+                                let slot = &mut ic_slots[ip];
+                                if !matches!(slot, ChunkIcSlot::EnumVariantTag { .. }) {
+                                    let enum_name = constants[enum_name_idx as usize]
+                                        .as_string()
+                                        .ok_or_else(|| LustError::RuntimeError {
+                                            message: "Enum name must be a string".to_string(),
+                                        })?;
+                                    let variant_name = constants[variant_idx as usize]
+                                        .as_string()
+                                        .ok_or_else(|| LustError::RuntimeError {
+                                            message: "Variant name must be a string".to_string(),
+                                        })?;
+                                    *slot = ChunkIcSlot::EnumVariantTag {
+                                        enum_name: Name::from(enum_name),
+                                        variant_name: Name::from(variant_name),
+                                    };
+                                }
+                                let ChunkIcSlot::EnumVariantTag { enum_name, variant_name } = slot
+                                else {
+                                    unreachable!()
+                                };
+                                let is_variant = matches!(&regs[value_reg as usize],
+                                    Value::Enum(object)
+                                        if (enum_name.is_empty() || object.enum_name == *enum_name)
+                                            && object.variant == *variant_name
+                                );
                                 write_frame_reg_scalar(regs, dest, Value::Bool(is_variant))
                             }
                             OP_GET_ENUM_VALUE => {
@@ -2070,14 +2148,9 @@ impl VM {
                                 let (obj, field_idx) = packed.field_operands(extra_args);
                                 let val = match &regs[obj as usize] {
                                     Value::Struct(s) if s.name != "LuaTable" => {
-                                        let cur_layout_ptr = Rc::as_ptr(&s.layout) as usize;
-                                        let resolved_slot = match &ic_slots[ip] {
-                                            ChunkIcSlot::FieldSlot {
-                                                layout_ptr,
-                                                slot_idx,
-                                                ..
-                                            } if *layout_ptr == cur_layout_ptr => Some(*slot_idx),
-                                            _ => {
+                                        let resolved_slot = match ic_slots[ip].probe_field(&s.layout) {
+                                            Some(slot) => Some(slot),
+                                            None => {
                                                 let field_name = constants[field_idx as usize]
                                                     .as_string_rc()
                                                     .ok_or_else(|| LustError::RuntimeError {
@@ -2099,11 +2172,7 @@ impl VM {
                                                             })
                                                     });
                                                 if let Some(slot_idx) = idx_opt {
-                                                    ic_slots[ip] = ChunkIcSlot::FieldSlot {
-                                                        layout_ptr: cur_layout_ptr,
-                                                        layout: Rc::clone(&s.layout),
-                                                        slot_idx,
-                                                    };
+                                                    ic_slots[ip].insert_field(&s.layout, slot_idx);
                                                 }
                                                 idx_opt
                                             }
@@ -2156,14 +2225,9 @@ impl VM {
                                 let value = &regs[value_reg as usize];
                                 match &regs[obj_reg as usize] {
                                     Value::Struct(s) if s.name != "LuaTable" => {
-                                        let cur_layout_ptr = Rc::as_ptr(&s.layout) as usize;
-                                        let idx = match &ic_slots[ip] {
-                                            ChunkIcSlot::FieldSlot {
-                                                layout_ptr,
-                                                slot_idx,
-                                                ..
-                                            } if *layout_ptr == cur_layout_ptr => *slot_idx,
-                                            _ => {
+                                        let idx = match ic_slots[ip].probe_field(&s.layout) {
+                                            Some(slot) => slot,
+                                            None => {
                                                 let field_name = constants[field_idx as usize]
                                                     .as_string_rc()
                                                     .ok_or_else(|| LustError::RuntimeError {
@@ -2183,11 +2247,7 @@ impl VM {
                                                             field_name.as_str()
                                                         ),
                                                     })?;
-                                                ic_slots[ip] = ChunkIcSlot::FieldSlot {
-                                                    layout_ptr: cur_layout_ptr,
-                                                    layout: Rc::clone(&s.layout),
-                                                    slot_idx,
-                                                };
+                                                ic_slots[ip].insert_field(&s.layout, slot_idx);
                                                 slot_idx
                                             }
                                         };
@@ -2510,6 +2570,28 @@ impl VM {
                                     write_frame_reg_scalar(regs, cond_dest, Value::Bool(false))
                                 }
                             }
+                            OP_MAP_GET | OP_MAP_GET_UNWRAP => {
+                                let value = map_read(
+                                    &regs[packed.b() as usize],
+                                    &regs[packed.c() as usize],
+                                    packed.opcode_u8() == OP_MAP_GET_UNWRAP,
+                                )?;
+                                if value.is_plain() {
+                                    write_frame_reg_scalar(regs, packed.a(), value)
+                                } else {
+                                    write_frame_reg_fast(frame, regs, cycle_collector, packed.a(), value)
+                                }
+                            }
+                            OP_MAP_SET => {
+                                let stores_container = map_write(
+                                    &regs[packed.a() as usize],
+                                    &regs[packed.b() as usize],
+                                    &regs[packed.c() as usize],
+                                    budgets,
+                                    cycle_collector,
+                                )?;
+                                stores_container && cycle_collector.should_collect()
+                            }
                             OP_ARRAY_LEN => {
                                 let dest = packed.a();
                                 let array_reg = packed.b();
@@ -2573,18 +2655,25 @@ impl VM {
 
                             OP_CALL => {
                                 let callee_reg = packed.a();
-                                if allow_inloop_calls
-                                    && let Value::Function(target_func_idx) =
-                                        regs[callee_reg as usize]
-                                {
-                                    let w0 = extra_args[packed.bx() as usize];
-                                    break 'intra FastStep::InLoopCall {
-                                        target_func_idx,
-                                        first_arg: (w0 & 0xFF) as u8,
-                                        arg_count: ((w0 >> 8) & 0xFF) as u8,
-                                        dest: ((w0 >> 16) & 0xFF) as u8,
-                                        ip_before_execution,
+                                if allow_inloop_calls {
+                                    let target = match &regs[callee_reg as usize] {
+                                        Value::Function(idx) => Some((*idx, None)),
+                                        Value::Closure(closure) => {
+                                            Some((closure.function_idx, Some(callee_reg)))
+                                        }
+                                        _ => None,
                                     };
+                                    if let Some((target_func_idx, closure_reg)) = target {
+                                        let w0 = extra_args[packed.bx() as usize];
+                                        break 'intra FastStep::InLoopCall {
+                                            target_func_idx,
+                                            closure_reg,
+                                            first_arg: (w0 & 0xFF) as u8,
+                                            arg_count: ((w0 >> 8) & 0xFF) as u8,
+                                            dest: ((w0 >> 16) & 0xFF) as u8,
+                                            ip_before_execution,
+                                        };
+                                    }
                                 }
                                 break 'frame_fast FrameExit::Slow(
                                     instructions[ip],
@@ -2596,6 +2685,7 @@ impl VM {
                                 if allow_inloop_calls
                                     && let Value::Struct(receiver) = &regs[obj_reg as usize]
                                     && receiver.name != "LuaTable"
+                                    && receiver.name == *receiver.layout.name_interned()
                                 {
                                     let ex = packed.bx() as usize;
                                     let w0 = extra_args[ex];
@@ -2604,48 +2694,17 @@ impl VM {
                                     let first_arg = ((w0 >> 16) & 0xFF) as u8;
                                     let arg_count = (w0 >> 24) as u8;
                                     let dest = (w1 & 0xFF) as u8;
-                                    let recv_layout_ptr = Rc::as_ptr(&receiver.layout) as usize;
-                                    let target_opt = match &ic_slots[ip] {
-                                        ChunkIcSlot::MethodCall {
-                                            layout_ptr,
-                                            target_func_idx,
-                                            ..
-                                        } if *layout_ptr == recv_layout_ptr => {
-                                            Some(*target_func_idx)
-                                        }
-                                        _ => {
-                                            let key =
-                                                (recv_layout_ptr, cur_func_idx, method_const);
-                                            let found = method_cache.get(&key).copied().or_else(
-                                                || {
-                                                    let method_name =
-                                                        constants[method_const as usize]
-                                                            .as_string()?;
-                                                    if method_name == "try_unwrap" {
-                                                        return None;
-                                                    }
-                                                    let mangled_name = format!(
-                                                        "{}:{}",
-                                                        receiver.name.as_str(),
-                                                        method_name
-                                                    );
-                                                    let idx = functions
-                                                        .iter()
-                                                        .position(|f| f.name == mangled_name)?;
-                                                    method_cache.insert(key, idx);
-                                                    Some(idx)
-                                                },
-                                            );
-                                            if let Some(target_func_idx) = found {
-                                                ic_slots[ip] = ChunkIcSlot::MethodCall {
-                                                    layout_ptr: recv_layout_ptr,
-                                                    layout: Rc::clone(&receiver.layout),
-                                                    target_func_idx,
-                                                };
+                                    let target_opt = ic_slots[ip].probe_method(&receiver.layout)
+                                        .or_else(|| {
+                                            let method_name = constants[method_const as usize].as_string()?;
+                                            if method_name == "try_unwrap" {
+                                                return None;
                                             }
-                                            found
-                                        }
-                                    };
+                                            let mangled_name = format!("{}:{}", receiver.name, method_name);
+                                            let target = functions.iter().position(|f| f.name == mangled_name)?;
+                                            ic_slots[ip].insert_method(&receiver.layout, target);
+                                            Some(target)
+                                        });
                                     if let Some(target_func_idx) = target_opt {
                                         break 'intra FastStep::InLoopCallMethod {
                                             target_func_idx,
@@ -2695,6 +2754,7 @@ impl VM {
                             match step {
                                 FastStep::InLoopCall {
                                     target_func_idx,
+                                    closure_reg,
                                     first_arg,
                                     arg_count,
                                     dest,
@@ -2706,11 +2766,9 @@ impl VM {
                                             ip_before_execution,
                                         );
                                     };
-                                    let is_trusted = call_meta
-                                        .get(target_func_idx)
-                                        .is_some_and(|m| m.trusted_signature && !m.lua_function);
-                                    if !is_trusted
-                                        || !target_fn.upvalues.is_empty()
+                                    let callee_meta = &call_meta[target_func_idx];
+                                    if callee_meta.lua_function
+                                        || (closure_reg.is_none() && !target_fn.upvalues.is_empty())
                                         || arg_count != target_fn.param_count
                                     {
                                         break 'frame_fast FrameExit::Slow(
@@ -2724,6 +2782,20 @@ impl VM {
                                     if arg_count > 0
                                         && (first_arg as usize) + (arg_count as usize)
                                             > caller_reg_count
+                                    {
+                                        break 'frame_fast FrameExit::Slow(
+                                            instructions[ip_before_execution - 1],
+                                            ip_before_execution,
+                                        );
+                                    }
+                                    // Non-Lua bytecode calls use the same shallow
+                                    // argument checks here as in the general dispatcher.
+                                    if !callee_meta.trusted_signature
+                                        && callee_meta.params.iter().enumerate().any(|(i, kind)| {
+                                            !kind.matches(
+                                                &vm_registers[caller_base + first_arg as usize + i],
+                                            )
+                                        })
                                     {
                                         break 'frame_fast FrameExit::Slow(
                                             instructions[ip_before_execution - 1],
@@ -2758,6 +2830,28 @@ impl VM {
                                     if let Some(meta) = call_meta.get_mut(target_func_idx) {
                                         meta.active_depth = meta.active_depth.saturating_add(1);
                                     }
+                                    let (upvalues, shared_upvalues) = if let Some(reg) = closure_reg
+                                        && let Value::Closure(closure) =
+                                            &vm_registers[caller_base + reg as usize]
+                                        && !closure.upvalues.is_empty()
+                                    {
+                                        let (mut values, mut shared): (Vec<Value>, Vec<Upvalue>) =
+                                            closure_upvalue_pool.pop().unwrap_or_default();
+                                        #[cfg(all(feature = "std", debug_assertions))]
+                                        CLOSURE_UPVALUE_BUFFER_GROWTHS.with(|growths| {
+                                            let count = closure.upvalues.len();
+                                            growths.set(
+                                                growths.get()
+                                                    + u64::from(values.capacity() < count)
+                                                    + u64::from(shared.capacity() < count),
+                                            );
+                                        });
+                                        values.extend(closure.upvalues.iter().map(Upvalue::get));
+                                        shared.extend_from_slice(&closure.upvalues);
+                                        (values, shared)
+                                    } else {
+                                        (Vec::new(), Vec::new())
+                                    };
                                     call_stack.push(CallFrame {
                                         function_idx: target_func_idx,
                                         ip: 0,
@@ -2765,8 +2859,8 @@ impl VM {
                                         reg_count: target_reg_count,
                                         return_dest: Some(dest),
                                         non_plain_mask: callee_non_plain_mask,
-                                        upvalues: Vec::new(),
-                                        shared_upvalues: Vec::new(),
+                                        upvalues,
+                                        shared_upvalues,
                                         saved_registers: None,
                                     });
                                     cur_frame_idx = call_stack.len() - 1;
@@ -2872,24 +2966,26 @@ impl VM {
                                     ret_reg,
                                     ip_before_execution,
                                 } => {
-                                    let is_trusted_ret = call_meta
-                                        .get(cur_func_idx)
-                                        .is_some_and(|m| m.trusted_signature);
+                                    let callee_base = call_stack[cur_frame_idx].base_reg;
+                                    let ret = if ret_reg == 255 {
+                                        &Value::Nil
+                                    } else {
+                                        &vm_registers[callee_base + ret_reg as usize]
+                                    };
+                                    let meta = &call_meta[cur_func_idx];
                                     if call_stack.len() <= min_inloop_return_depth
-                                        || !is_trusted_ret
+                                        || (!meta.trusted_signature
+                                            && !meta.return_kind.matches(ret)
+                                            && !(meta.lua_multi_return
+                                                && matches!(ret, Value::Nil)))
                                     {
                                         break 'frame_fast FrameExit::Slow(
                                             instructions[ip_before_execution - 1],
                                             ip_before_execution,
                                         );
                                     }
-                                    let callee_frame = call_stack.pop().unwrap();
-                                    let callee_base = callee_frame.base_reg;
-                                    let ret_val = if ret_reg == 255 {
-                                        Value::Nil
-                                    } else {
-                                        vm_registers[callee_base + ret_reg as usize].fast_clone()
-                                    };
+                                    let ret_val = ret.fast_clone();
+                                    let mut callee_frame = call_stack.pop().unwrap();
                                     if let Some(meta) =
                                         call_meta.get_mut(callee_frame.function_idx)
                                     {
@@ -2908,6 +3004,14 @@ impl VM {
                                     };
                                     *last_frame_pop_cleanup_iters = cleared;
 
+                                    if callee_frame.shared_upvalues.capacity() != 0 {
+                                        callee_frame.upvalues.clear();
+                                        callee_frame.shared_upvalues.clear();
+                                        closure_upvalue_pool.push((
+                                            callee_frame.upvalues,
+                                            callee_frame.shared_upvalues,
+                                        ));
+                                    }
                                     cur_frame_idx = call_stack.len() - 1;
                                     let caller_func_idx = call_stack[cur_frame_idx].function_idx;
                                     let mut needs_collect = false;
@@ -4754,6 +4858,30 @@ impl VM {
                     self.set_register(dest, result)?;
                 }
 
+                Instruction::MapGet(dest, map, key) | Instruction::MapGetUnwrap(dest, map, key) => {
+                    let value = map_read(
+                        self.get_register(map)?,
+                        self.get_register(key)?,
+                        matches!(instruction, Instruction::MapGetUnwrap(..)),
+                    )?;
+                    self.set_register(dest, value)?;
+                }
+
+                Instruction::MapSet(map, key, value) => {
+                    let map = self.get_register(map)?.fast_clone();
+                    let key = self.get_register(key)?.fast_clone();
+                    let value = self.get_register(value)?.fast_clone();
+                    if map_write(
+                        &map,
+                        &key,
+                        &value,
+                        &mut self.budgets,
+                        &mut self.cycle_collector,
+                    )? {
+                        self.maybe_collect_cycles();
+                    }
+                }
+
                 Instruction::ArrayGetUnwrap(dest, array_reg, index_reg) => {
                     let collection = self.get_register(array_reg)?.fast_clone();
                     let index = self.get_register(index_reg)?.fast_clone();
@@ -4923,40 +5051,18 @@ impl VM {
                     frame_dirty = true;
                     let call_ip = ip_before_execution.saturating_sub(1);
                     let object = self.get_register(obj_reg)?.fast_clone();
-                    // Fast path: monomorphic per-site IC in Chunk::ic_slots[call_ip],
-                    // with fallback to VM::method_cache. Never cache LuaTable.
+                    // Method entries own their layouts, so a recycled allocation
+                    // address cannot select a previous receiver's method.
                     if let Value::Struct(receiver) = &object
                         && receiver.name != "LuaTable"
+                        && receiver.name == *receiver.layout.name_interned()
                     {
-                        let recv_layout_ptr = Rc::as_ptr(&receiver.layout) as usize;
-                        let cached_target = {
-                            let slots = self.functions[func_idx].chunk.ic_slots.borrow();
-                            match slots.get(call_ip) {
-                                Some(ChunkIcSlot::MethodCall {
-                                    layout_ptr,
-                                    target_func_idx,
-                                    ..
-                                }) if *layout_ptr == recv_layout_ptr => Some(*target_func_idx),
-                                _ => None,
-                            }
-                        }
-                        .or_else(|| {
-                            let key = (recv_layout_ptr, func_idx, method_name_idx);
-                            let target = self.method_cache.get(&key).copied()?;
-                            let needed = self.functions[func_idx].chunk.instructions.len();
-                            let mut slots = self.functions[func_idx].chunk.ic_slots.borrow_mut();
-                            if slots.len() < needed {
-                                slots.resize(needed, ChunkIcSlot::Empty);
-                            }
-                            if call_ip < slots.len() {
-                                slots[call_ip] = ChunkIcSlot::MethodCall {
-                                    layout_ptr: recv_layout_ptr,
-                                    layout: Rc::clone(&receiver.layout),
-                                    target_func_idx: target,
-                                };
-                            }
-                            Some(target)
-                        });
+                        let cached_target = self.functions[func_idx]
+                            .chunk
+                            .ic_slots
+                            .borrow_mut()
+                            .get_mut(call_ip)
+                            .and_then(|slot| slot.probe_method(&receiver.layout));
                         if let Some(target) = cached_target {
                             let mut args = core::mem::take(&mut self.arg_scratch);
                             args.clear();
@@ -5046,14 +5152,10 @@ impl VM {
                         {
                             if let Value::Struct(object) = &object
                                 && object.name != "LuaTable"
+                                && object.name == *object.layout.name_interned()
                             {
                                 let StructObject { layout, .. } = object.as_ref();
-                                let layout_ptr = Rc::as_ptr(layout) as usize;
                                 let caller = self.call_stack.last().unwrap().function_idx;
-                                self.method_cache.insert(
-                                    (layout_ptr, caller, method_name_idx),
-                                    target_func_idx,
-                                );
                                 let needed = self.functions[caller].chunk.instructions.len();
                                 let mut slots =
                                     self.functions[caller].chunk.ic_slots.borrow_mut();
@@ -5061,11 +5163,7 @@ impl VM {
                                     slots.resize(needed, ChunkIcSlot::Empty);
                                 }
                                 if call_ip < slots.len() {
-                                    slots[call_ip] = ChunkIcSlot::MethodCall {
-                                        layout_ptr,
-                                        layout: Rc::clone(layout),
-                                        target_func_idx,
-                                    };
+                                    slots[call_ip].insert_method(layout, target_func_idx);
                                 }
                             }
                             let mut args = Vec::with_capacity(1 + arg_count as usize);

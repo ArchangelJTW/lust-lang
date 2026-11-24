@@ -3766,7 +3766,10 @@ impl TraceRecorder {
                 Ok(())
             }
 
-            Instruction::NewMap(_) => {
+            Instruction::NewMap(_)
+            | Instruction::MapGet(..)
+            | Instruction::MapSet(..)
+            | Instruction::MapGetUnwrap(..) => {
                 self.stop_recording();
                 Err(LustError::RuntimeError {
                     message: "Trace aborted: unsupported index operation".to_string(),

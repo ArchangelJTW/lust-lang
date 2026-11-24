@@ -12,9 +12,8 @@ pub enum ChunkIcSlot {
     #[default]
     Empty,
     FieldSlot {
-        layout_ptr: usize,
-        layout: Rc<StructLayout>,
         slot_idx: usize,
+        entries: Pic4,
     },
     NewStructTemplate {
         struct_meta_gen: u64,
@@ -31,14 +30,108 @@ pub enum ChunkIcSlot {
         variant_name: Name,
     },
     MethodCall {
-        layout_ptr: usize,
-        layout: Rc<StructLayout>,
         target_func_idx: usize,
+        entries: Pic4,
+    },
+    EnumVariantTag {
+        enum_name: Name,
+        variant_name: Name,
     },
     GlobalSlot {
         generation: u64,
         slot_idx: u32,
     },
+}
+
+/// Four layout identities and their resolved field slots or method targets.
+#[derive(Debug, Clone, Default)]
+pub struct Pic4 {
+    entries: [Option<(Rc<StructLayout>, usize)>; 4],
+    next_evict: usize,
+}
+
+impl Pic4 {
+    #[inline(always)]
+    fn probe(&self, receiver: &Rc<StructLayout>) -> Option<usize> {
+        for (layout, index) in self.entries.iter().flatten() {
+            if Rc::ptr_eq(layout, receiver) {
+                return Some(*index);
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, receiver: &Rc<StructLayout>, resolved: usize) {
+        for (layout, index) in self.entries.iter_mut().flatten() {
+            if Rc::ptr_eq(layout, receiver) {
+                *index = resolved;
+                return;
+            }
+        }
+        // Owning the layout protects its identity until this entry is evicted.
+        self.entries[self.next_evict] = Some((Rc::clone(receiver), resolved));
+        self.next_evict = (self.next_evict + 1) % self.entries.len();
+    }
+}
+
+impl ChunkIcSlot {
+    #[inline(always)]
+    pub fn probe_field(&mut self, receiver: &Rc<StructLayout>) -> Option<usize> {
+        let Self::FieldSlot { slot_idx, entries } = self else {
+            return None;
+        };
+        let resolved = entries.probe(receiver)?;
+        *slot_idx = resolved;
+        Some(resolved)
+    }
+
+    #[inline]
+    pub fn insert_field(&mut self, receiver: &Rc<StructLayout>, resolved: usize) {
+        if !matches!(self, Self::FieldSlot { .. }) {
+            *self = Self::FieldSlot {
+                slot_idx: resolved,
+                entries: Pic4::default(),
+            };
+        }
+        let Self::FieldSlot { slot_idx, entries } = self else {
+            unreachable!()
+        };
+        *slot_idx = resolved;
+        entries.insert(receiver, resolved);
+    }
+
+    #[inline(always)]
+    pub fn probe_method(&mut self, receiver: &Rc<StructLayout>) -> Option<usize> {
+        let Self::MethodCall {
+            target_func_idx,
+            entries,
+        } = self
+        else {
+            return None;
+        };
+        let resolved = entries.probe(receiver)?;
+        *target_func_idx = resolved;
+        Some(resolved)
+    }
+
+    #[inline]
+    pub fn insert_method(&mut self, receiver: &Rc<StructLayout>, resolved: usize) {
+        if !matches!(self, Self::MethodCall { .. }) {
+            *self = Self::MethodCall {
+                target_func_idx: resolved,
+                entries: Pic4::default(),
+            };
+        }
+        let Self::MethodCall {
+            target_func_idx,
+            entries,
+        } = self
+        else {
+            unreachable!()
+        };
+        *target_func_idx = resolved;
+        entries.insert(receiver, resolved);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +195,9 @@ impl Chunk {
         self.bb_gas_weights.clear();
         self.bb_gas_ends.clear();
         self.instructions[idx] = instruction;
+        if let Some(slot) = self.ic_slots.get_mut().get_mut(idx) {
+            *slot = ChunkIcSlot::Empty;
+        }
         if self.packed_code.len() == self.instructions.len() {
             if let Some(packed) =
                 PackedInstruction::from_instruction(instruction, &mut self.extra_args)
@@ -205,6 +301,7 @@ impl Chunk {
     /// empty so the VM cleanly falls back to `instructions`.
     pub fn build_packed_code(&mut self) {
         let n = self.instructions.len();
+        self.ic_slots.get_mut().clear();
         self.packed_code.clear();
         self.extra_args.clear();
         if n == 0 {

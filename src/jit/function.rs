@@ -133,6 +133,7 @@ pub fn field_pure(functions: &[Function], idx: usize) -> bool {
                 Instruction::SetField(..)
                 | Instruction::SetFieldSlot(..)
                 | Instruction::GetFieldAddSetInt(..)
+                | Instruction::MapSet(..)
                 | Instruction::CallMethod(..)
                 | Instruction::Closure(..)
                 | Instruction::StoreUpvalue(..) => false,
@@ -1234,7 +1235,10 @@ impl<'a> Translator<'a> {
                 self.ops.push(TraceOp::ArrayLen { dest, array });
                 self.write(dest, Some(ValueType::Int));
             }
-            Instruction::ArrayPush(..) => {
+            Instruction::ArrayPush(..)
+            | Instruction::MapGet(..)
+            | Instruction::MapSet(..)
+            | Instruction::MapGetUnwrap(..) => {
                 return None;
             }
             Instruction::ArrayGetUnwrap(dest, array, index) => {

@@ -356,7 +356,7 @@ impl TypeEnv {
                     }
                 }
                 if let Some(global_scope) = self.scopes.first_mut() {
-                    for mod_name in ["array", "table", "map", "math", "string", "task", "lua", "rx"] {
+                    for mod_name in ["array", "table", "map", "math", "string", "task", "lua", "rx", "view"] {
                         if auto_globals.contains(mod_name) {
                             global_scope.insert(mod_name.to_string(), Type::new(TypeKind::Unknown, dummy_span));
                         }
@@ -383,6 +383,7 @@ impl TypeEnv {
                     global_scope.insert("task".to_string(), Type::new(TypeKind::Unknown, dummy_span));
                     global_scope.insert("lua".to_string(), Type::new(TypeKind::Unknown, dummy_span));
                     global_scope.insert("rx".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+                    global_scope.insert("view".to_string(), Type::new(TypeKind::Unknown, dummy_span));
                 }
             }
         }

@@ -45,7 +45,9 @@ pub use jit_engine::{
     is_vm_effect_intrinsic_callee, is_effect_or_handler_callee,
     lust_mir_enter_native_callee, lust_mir_exit_native_callee,
     NativeInvocationIdentity, NativeInvocationGuard, DeoptSiteKind,
-    CraneliftJitCompiler, DeoptPayload, GasFastState, IcEntry, IcSiteStats,
+    AOT_EXPORTED_RUNTIME_SYMBOLS, CraneliftJitCompiler, CraneliftModuleCompiler,
+    LoweredModuleArtifacts, is_aot_exported_runtime_symbol, DeoptPayload, GasFastState, IcEntry,
+    IcSiteStats,
     IcStateKind, InlineCacheSite, MirCraneliftBackendError, OsrPromotionTracker,
     SafepointFastState, SafepointRuntimeState, SafepointStatsSnapshot, SchemaDecodeError,
     SLOW_FLAG_DEOPT, SLOW_FLAG_FINALIZERS, SLOW_FLAG_GAS_BUDGET, SLOW_FLAG_INTERRUPT,
@@ -60,6 +62,9 @@ pub use jit_engine::{
     MIR_STATUS_ERR_INTERRUPTED, MIR_STATUS_ERR_NEG_EXPONENT, MIR_STATUS_ERR_OOM,
     MIR_STATUS_ERR_OUT_OF_BOUNDS, MIR_STATUS_ERR_OUT_OF_GAS, MIR_STATUS_OK,
 };
+
+#[cfg(all(feature = "std", feature = "cranelift-aot"))]
+pub use jit_engine::CraneliftObjectCompiler;
 
 #[cfg(all(feature = "std", feature = "test-deopt"))]
 pub use jit_engine::{
@@ -76,13 +81,13 @@ pub mod jit_engine {
     use cranelift_codegen::Context;
     use cranelift_codegen::ir::{
         condcodes::{FloatCC, IntCC},
-        types, AbiParam, Block, BlockArg, FuncRef, InstBuilder, MemFlagsData, Signature, StackSlot,
-        StackSlotData, StackSlotKind, Value as ClifValue,
+        types, AbiParam, Block, BlockArg, FuncRef, GlobalValue, InstBuilder, MemFlagsData,
+        Signature, StackSlot, StackSlotData, StackSlotKind, Value as ClifValue,
     };
     use cranelift_codegen::settings::{self, Configurable};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
     use cranelift_jit::{JITBuilder, JITModule};
-    use cranelift_module::{FuncId, Linkage, Module};
+    use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 
     #[derive(Debug, Clone, PartialEq, thiserror::Error)]
     pub enum MirCraneliftBackendError {
@@ -6220,10 +6225,103 @@ pub mod jit_engine {
         }
     }
 
-    pub struct CraneliftJitCompiler {
+    /// Authoritative allowlist of `#[unsafe(no_mangle)] pub extern "C"` runtime symbols
+    /// exported by `liblust` that a Cranelift AOT object file is permitted to import.
+    /// Any `Linkage::Import` outside this list (and outside explicit host callbacks) fails closed.
+    pub const AOT_EXPORTED_RUNTIME_SYMBOLS: &[&str] = &[
+        "lust_mir_abs_int",
+        "lust_mir_alloc_array",
+        "lust_mir_alloc_array_typed",
+        "lust_mir_alloc_cflat_struct",
+        "lust_mir_alloc_enum",
+        "lust_mir_alloc_map",
+        "lust_mir_alloc_struct",
+        "lust_mir_alloc_struct_named",
+        "lust_mir_alloc_tuple",
+        "lust_mir_alloc_tuple_typed",
+        "lust_mir_array_get",
+        "lust_mir_array_len",
+        "lust_mir_array_len_checked",
+        "lust_mir_array_push",
+        "lust_mir_array_set",
+        "lust_mir_charge_gas",
+        "lust_mir_clamp_int",
+        "lust_mir_div_int",
+        "lust_mir_enter_native_callee",
+        "lust_mir_enum_payload",
+        "lust_mir_enum_tag",
+        "lust_mir_exit_native_callee",
+        "lust_mir_floordiv_float",
+        "lust_mir_floordiv_int",
+        "lust_mir_gas_fast_ptr",
+        "lust_mir_gas_slow",
+        "lust_mir_get_gas",
+        "lust_mir_get_memory_used",
+        "lust_mir_get_status",
+        "lust_mir_ic_dispatch",
+        "lust_mir_ic_miss",
+        "lust_mir_ic_probe",
+        "lust_mir_init_deopt",
+        "lust_mir_init_deopt_at_terminator",
+        "lust_mir_is_simd_scalar_forced",
+        "lust_mir_map_get",
+        "lust_mir_map_len",
+        "lust_mir_map_set",
+        "lust_mir_max_int",
+        "lust_mir_min_int",
+        "lust_mir_pow_float",
+        "lust_mir_pow_int",
+        "lust_mir_print_bool_part",
+        "lust_mir_print_float_part",
+        "lust_mir_print_int",
+        "lust_mir_print_int_part",
+        "lust_mir_print_nl",
+        "lust_mir_print_sep",
+        "lust_mir_print_string_part",
+        "lust_mir_record_deopt",
+        "lust_mir_record_deopt_local",
+        "lust_mir_record_native_entry",
+        "lust_mir_record_simd_scalar_op",
+        "lust_mir_record_simd_vector_op",
+        "lust_mir_rem_float",
+        "lust_mir_rem_int",
+        "lust_mir_safepoint",
+        "lust_mir_safepoint_slow",
+        "lust_mir_safepoint_state_ptr",
+        "lust_mir_set_gas",
+        "lust_mir_set_max_memory",
+        "lust_mir_set_memory_limit",
+        "lust_mir_set_status",
+        "lust_mir_string_append_inplace",
+        "lust_mir_string_concat",
+        "lust_mir_string_eq",
+        "lust_mir_string_len",
+        "lust_mir_struct_decode_binary",
+        "lust_mir_struct_decode_contiguous",
+        "lust_mir_tostring_bool",
+        "lust_mir_tostring_float",
+        "lust_mir_tostring_int",
+        "lust_mir_track_memory_allocated",
+    ];
+
+    /// Returns `true` iff `name` is an exported C-ABI MIR runtime helper symbol.
+    pub fn is_aot_exported_runtime_symbol(name: &str) -> bool {
+        AOT_EXPORTED_RUNTIME_SYMBOLS.binary_search(&name).is_ok()
+    }
+
+    /// Module-generic lowering output shared between JIT (`JITModule`) and AOT (`ObjectModule`).
+    #[derive(Debug, Clone)]
+    pub struct LoweredModuleArtifacts {
+        pub export_entries: Vec<(String, Option<(String, FuncId)>, FuncId)>,
+        pub exported_functions: Vec<String>,
+        pub imported_runtime_symbols: Vec<String>,
+        pub skipped_dead_helper_count: usize,
+    }
+
+    pub struct CraneliftModuleCompiler<M: Module> {
         builder_ctx: FunctionBuilderContext,
         ctx: Context,
-        module: JITModule,
+        module: M,
         pub struct_layouts: hashbrown::HashMap<String, MirStructLayout>,
         compiled_code_sizes: hashbrown::HashMap<FuncId, usize>,
         compiled_code_ranges: hashbrown::HashMap<String, (usize, usize)>,
@@ -6234,6 +6332,8 @@ pub mod jit_engine {
         captured_opt_ir: hashbrown::HashMap<String, String>,
         host_callbacks: hashbrown::HashMap<String, (Vec<MirType>, MirType)>,
         gas_budget_active: bool,
+        aot_mode: bool,
+        aot_data_symbols: hashbrown::HashMap<Vec<u8>, DataId>,
         post_inline_mirs: hashbrown::HashMap<String, MirFunction>,
         deferred_continuation_fns: hashbrown::HashSet<String>,
         deferred_dead_helpers: hashbrown::HashSet<String>,
@@ -6245,6 +6345,13 @@ pub mod jit_engine {
         #[cfg(feature = "test-deopt")]
         refine_max_iterations_override: Option<usize>,
     }
+
+    /// Concrete Cranelift JIT compiler backed by [`JITModule`].
+    pub type CraneliftJitCompiler = CraneliftModuleCompiler<JITModule>;
+
+    /// Concrete Cranelift AOT object compiler backed by [`cranelift_object::ObjectModule`].
+    #[cfg(feature = "cranelift-aot")]
+    pub type CraneliftObjectCompiler = CraneliftModuleCompiler<cranelift_object::ObjectModule>;
 
     impl CraneliftJitCompiler {
         pub fn new() -> Result<Self, String> {
@@ -6409,6 +6516,8 @@ pub mod jit_engine {
                 captured_opt_ir: hashbrown::HashMap::new(),
                 host_callbacks,
                 gas_budget_active: false,
+                aot_mode: false,
+                aot_data_symbols: hashbrown::HashMap::new(),
                 post_inline_mirs: hashbrown::HashMap::new(),
                 deferred_continuation_fns: hashbrown::HashSet::new(),
                 deferred_dead_helpers: hashbrown::HashSet::new(),
@@ -6420,6 +6529,84 @@ pub mod jit_engine {
                 #[cfg(feature = "test-deopt")]
                 refine_max_iterations_override: None,
             })
+        }
+    }
+
+    impl<M: Module> CraneliftModuleCompiler<M> {
+        /// Wraps any [`cranelift_module::Module`] (e.g., `JITModule` or `ObjectModule`)
+        /// with module-generic MIR->CLIF lowering state.
+        pub fn from_module(module: M, aot_mode: bool) -> Self {
+            let ctx = module.make_context();
+            Self {
+                builder_ctx: FunctionBuilderContext::new(),
+                ctx,
+                module,
+                struct_layouts: hashbrown::HashMap::new(),
+                compiled_code_sizes: hashbrown::HashMap::new(),
+                compiled_code_ranges: hashbrown::HashMap::new(),
+                compiled_osr_entries: hashbrown::HashMap::new(),
+                osr_request_counter: 0,
+                capture_ir: false,
+                captured_ir: hashbrown::HashMap::new(),
+                captured_opt_ir: hashbrown::HashMap::new(),
+                host_callbacks: hashbrown::HashMap::new(),
+                gas_budget_active: aot_mode,
+                aot_mode,
+                aot_data_symbols: hashbrown::HashMap::new(),
+                post_inline_mirs: hashbrown::HashMap::new(),
+                deferred_continuation_fns: hashbrown::HashSet::new(),
+                deferred_dead_helpers: hashbrown::HashSet::new(),
+                compiled_roots: hashbrown::HashSet::new(),
+                skipped_dead_helper_count: 0,
+                lazy_deopt_materialization_count: 0,
+                preserve_all_safepoint_slow_id: None,
+                preserve_all_gas_slow_id: None,
+                #[cfg(feature = "test-deopt")]
+                refine_max_iterations_override: None,
+            }
+        }
+
+        /// Wraps an AOT module (e.g. `ObjectModule`) in fail-closed AOT mode with gas budget propagation enabled.
+        pub fn from_module_aot(module: M) -> Self {
+            Self::from_module(module, true)
+        }
+
+        pub fn is_aot_mode(&self) -> bool {
+            self.aot_mode
+        }
+
+        pub fn module(&self) -> &M {
+            &self.module
+        }
+
+        pub fn module_mut(&mut self) -> &mut M {
+            &mut self.module
+        }
+
+        pub fn into_module(self) -> M {
+            self.module
+        }
+
+        fn ensure_aot_rodata_symbol(
+            &mut self,
+            label_prefix: &str,
+            bytes: &[u8],
+        ) -> Result<DataId, MirCraneliftBackendError> {
+            if let Some(&data_id) = self.aot_data_symbols.get(bytes) {
+                return Ok(data_id);
+            }
+            let sym_name = format!("{}_{}", label_prefix, self.aot_data_symbols.len());
+            let data_id = self
+                .module
+                .declare_data(&sym_name, Linkage::Local, false, false)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let mut data_desc = DataDescription::new();
+            data_desc.define(bytes.to_vec().into_boxed_slice());
+            self.module
+                .define_data(data_id, &data_desc)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            self.aot_data_symbols.insert(bytes.to_vec(), data_id);
+            Ok(data_id)
         }
 
         fn compile_preserve_all_slow_trampoline(
@@ -6603,7 +6790,9 @@ pub mod jit_engine {
                 settings::OptLevel::SpeedAndSize => "speed_and_size",
             }
         }
+    }
 
+    impl CraneliftJitCompiler {
         pub fn dump_function_ir(&mut self, mir_fn: &MirFunction) -> Result<String, MirCraneliftBackendError> {
             let prev = self.capture_ir;
             self.capture_ir = true;
@@ -6680,7 +6869,9 @@ pub mod jit_engine {
                     ))
                 })
         }
+    }
 
+    impl<M: Module> CraneliftModuleCompiler<M> {
         fn format_captured_ir(&self) -> String {
             let mut ir_text = format!("{}", self.ctx.func.display());
             let decls = self.module.declarations();
@@ -6766,27 +6957,31 @@ pub mod jit_engine {
             }
         }
 
-        pub fn compile_function(&mut self, mir_fn: &MirFunction) -> Result<*const u8, MirCraneliftBackendError> {
-            let mut module = MirModule::new(mir_fn.signature.name.clone());
-            module.add_function(mir_fn.clone());
-            let mut map = self.compile_module(&module)?;
-            map.remove(&mir_fn.signature.name)
-                .ok_or_else(|| MirCraneliftBackendError::CodegenError("Failed to get compiled function pointer".into()))
-        }
-
-        pub fn compile_module(
+        /// Module-generic MIR->CLIF lowering for all reachable functions in `module`.
+        ///
+        /// Declares and defines every live function into `self.module` without invoking
+        /// `JITModule`-specific finalization or code pointer extraction.
+        pub fn lower_module(
             &mut self,
             module: &MirModule,
-        ) -> Result<hashbrown::HashMap<String, *const u8>, MirCraneliftBackendError> {
+        ) -> Result<LoweredModuleArtifacts, MirCraneliftBackendError> {
             let roots = compute_default_module_roots(module);
-            self.compile_module_with_roots(module, &roots)
+            self.lower_module_with_roots(module, &roots)
         }
 
-        pub fn compile_module_with_roots(
+        /// Module-generic MIR->CLIF lowering rooted at `roots`.
+        pub fn lower_module_with_roots(
             &mut self,
             module: &MirModule,
             roots: &hashbrown::HashSet<String>,
-        ) -> Result<hashbrown::HashMap<String, *const u8>, MirCraneliftBackendError> {
+        ) -> Result<LoweredModuleArtifacts, MirCraneliftBackendError> {
+            if self.aot_mode && self.module.target_config().pointer_type() != types::I64 {
+                return Err(MirCraneliftBackendError::CodegenError(format!(
+                    "Cranelift AOT object emission requires a 64-bit target ISA, got pointer type {}",
+                    self.module.target_config().pointer_type()
+                )));
+            }
+
             self.register_struct_layouts(&module.struct_layouts);
 
             let reachable = compute_reachable_native_functions(module, roots);
@@ -6979,6 +7174,69 @@ pub mod jit_engine {
                 }
             }
 
+            // 3. Collect imported runtime symbols and fail closed in AOT mode on any
+            //    imported symbol that is not exported in the C ABI runtime surface.
+            let mut imported_runtime_symbols = Vec::new();
+            for (_fid, decl) in self.module.declarations().get_functions() {
+                if decl.linkage == Linkage::Import {
+                    if let Some(sym_name) = decl.name.as_deref() {
+                        if self.aot_mode
+                            && !is_aot_exported_runtime_symbol(sym_name)
+                            && !self.host_callbacks.contains_key(sym_name)
+                        {
+                            return Err(MirCraneliftBackendError::UnlowerableValue(format!(
+                                "Cranelift AOT object emission cannot link non-C-ABI or unresolved runtime symbol '{sym_name}'"
+                            )));
+                        }
+                        imported_runtime_symbols.push(sym_name.to_string());
+                    }
+                }
+            }
+            imported_runtime_symbols.sort();
+            imported_runtime_symbols.dedup();
+
+            let exported_functions = export_entries
+                .iter()
+                .map(|(name, _, _, _)| name.clone())
+                .collect();
+            let stripped_entries = export_entries
+                .into_iter()
+                .map(|(name, fast_opt, fid, _)| (name, fast_opt, fid))
+                .collect();
+
+            Ok(LoweredModuleArtifacts {
+                export_entries: stripped_entries,
+                exported_functions,
+                imported_runtime_symbols,
+                skipped_dead_helper_count: skipped,
+            })
+        }
+    }
+
+    impl CraneliftJitCompiler {
+        pub fn compile_function(&mut self, mir_fn: &MirFunction) -> Result<*const u8, MirCraneliftBackendError> {
+            let mut module = MirModule::new(mir_fn.signature.name.clone());
+            module.add_function(mir_fn.clone());
+            let mut map = self.compile_module(&module)?;
+            map.remove(&mir_fn.signature.name)
+                .ok_or_else(|| MirCraneliftBackendError::CodegenError("Failed to get compiled function pointer".into()))
+        }
+
+        pub fn compile_module(
+            &mut self,
+            module: &MirModule,
+        ) -> Result<hashbrown::HashMap<String, *const u8>, MirCraneliftBackendError> {
+            let roots = compute_default_module_roots(module);
+            self.compile_module_with_roots(module, &roots)
+        }
+
+        pub fn compile_module_with_roots(
+            &mut self,
+            module: &MirModule,
+            roots: &hashbrown::HashSet<String>,
+        ) -> Result<hashbrown::HashMap<String, *const u8>, MirCraneliftBackendError> {
+            let lowered = self.lower_module_with_roots(module, roots)?;
+
             // 3. Finalize definitions
             self.module
                 .finalize_definitions()
@@ -6986,7 +7244,7 @@ pub mod jit_engine {
 
             // 4. Collect finalized code pointers (public export `F`) and code ranges
             let mut res = hashbrown::HashMap::new();
-            for (export_name, fast_opt, export_func_id, _) in export_entries {
+            for (export_name, fast_opt, export_func_id) in lowered.export_entries {
                 let code_ptr = self.module.get_finalized_function(export_func_id);
                 let size = self
                     .compiled_code_sizes
@@ -7624,6 +7882,21 @@ pub mod jit_engine {
             self.compile_function(&func)
         }
 
+        fn cleanup_unfinalized_declarations(
+            &mut self,
+            declared_sigs: &hashbrown::HashMap<FuncId, Signature>,
+            defined_fids: &hashbrown::HashSet<FuncId>,
+        ) {
+            for (&fid, sig) in declared_sigs {
+                if !defined_fids.contains(&fid) {
+                    self.define_trap_stub(fid, sig.clone());
+                }
+            }
+            let _ = self.module.finalize_definitions();
+        }
+    }
+
+    impl<M: Module> CraneliftModuleCompiler<M> {
         fn is_simd_callee_name(callee: &str) -> bool {
             callee.starts_with("simd.")
                 || callee.starts_with("simd_")
@@ -8064,19 +8337,6 @@ pub mod jit_engine {
             Ok(())
         }
 
-        fn cleanup_unfinalized_declarations(
-            &mut self,
-            declared_sigs: &hashbrown::HashMap<FuncId, Signature>,
-            defined_fids: &hashbrown::HashSet<FuncId>,
-        ) {
-            for (&fid, sig) in declared_sigs {
-                if !defined_fids.contains(&fid) {
-                    self.define_trap_stub(fid, sig.clone());
-                }
-            }
-            let _ = self.module.finalize_definitions();
-        }
-
         fn compile_function_internal(
             &mut self,
             mir_fn: &MirFunction,
@@ -8146,7 +8406,7 @@ pub mod jit_engine {
         }
 
         fn declare_ext_fn(
-            module: &mut JITModule,
+            module: &mut M,
             func: &mut cranelift_codegen::ir::Function,
             cache: &mut hashbrown::HashMap<&'static str, FuncRef>,
             name: &'static str,
@@ -8225,9 +8485,12 @@ pub mod jit_engine {
             }
 
             // NG-W16-3: Pre-compile CallConv::PreserveAll cold trampolines BEFORE building
-            // `self.ctx.func` when the function uses F64 locals/returns so AArch64 AAPCS64
-            // default clobbers (`v0..v31`) never spill loop-carried floats on hot iterations.
-            let use_preserve_all_slow = cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))
+            // `self.ctx.func` when the target ISA supports PreserveAll and the function uses
+            // F64 locals/returns so AArch64 AAPCS64 default clobbers (`v0..v31`) never spill
+            // loop-carried floats on hot iterations.
+            let target_supports_preserve_all =
+                matches!(self.module.isa().name(), "aarch64" | "x86_64");
+            let use_preserve_all_slow = target_supports_preserve_all
                 && (mir_fn.locals.iter().any(|l| matches!(l.ty, MirType::Float))
                     || matches!(mir_fn.signature.return_type, MirType::Float));
             let preserve_all_trampolines = if use_preserve_all_slow {
@@ -8235,6 +8498,31 @@ pub mod jit_engine {
             } else {
                 None
             };
+
+            // Pre-declare read-only data symbols for struct type names in AOT mode so
+            // emitted Mach-O/ELF code uses real relocations instead of host heap pointers.
+            let mut aot_struct_name_data: Vec<(String, DataId, usize)> = Vec::new();
+            if self.aot_mode {
+                let mut seen_names: Vec<String> = Vec::new();
+                for block in &mir_fn.blocks {
+                    for stmt in &block.statements {
+                        if let Statement::Assign(_, Rvalue::Aggregate(MirType::Struct(name), _), _) =
+                            stmt
+                            && !name.is_empty()
+                        {
+                            seen_names.push(name.clone());
+                        }
+                    }
+                }
+                seen_names.sort();
+                seen_names.dedup();
+                for name in seen_names {
+                    let data_id =
+                        self.ensure_aot_rodata_symbol("__lust_struct_name", name.as_bytes())?;
+                    let len = name.len();
+                    aot_struct_name_data.push((name, data_id, len));
+                }
+            }
 
             self.ctx.func.signature.params.clear();
             self.ctx.func.signature.returns.clear();
@@ -8511,6 +8799,17 @@ pub mod jit_engine {
                 let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_ctx);
                 let mut ext_fn_cache: hashbrown::HashMap<&'static str, FuncRef> =
                     hashbrown::HashMap::new();
+                let mut aot_struct_name_gvs: hashbrown::HashMap<String, (GlobalValue, usize)> =
+                    hashbrown::HashMap::with_capacity(aot_struct_name_data.len());
+                for (name, data_id, len) in &aot_struct_name_data {
+                    let gv = self.module.declare_data_in_func(*data_id, &mut builder.func);
+                    aot_struct_name_gvs.insert(name.clone(), (gv, *len));
+                }
+                let aot_struct_name_gvs_ref = if self.aot_mode {
+                    Some(&aot_struct_name_gvs)
+                } else {
+                    None
+                };
                 let alloc_array_fn = self.module.declare_func_in_func(alloc_array_callee, &mut builder.func);
                 let alloc_array_typed_fn = self.module.declare_func_in_func(alloc_array_typed_callee, &mut builder.func);
                 let alloc_tuple_typed_fn = self.module.declare_func_in_func(alloc_tuple_typed_callee, &mut builder.func);
@@ -8678,6 +8977,8 @@ pub mod jit_engine {
                     pow2_mod_defs: &empty_pow2_mod_defs,
                     inline_status_ptr_var,
                     closure_fn_ids: closure_fn_ids_ref,
+                    aot_mode: self.aot_mode,
+                    aot_struct_name_gvs: aot_struct_name_gvs_ref,
                 };
 
                 // Cache `type_id` once in `fn_entry_bb` for read-only `MirType::Unknown` parameters
@@ -9431,6 +9732,8 @@ pub mod jit_engine {
                         pow2_mod_defs: &empty_pow2_mod_defs,
                         inline_status_ptr_var,
                         closure_fn_ids: closure_fn_ids_ref,
+                        aot_mode: self.aot_mode,
+                        aot_struct_name_gvs: aot_struct_name_gvs_ref,
                     };
                     let active_promoted = if is_peeled_iq_hdr {
                         cl_opt.map(|ci| cl_states[ci].counters)
@@ -9583,6 +9886,8 @@ pub mod jit_engine {
                             pow2_mod_defs: &peeled_pow2_mod_defs,
                             inline_status_ptr_var,
                             closure_fn_ids: closure_fn_ids_ref,
+                            aot_mode: self.aot_mode,
+                            aot_struct_name_gvs: aot_struct_name_gvs_ref,
                         };
                         if let Some(rc) = peeled_range_fusion.fused_checks.get(&stmt_idx) {
                             let dst_decl = mir_fn.locals.get(rc.dst.0).ok_or_else(|| {
@@ -10056,6 +10361,8 @@ pub mod jit_engine {
                                     pow2_mod_defs: &empty_pow2_mod_defs,
                                     inline_status_ptr_var,
                                     closure_fn_ids: closure_fn_ids_ref,
+                                    aot_mode: self.aot_mode,
+                                    aot_struct_name_gvs: aot_struct_name_gvs_ref,
                                 };
                                 let q0 = builder.use_var(quantum_rem_var);
                                 const UNROLL_K: i64 = 8;
@@ -10265,6 +10572,8 @@ pub mod jit_engine {
                                                         pow2_mod_defs: &empty_pow2_mod_defs,
                                                         inline_status_ptr_var,
                                                         closure_fn_ids: closure_fn_ids_ref,
+                                                        aot_mode: self.aot_mode,
+                                                        aot_struct_name_gvs: aot_struct_name_gvs_ref,
                                                     };
                                                     let d_val = lower_operand(
                                                         delta_op,
@@ -10338,6 +10647,8 @@ pub mod jit_engine {
                                                     pow2_mod_defs: &empty_pow2_mod_defs,
                                                     inline_status_ptr_var,
                                                     closure_fn_ids: closure_fn_ids_ref,
+                                                    aot_mode: self.aot_mode,
+                                                    aot_struct_name_gvs: aot_struct_name_gvs_ref,
                                                 };
                                                 let dst_decl = &mir_fn.locals[dst.0];
                                                 let val = lower_rvalue(
@@ -10457,6 +10768,8 @@ pub mod jit_engine {
                                     pow2_mod_defs: &empty_pow2_mod_defs,
                                     inline_status_ptr_var,
                                     closure_fn_ids: closure_fn_ids_ref,
+                                    aot_mode: self.aot_mode,
+                                    aot_struct_name_gvs: aot_struct_name_gvs_ref,
                                 };
                                 let q0 = builder.use_var(quantum_rem_var);
                                 let q_ge_k = builder.ins().icmp_imm_s(
@@ -11137,6 +11450,8 @@ pub mod jit_engine {
                             pow2_mod_defs: &cur_pow2_mod_defs,
                             inline_status_ptr_var,
                             closure_fn_ids: closure_fn_ids_ref,
+                            aot_mode: self.aot_mode,
+                            aot_struct_name_gvs: aot_struct_name_gvs_ref,
                         };
                         if let Some(rc) = block_range_fusion.fused_checks.get(&stmt_idx) {
                             let dst_decl = mir_fn.locals.get(rc.dst.0).ok_or_else(|| {
@@ -11389,6 +11704,8 @@ pub mod jit_engine {
                         pow2_mod_defs: &empty_pow2_mod_defs,
                         inline_status_ptr_var,
                         closure_fn_ids: closure_fn_ids_ref,
+                        aot_mode: self.aot_mode,
+                        aot_struct_name_gvs: aot_struct_name_gvs_ref,
                     };
 
                     // If this block is the pre-entry to a vectorized loop, insert runtime scalar-forced
@@ -11669,6 +11986,11 @@ pub mod jit_engine {
                                     let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
                                     builder.ins().jump(succ_bb, &[]);
                                 } else if let Some(struct_name) = crate::mir::ir::parse_mir_struct_decode_callee(callee) {
+                                    if self.aot_mode {
+                                        return Err(MirCraneliftBackendError::UnlowerableValue(format!(
+                                            "Dynamic struct decoder intrinsic '{callee}' relies on compiler-process layout IDs and is not supported in Cranelift AOT object mode"
+                                        )));
+                                    }
                                     let layout_id = if let Some(layout) = self.struct_layouts.get(struct_name) {
                                         layout.type_id as i64
                                     } else if let Some(type_id) = STRUCT_NAME_MAP.with(|m| m.borrow().get(struct_name).copied()) {
@@ -11706,6 +12028,11 @@ pub mod jit_engine {
                                     let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
                                     builder.ins().jump(succ_bb, &[]);
                                 } else if is_effect_or_handler_callee(callee) {
+                                    if self.aot_mode {
+                                        return Err(MirCraneliftBackendError::UnlowerableValue(format!(
+                                            "Algebraic effect/handler intrinsic '{callee}' is not supported in Cranelift AOT object mode (requires VM deopt or --backend rust)"
+                                        )));
+                                    }
                                     // 3A->3D deopt seam: publish DeoptPayload and exit with MIR_STATUS_DEOPT
                                     let proven_locals_storage;
                                     let locals_to_record = if let Some((_, live_locals)) = osr_info {
@@ -16445,6 +16772,8 @@ pub mod jit_engine {
         pow2_mod_defs: &'a hashbrown::HashMap<usize, (ClifValue, i64)>,
         inline_status_ptr_var: Option<Variable>,
         closure_fn_ids: Option<&'a hashbrown::HashMap<String, i64>>,
+        aot_mode: bool,
+        aot_struct_name_gvs: Option<&'a hashbrown::HashMap<String, (GlobalValue, usize)>>,
     }
 
     fn is_bool_array_index_place(
@@ -16787,6 +17116,11 @@ pub mod jit_engine {
                 MirConstant::Float(f) => Ok(builder.ins().f64const(*f)),
                 MirConstant::Bool(b) => Ok(builder.ins().iconst(types::I8, if *b { 1 } else { 0 })),
                 MirConstant::String(s) => {
+                    if bc_ctx.aot_mode {
+                        return Err(MirCraneliftBackendError::UnlowerableValue(format!(
+                            "Static string constant {s:?} is not supported in Cranelift AOT object mode (no C-ABI static string interner symbol exported)"
+                        )));
+                    }
                     let handle = with_current_mir_context(|ctx| ctx.intern_string(s));
                     Ok(builder.ins().iconst(types::I64, handle))
                 }
@@ -18178,9 +18512,26 @@ pub mod jit_engine {
                     )));
                 }
                 let size_val = builder.ins().iconst(types::I64, layout.size_bytes as i64);
-                let (name_ptr, name_len) = intern_static_type_name(name);
-                let name_ptr_val = builder.ins().iconst(types::I64, name_ptr as i64);
-                let name_len_val = builder.ins().iconst(types::I64, name_len as i64);
+                let (name_ptr_val, name_len_val) = if bc_ctx.aot_mode {
+                    let &(gv, name_len) = bc_ctx
+                        .aot_struct_name_gvs
+                        .and_then(|m| m.get(name))
+                        .ok_or_else(|| {
+                            MirCraneliftBackendError::CodegenError(format!(
+                                "Missing AOT rodata symbol for C-flat struct type name '{name}'"
+                            ))
+                        })?;
+                    (
+                        builder.ins().symbol_value(types::I64, gv),
+                        builder.ins().iconst(types::I64, name_len as i64),
+                    )
+                } else {
+                    let (name_ptr, name_len) = intern_static_type_name(name);
+                    (
+                        builder.ins().iconst(types::I64, name_ptr as i64),
+                        builder.ins().iconst(types::I64, name_len as i64),
+                    )
+                };
                 let call_inst = builder.ins().call(
                     alloc_cflat_struct_fn,
                     &[size_val, name_ptr_val, name_len_val],
@@ -18201,9 +18552,26 @@ pub mod jit_engine {
                     ));
                 }
                 let len_val = builder.ins().iconst(types::I64, elements.len() as i64);
-                let (name_ptr, name_len) = intern_static_type_name(name);
-                let name_ptr_val = builder.ins().iconst(types::I64, name_ptr as i64);
-                let name_len_val = builder.ins().iconst(types::I64, name_len as i64);
+                let (name_ptr_val, name_len_val) = if bc_ctx.aot_mode {
+                    let &(gv, name_len) = bc_ctx
+                        .aot_struct_name_gvs
+                        .and_then(|m| m.get(name))
+                        .ok_or_else(|| {
+                            MirCraneliftBackendError::CodegenError(format!(
+                                "Missing AOT rodata symbol for struct type name '{name}'"
+                            ))
+                        })?;
+                    (
+                        builder.ins().symbol_value(types::I64, gv),
+                        builder.ins().iconst(types::I64, name_len as i64),
+                    )
+                } else {
+                    let (name_ptr, name_len) = intern_static_type_name(name);
+                    (
+                        builder.ins().iconst(types::I64, name_ptr as i64),
+                        builder.ins().iconst(types::I64, name_len as i64),
+                    )
+                };
                 let call_inst = builder.ins().call(
                     alloc_struct_named_fn,
                     &[len_val, name_ptr_val, name_len_val],

@@ -571,6 +571,66 @@ impl TypeChecker {
         Ok(Type::new(TypeKind::Unit, span))
     }
 
+    fn check_borrow_intrinsic(
+        &mut self,
+        span: Span,
+        args: &[Expr],
+        mutable: bool,
+    ) -> Result<Type> {
+        if args.len() != 1 {
+            return Err(self.type_error_at(
+                format!(
+                    "Borrow producer expects exactly 1 argument, got {}",
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        let arg_ty = self.check_expr(&args[0])?;
+        let canonical = self.canonicalize_type(&arg_ty);
+        let inner = match canonical.kind {
+            TypeKind::Ref(inner) => {
+                if mutable {
+                    return Err(self.type_error_at(
+                        "Cannot create mutable borrow '&mut' from an immutable reference '&'"
+                            .to_string(),
+                        span,
+                    ));
+                }
+                *inner
+            }
+            TypeKind::MutRef(inner) => *inner,
+            _ => canonical,
+        };
+        let kind = if mutable {
+            TypeKind::MutRef(Box::new(inner))
+        } else {
+            TypeKind::Ref(Box::new(inner))
+        };
+        Ok(Type::new(kind, span))
+    }
+
+    fn check_view_unwrap_intrinsic(
+        &mut self,
+        span: Span,
+        name: &str,
+        args: &[Expr],
+    ) -> Result<Type> {
+        if args.len() != 1 {
+            return Err(self.type_error_at(
+                format!("'{}' expects exactly 1 argument, got {}", name, args.len()),
+                span,
+            ));
+        }
+        let arg_ty = self.check_expr(&args[0])?;
+        let canonical = self.canonicalize_type(&arg_ty);
+        let unwrapped = match canonical.kind {
+            TypeKind::Ref(inner) | TypeKind::MutRef(inner) => *inner,
+            _ => canonical,
+        };
+        Ok(Type::new(unwrapped.kind, span))
+    }
+
     pub fn check_call_expr(
         &mut self,
         span: Span,
@@ -588,6 +648,29 @@ impl TypeChecker {
             }
             if fn_name == "__lust_resume" {
                 return self.check_lust_resume(span, args, expected_type);
+            }
+            if fn_name == "__lust_borrow" {
+                return self.check_borrow_intrinsic(span, args, false);
+            }
+            if fn_name == "__lust_borrow_mut" {
+                return self.check_borrow_intrinsic(span, args, true);
+            }
+            if fn_name == "__lust_view_read" || fn_name == "__lust_materialize" {
+                return self.check_view_unwrap_intrinsic(span, fn_name, args);
+            }
+        }
+        if let ExprKind::FieldAccess { object, field } = &callee.kind
+            && let ExprKind::Identifier(obj_name) = &object.kind
+            && obj_name == "view"
+        {
+            match field.as_str() {
+                "borrow" => return self.check_borrow_intrinsic(span, args, false),
+                "borrow_mut" => return self.check_borrow_intrinsic(span, args, true),
+                "read" => return self.check_view_unwrap_intrinsic(span, "view.read", args),
+                "materialize" => {
+                    return self.check_view_unwrap_intrinsic(span, "view.materialize", args);
+                }
+                _ => {}
             }
         }
         if let ExprKind::FieldAccess { object, field } = &callee.kind {
@@ -2002,7 +2085,12 @@ impl TypeChecker {
             return Ok(Type::new(TypeKind::Named(enum_def.name.clone()), span));
         }
 
-        let object_type = self.check_expr(object)?;
+        let raw_object_type = self.check_expr(object)?;
+        let (object_type, borrow_mode) = match &raw_object_type.kind {
+            TypeKind::Ref(inner) => ((**inner).clone(), Some(false)),
+            TypeKind::MutRef(inner) => ((**inner).clone(), Some(true)),
+            _ => (raw_object_type, None),
+        };
         if matches!(object_type.kind, TypeKind::Unknown)
             || matches!(&object_type.kind, TypeKind::Named(name) if name == "LuaValue" || name == "LuaTable")
         {
@@ -2016,7 +2104,22 @@ impl TypeChecker {
                 return Ok(Type::new(TypeKind::Unknown, span));
             }
         if let TypeKind::Map(_, value_type) = &object_type.kind {
-            return Ok(value_type.as_ref().clone());
+            let val_ty = value_type.as_ref().clone();
+            return Ok(match borrow_mode {
+                Some(is_mut)
+                    if !matches!(
+                        val_ty.kind,
+                        TypeKind::Int | TypeKind::Float | TypeKind::Bool | TypeKind::Unit
+                    ) =>
+                {
+                    if is_mut {
+                        Type::new(TypeKind::MutRef(Box::new(val_ty)), span)
+                    } else {
+                        Type::new(TypeKind::Ref(Box::new(val_ty)), span)
+                    }
+                }
+                _ => val_ty,
+            });
         }
         let (type_name, type_bindings) = match &object_type.kind {
             TypeKind::Named(name) => (name.clone(), HashMap::new()),
@@ -2060,7 +2163,22 @@ impl TypeChecker {
                 )
             })?;
         let field_type = self.substitute_type(&field_type, &type_bindings);
-        Ok(self.canonicalize_type(&field_type))
+        let canonical = self.canonicalize_type(&field_type);
+        Ok(match borrow_mode {
+            Some(is_mut)
+                if !matches!(
+                    canonical.kind,
+                    TypeKind::Int | TypeKind::Float | TypeKind::Bool | TypeKind::Unit
+                ) =>
+            {
+                if is_mut {
+                    Type::new(TypeKind::MutRef(Box::new(canonical)), span)
+                } else {
+                    Type::new(TypeKind::Ref(Box::new(canonical)), span)
+                }
+            }
+            _ => canonical,
+        })
     }
 
     pub fn check_index_expr(&mut self, span: Span, object: &Expr, index: &Expr) -> Result<Type> {
@@ -2078,7 +2196,11 @@ impl TypeChecker {
         index: &Expr,
         safe_array_read: bool,
     ) -> Result<Type> {
-        let object_type = self.check_expr(object)?;
+        let raw_object_type = self.check_expr(object)?;
+        let object_type = match &raw_object_type.kind {
+            TypeKind::Ref(inner) | TypeKind::MutRef(inner) => (**inner).clone(),
+            _ => raw_object_type,
+        };
         let index_type = self.check_expr(index)?;
         if matches!(object_type.kind, TypeKind::Unknown)
             || matches!(&object_type.kind, TypeKind::Named(name) if name == "LuaValue" || name == "LuaTable")

@@ -119,7 +119,12 @@ impl Parser {
 
             TokenKind::Ampersand => {
                 self.advance();
-                TypeKind::Ref(Box::new(self.parse_type()?))
+                if self.check(TokenKind::Identifier) && self.current_token().lexeme == "mut" {
+                    self.advance();
+                    TypeKind::MutRef(Box::new(self.parse_type()?))
+                } else {
+                    TypeKind::Ref(Box::new(self.parse_type()?))
+                }
             }
 
             TokenKind::Star => {

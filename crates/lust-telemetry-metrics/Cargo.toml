@@ -5,4 +5,9 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Zero-dependency metrics collector and exporter for Lust Runtime"
 
+[features]
+default = []
+upstream = ["dep:metrics"]
+
 [dependencies]
+metrics = { version = "0.24.6", optional = true }

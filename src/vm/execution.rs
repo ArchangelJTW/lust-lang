@@ -7932,46 +7932,87 @@ impl VM {
         &mut self,
         types: Option<&[(usize, crate::mir::ir::MirType)]>,
     ) -> Result<Value> {
-        if self.call_stack.is_empty() {
-            return Err(LustError::RuntimeError {
-                message: "Cannot resume deopt: call stack is empty".to_string(),
-            });
-        }
+        let provided_types = types.ok_or_else(|| LustError::RuntimeError {
+            message: "Cannot resume deopt: type metadata required but None provided".to_string(),
+        })?;
 
         let payload = crate::mir::cranelift_backend::take_deopt_payload()
             .ok_or_else(|| LustError::RuntimeError {
                 message: "No deopt payload available to reconstruct VM state".to_string(),
             })?;
 
-        // 1. Validate call frame identity before mutation
-        let top_frame = self.call_stack.last().expect("call stack validated non-empty");
-        let fn_idx = top_frame.function_idx;
+        // 1. Resolve and validate target call frame identity before any mutation.
+        //    Distinguish valid empty-stack deopt entry (explicitly named function or `"main"`
+        //    entry with validated metadata and compatible root frame depth) from malformed OSR state.
+        let is_empty_stack = self.call_stack.is_empty();
+        let (fn_idx, reg_count) = if let Some(top_frame) = self.call_stack.last() {
+            let fn_idx = top_frame.function_idx;
+            let func = self.functions.get(fn_idx).ok_or_else(|| LustError::RuntimeError {
+                message: format!("Function index {} out of bounds on top call frame", fn_idx),
+            })?;
+
+            if let Some(ref expected_fn_name) = payload.func_name {
+                if func.name != *expected_fn_name {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "Deopt payload function identity mismatch: expected '{}', top frame has '{}'",
+                            expected_fn_name, func.name
+                        ),
+                    });
+                }
+            }
+
+            if let Some(ref expected_ident) = payload.frame_identity {
+                if expected_ident.frame_depth != self.call_stack.len() {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "Deopt payload frame depth mismatch: expected {}, call stack depth is {}",
+                            expected_ident.frame_depth,
+                            self.call_stack.len()
+                        ),
+                    });
+                }
+            }
+
+            (fn_idx, top_frame.reg_count)
+        } else {
+            if let Some(ref expected_ident) = payload.frame_identity {
+                if expected_ident.frame_depth != 1 {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "Deopt payload frame depth mismatch: expected {}, call stack is empty",
+                            expected_ident.frame_depth
+                        ),
+                    });
+                }
+            }
+
+            let fn_idx = if let Some(ref expected_fn_name) = payload.func_name {
+                self.functions
+                    .iter()
+                    .position(|f| f.name == *expected_fn_name)
+                    .ok_or_else(|| LustError::RuntimeError {
+                        message: format!(
+                            "Cannot resume deopt on empty call stack: function '{}' not found",
+                            expected_fn_name
+                        ),
+                    })?
+            } else {
+                self.functions
+                    .iter()
+                    .position(|f| f.name == "main")
+                    .ok_or_else(|| LustError::RuntimeError {
+                        message: "Cannot resume deopt: call stack is empty".to_string(),
+                    })?
+            };
+
+            let reg_count = self.effective_reg_count(fn_idx);
+            (fn_idx, reg_count)
+        };
+
         let func = self.functions.get(fn_idx).ok_or_else(|| LustError::RuntimeError {
-            message: format!("Function index {} out of bounds on top call frame", fn_idx),
+            message: format!("Function index {} out of bounds", fn_idx),
         })?;
-
-        if let Some(ref expected_fn_name) = payload.func_name {
-            if func.name != *expected_fn_name {
-                return Err(LustError::RuntimeError {
-                    message: format!(
-                        "Deopt payload function identity mismatch: expected '{}', top frame has '{}'",
-                        expected_fn_name, func.name
-                    ),
-                });
-            }
-        }
-
-        if let Some(ref expected_ident) = payload.frame_identity {
-            if expected_ident.frame_depth != self.call_stack.len() {
-                return Err(LustError::RuntimeError {
-                    message: format!(
-                        "Deopt payload frame depth mismatch: expected {}, call stack depth is {}",
-                        expected_ident.frame_depth,
-                        self.call_stack.len()
-                    ),
-                });
-            }
-        }
 
         // 2. Separate site/block identity from authoritative bytecode resume PC
         let site_id = payload.target_pc;
@@ -8017,10 +8058,6 @@ impl VM {
         }
 
         // 3. Validate entire payload and types before mutating any frame state
-        let provided_types = types.ok_or_else(|| LustError::RuntimeError {
-            message: "Cannot resume deopt: type metadata required but None provided".to_string(),
-        })?;
-
         let mut seen_type_indices = hashbrown::HashSet::with_capacity(provided_types.len());
         for &(t_idx, _) in provided_types {
             if !seen_type_indices.insert(t_idx) {
@@ -8039,12 +8076,12 @@ impl VM {
                     message: format!("Duplicate local index {} in deopt payload", loc_idx),
                 });
             }
-            if loc_idx >= top_frame.reg_count as usize {
+            if loc_idx >= reg_count as usize {
                 return Err(LustError::RuntimeError {
                     message: format!(
                         "Deopt payload local index {} exceeds frame register count {}",
                         loc_idx,
-                        top_frame.reg_count
+                        reg_count
                     ),
                 });
             }
@@ -8091,7 +8128,10 @@ impl VM {
             validated_restorations.push((loc_idx, restored_val));
         }
 
-        // 4. All validations passed; apply restored state to top call frame
+        // 4. All validations passed; push entry frame if needed and apply restored state
+        if is_empty_stack {
+            self.try_push_call_frame(fn_idx, reg_count, None, Vec::new(), Vec::new())?;
+        }
         let top_frame = self.call_stack.last_mut().expect("call stack validated non-empty");
         top_frame.ip = resume_pc;
         let base_reg = top_frame.base_reg;

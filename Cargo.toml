@@ -10,6 +10,8 @@ members = [
   "crates/lust-telemetry-prometheus",
   "crates/lust-telemetry-tracing",
   "crates/lust-napi",
+  "crates/lust-napi-rs",
+  "crates/lust-wasi-runner",
   "crates/lust-aot-rt",
 ]
 exclude = ["examples/rust-extension/extensions/**", "tree-sitter-lust", "tests/compile_fail/fs_gate"]
@@ -108,6 +110,19 @@ telemetry-all = ["telemetry-vm", "telemetry-jit", "telemetry-effects", "telemetr
 # WASI features (Track 2G per RFC_WASM_WASI_SUPPORT)
 wasi = ["std"]
 wasi-p2 = ["wasi"]
+
+# Wave 17 opt-in real-backend features (strictly opt-in; never in default/std/net-services)
+jit = ["std"]
+cranelift-aot = ["jit", "dep:cranelift-object", "cranelift-codegen/all-native-arch"]
+telemetry-exporters = [
+  "std",
+  "dep:metrics",
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:prometheus",
+]
+svc-reqwest = ["std", "dep:reqwest"]
+svc-sqlx = ["std", "dep:sqlx"]
 
 [[bin]]
 name = "lust"
@@ -226,6 +241,7 @@ cranelift-frontend = { version = "0.137.1", optional = true }
 cranelift-jit = { version = "0.137.1", optional = true }
 cranelift-module = { version = "0.137.1", optional = true }
 cranelift-native = { version = "0.137.1", optional = true }
+cranelift-object = { version = "0.137.1", optional = true }
 log = { version = "0.4", optional = true }
 tempfile = { version = "3.27.0", optional = true }
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
@@ -235,6 +251,12 @@ hyper-util = { version = "0.1.21", optional = true, features = ["tokio", "http1"
 http-body-util = { version = "0.1.5", optional = true }
 bytes = { version = "1.12.1", optional = true }
 rusqlite = { version = "0.33.0", optional = true }
+metrics = { version = "0.24.6", optional = true }
+opentelemetry = { version = "0.33.1", optional = true }
+opentelemetry_sdk = { version = "0.33.1", features = ["testing", "experimental_metrics_custom_reader"], optional = true }
+prometheus = { version = "0.14.0", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "sqlite"], optional = true }
 
 [build-dependencies]
 

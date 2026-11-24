@@ -5,6 +5,44 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Indicates whether the optional upstream OpenTelemetry SDK adapter is compiled in.
+#[cfg(feature = "upstream")]
+pub const UPSTREAM_ENABLED: bool = true;
+
+/// Indicates whether the optional upstream OpenTelemetry SDK adapter is compiled in.
+#[cfg(not(feature = "upstream"))]
+pub const UPSTREAM_ENABLED: bool = false;
+
+#[cfg(feature = "upstream")]
+pub mod upstream;
+
+#[cfg(feature = "upstream")]
+pub use upstream::{
+    sanitize_otel_instrument_name, OtelCardinalityLimits, ScopedUpstreamOtelSink,
+    SharedManualReader, UpstreamOtelSink,
+};
+
+/// Zero-sized, zero-allocation no-op [`TelemetrySink`] for disabled-telemetry controls.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct NoopTelemetrySink;
+
+impl TelemetrySink for NoopTelemetrySink {
+    #[inline(always)]
+    fn counter_add(&self, _name: &str, _delta: u64, _labels: &[(&str, &str)]) {}
+    #[inline(always)]
+    fn gauge_set(&self, _name: &str, _value: f64, _labels: &[(&str, &str)]) {}
+    #[inline(always)]
+    fn histogram_record(&self, _name: &str, _value: f64, _labels: &[(&str, &str)]) {}
+    #[inline(always)]
+    fn span_enter(&self, _name: &str, _labels: &[(&str, &str)]) -> u64 {
+        0
+    }
+    #[inline(always)]
+    fn span_exit(&self, _span_id: u64, _status: SpanStatus) {}
+    #[inline(always)]
+    fn flush(&self) {}
+}
+
 thread_local! {
     static ACTIVE_SPAN_STACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
@@ -90,13 +128,16 @@ pub struct OtelHistogramPoint {
     pub attributes: Vec<(String, String)>,
 }
 
+type OtelMetricKey = (String, Vec<(String, String)>);
+type OtelHistogramState = (u64, f64, Vec<u64>);
+
 #[derive(Debug, Default)]
 struct OtelStorage {
     spans: Vec<OtelSpan>,
     open_spans: HashMap<u64, OtelSpan>,
-    counters: HashMap<(String, Vec<(String, String)>), u64>,
-    gauges: HashMap<(String, Vec<(String, String)>), f64>,
-    histograms: HashMap<(String, Vec<(String, String)>), (u64, f64, Vec<u64>)>, // count, sum, bucket counts
+    counters: HashMap<OtelMetricKey, u64>,
+    gauges: HashMap<OtelMetricKey, f64>,
+    histograms: HashMap<OtelMetricKey, OtelHistogramState>, // count, sum, bucket counts
 }
 
 #[derive(Debug)]

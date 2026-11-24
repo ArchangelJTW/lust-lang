@@ -4,6 +4,43 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Indicates whether the optional upstream `metrics` crate adapter is compiled in.
+#[cfg(feature = "upstream")]
+pub const UPSTREAM_ENABLED: bool = true;
+
+/// Indicates whether the optional upstream `metrics` crate adapter is compiled in.
+#[cfg(not(feature = "upstream"))]
+pub const UPSTREAM_ENABLED: bool = false;
+
+#[cfg(feature = "upstream")]
+pub mod upstream;
+
+#[cfg(feature = "upstream")]
+pub use upstream::{
+    InMemoryMetricsRecorder, MetricDescription, ScopedUpstreamMetricsSink, UpstreamMetricsSink,
+};
+
+/// Zero-sized, zero-allocation no-op [`TelemetrySink`] for disabled-telemetry controls.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct NoopTelemetrySink;
+
+impl TelemetrySink for NoopTelemetrySink {
+    #[inline(always)]
+    fn counter_add(&self, _name: &str, _delta: u64, _labels: &[(&str, &str)]) {}
+    #[inline(always)]
+    fn gauge_set(&self, _name: &str, _value: f64, _labels: &[(&str, &str)]) {}
+    #[inline(always)]
+    fn histogram_record(&self, _name: &str, _value: f64, _labels: &[(&str, &str)]) {}
+    #[inline(always)]
+    fn span_enter(&self, _name: &str, _labels: &[(&str, &str)]) -> u64 {
+        0
+    }
+    #[inline(always)]
+    fn span_exit(&self, _span_id: u64, _status: SpanStatus) {}
+    #[inline(always)]
+    fn flush(&self) {}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpanStatus {
     Success,

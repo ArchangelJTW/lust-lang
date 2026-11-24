@@ -556,7 +556,13 @@ fn test_w3_handlers_3a_cranelift_to_3d_vm_integrated_deopt() {
     vm.load_functions(funcs);
 
     // 4. Consume the Cranelift-published DeoptPayload via 3D `resume_from_deopt`
-    let types = vec![(0, MirType::Int), (arg0.0, MirType::Int), (local_accum.0, MirType::Int)];
+    let mut types = vec![(mir_fn.return_local.0, MirType::Int)];
+    if arg0.0 != mir_fn.return_local.0 {
+        types.push((arg0.0, MirType::Int));
+    }
+    if local_accum.0 != mir_fn.return_local.0 && local_accum.0 != arg0.0 {
+        types.push((local_accum.0, MirType::Int));
+    }
     let outcome = vm.resume_from_deopt(Some(&types)).expect("resume_from_deopt must succeed");
     assert_eq!(
         outcome,

@@ -1,0 +1,23 @@
+function fib(n: int): int
+    if n <= 1 then
+        return n
+    end
+    local a: int = 0
+    local b: int = 1
+    local i: int = 2
+    while i <= n do
+        local next: int = a + b
+        a = b
+        b = next
+        i = i + 1
+    end
+    return b
+end
+
+local acc: int = 0
+local i: int = 1
+while i <= 12 do
+    acc = acc + fib(i)
+    i = i + 1
+end
+println("w17-lust-compute=" .. tostring(acc))

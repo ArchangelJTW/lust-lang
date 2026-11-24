@@ -822,6 +822,34 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {
+        if self.match_token(&[TokenKind::Ampersand]) {
+            let start_token = self.tokens[self.current - 1].clone();
+            let is_mut =
+                self.check(TokenKind::Identifier) && self.current_token().lexeme == "mut";
+            if is_mut {
+                self.advance();
+            }
+            let operand = self.parse_unary()?;
+            let end_token = self.tokens[self.current - 1].clone();
+            let span = self.make_span(&start_token, &end_token);
+            let callee_name = if is_mut {
+                "__lust_borrow_mut"
+            } else {
+                "__lust_borrow"
+            };
+            return Ok(Expr::new(
+                ExprKind::Call {
+                    callee: Box::new(Expr::new(
+                        ExprKind::Identifier(callee_name.to_string()),
+                        span,
+                    )),
+                    type_args: None,
+                    args: vec![operand],
+                },
+                span,
+            ));
+        }
+
         if self.match_token(&[TokenKind::Minus, TokenKind::Not, TokenKind::Tilde]) {
             let start_token = self.tokens[self.current - 1].clone();
             let op = match start_token.kind {
@@ -955,9 +983,35 @@ impl Parser {
 
                     self.consume(TokenKind::RightParen, "Expected ')' after arguments")?;
                     let span = expr.span;
+                    let callee = match &expr.kind {
+                        ExprKind::FieldAccess { object, field }
+                            if matches!(&object.kind, ExprKind::Identifier(ns) if ns == "view") =>
+                        {
+                            match field.as_str() {
+                                "borrow" => Expr::new(
+                                    ExprKind::Identifier("__lust_borrow".to_string()),
+                                    span,
+                                ),
+                                "borrow_mut" => Expr::new(
+                                    ExprKind::Identifier("__lust_borrow_mut".to_string()),
+                                    span,
+                                ),
+                                "read" => Expr::new(
+                                    ExprKind::Identifier("__lust_view_read".to_string()),
+                                    span,
+                                ),
+                                "materialize" => Expr::new(
+                                    ExprKind::Identifier("__lust_materialize".to_string()),
+                                    span,
+                                ),
+                                _ => expr,
+                            }
+                        }
+                        _ => expr,
+                    };
                     expr = Expr::new(
                         ExprKind::Call {
-                            callee: Box::new(expr),
+                            callee: Box::new(callee),
                             type_args: None,
                             args,
                         },

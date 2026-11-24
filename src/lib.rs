@@ -53,6 +53,10 @@ pub mod vfs;
 pub mod wasm;
 #[cfg(feature = "std")]
 pub mod wasi;
+#[cfg(feature = "std")]
+pub mod w17_layout;
+#[cfg(feature = "std")]
+pub mod w17_lifetime;
 pub use vm::telemetry;
 pub use ast::{Expr, Item, Span, Stmt, Type};
 pub use bytecode::{Chunk, Compiler, Function, Instruction, Value};

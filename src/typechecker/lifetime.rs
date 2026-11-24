@@ -122,6 +122,40 @@ pub struct LifetimeRegistry {
 
 impl Default for LifetimeRegistry {
     fn default() -> Self {
+        let mut borrow_producers = HashMap::new();
+        borrow_producers.insert(
+            "__lust_borrow".to_string(),
+            BorrowProducerSpec {
+                owner_arg_idx: 0,
+                mutable: false,
+            },
+        );
+        borrow_producers.insert(
+            "__lust_borrow_mut".to_string(),
+            BorrowProducerSpec {
+                owner_arg_idx: 0,
+                mutable: true,
+            },
+        );
+        borrow_producers.insert(
+            "view.borrow".to_string(),
+            BorrowProducerSpec {
+                owner_arg_idx: 0,
+                mutable: false,
+            },
+        );
+        borrow_producers.insert(
+            "view.borrow_mut".to_string(),
+            BorrowProducerSpec {
+                owner_arg_idx: 0,
+                mutable: true,
+            },
+        );
+
+        let mut deep_materializers = HashSet::new();
+        deep_materializers.insert("__lust_materialize".to_string());
+        deep_materializers.insert("view.materialize".to_string());
+
         let mut sync_read_safe_callees = HashSet::new();
         for name in [
             "print",
@@ -130,6 +164,8 @@ impl Default for LifetimeRegistry {
             "assert",
             "assert_eq",
             "typeof",
+            "__lust_view_read",
+            "view.read",
         ] {
             sync_read_safe_callees.insert(name.to_string());
         }
@@ -143,6 +179,12 @@ impl Default for LifetimeRegistry {
             "task.spawn",
             "task.await",
             "task.sleep",
+            "task.send",
+            "fiber.spawn",
+            "actor.send",
+            "thread.spawn",
+            "channel.send",
+            "async.spawn",
             "coord.send",
             "coord.recv",
             "coord.wait",
@@ -158,8 +200,8 @@ impl Default for LifetimeRegistry {
         }
 
         Self {
-            borrow_producers: HashMap::new(),
-            deep_materializers: HashSet::new(),
+            borrow_producers,
+            deep_materializers,
             sync_read_safe_callees,
             suspending_callees,
             drop_callees,
@@ -266,6 +308,15 @@ impl FnSummary {
             && !self.escapes_params_to_return.contains(&arg_idx)
             && !self.escapes_params_to_global.contains(&arg_idx)
             && !self.mutates_params.contains(&arg_idx)
+            && !self.captures_params.contains(&arg_idx)
+            && !self.unproven_params.contains(&arg_idx)
+    }
+
+    fn is_safe_sync_mut_for_arg(&self, arg_idx: usize) -> bool {
+        !self.may_suspend
+            && !self.returns_unresolved_borrow
+            && !self.escapes_params_to_return.contains(&arg_idx)
+            && !self.escapes_params_to_global.contains(&arg_idx)
             && !self.captures_params.contains(&arg_idx)
             && !self.unproven_params.contains(&arg_idx)
     }
@@ -488,6 +539,22 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn resolve_fn_key(&self, name: &str) -> Option<String> {
+        if self.fn_defs.contains_key(name) || self.summaries.contains_key(name) {
+            return Some(name.to_string());
+        }
+        if !name.contains('.') {
+            if let Some(module) = &self.module_name {
+                let qualified = format!("{module}.{name}");
+                if self.fn_defs.contains_key(&qualified) || self.summaries.contains_key(&qualified)
+                {
+                    return Some(qualified);
+                }
+            }
+        }
+        None
+    }
+
     fn emit(&mut self, code: LifetimeDiagCode, detail: impl Into<String>, span: Span) {
         self.diagnostics.push(LifetimeDiagnostic {
             code,
@@ -543,7 +610,11 @@ impl<'a> Analyzer<'a> {
         for bid in &frame.owned_bindings {
             if let Some(info) = state.bindings.get(bid) {
                 dying_owners.insert(info.owner);
-                dying_owners.extend(info.aliased_owners.iter().copied());
+                if !info.provenance.is_borrowed() {
+                    if let Provenance::Owned(owned_id) = info.provenance {
+                        dying_owners.insert(owned_id);
+                    }
+                }
             }
         }
         let popped_region = frame.id;
@@ -813,12 +884,30 @@ impl<'a> Analyzer<'a> {
                         .and_then(type_contains_ref);
                     let init_val = evals.get(i).cloned();
                     let (provenance, fn_targets, aliased_owners) = match (ref_ann, init_val) {
-                        (Some(_), Some(ev)) => match ev.provenance {
-                            Provenance::Borrowed { .. } => (
-                                ev.provenance,
-                                ev.fn_targets,
-                                ev.touched_owners,
-                            ),
+                        (Some((wants_mut, ann_span)), Some(ev)) => match ev.provenance {
+                            Provenance::Borrowed { ref loans, .. } => {
+                                if wants_mut {
+                                    let any_shared = loans
+                                        .iter()
+                                        .filter_map(|lid| state.loans.get(lid))
+                                        .any(|l| !l.mutable);
+                                    if any_shared {
+                                        self.emit(
+                                            LifetimeDiagCode::E4G004,
+                                            format!(
+                                                "local `{}` requires mutable borrow `&mut` but initializer is shared borrow",
+                                                binding.name
+                                            ),
+                                            if ann_span.start_line > 0 { ann_span } else { binding.span },
+                                        );
+                                    }
+                                }
+                                (
+                                    ev.provenance,
+                                    ev.fn_targets,
+                                    ev.touched_owners,
+                                )
+                            }
                             Provenance::Owned(_) | Provenance::UnresolvedBorrow => {
                                 self.emit(
                                     LifetimeDiagCode::E4G006,
@@ -903,10 +992,26 @@ impl<'a> Analyzer<'a> {
                                         }
                                     }
                                 }
+                                let is_place_write = matches!(
+                                    target.kind,
+                                    ExprKind::FieldAccess { .. } | ExprKind::Index { .. }
+                                );
                                 if let Some(entry) = state.bindings.get_mut(&bid) {
-                                    entry.provenance = val.provenance.clone();
-                                    entry.fn_targets = val.fn_targets.clone();
-                                    entry.aliased_owners = val.touched_owners.clone();
+                                    if is_place_write {
+                                        if val.provenance.is_borrowed() {
+                                            let fresh = self.id_gen.next_owner();
+                                            entry.provenance =
+                                                entry.provenance.union(&val.provenance, fresh);
+                                        }
+                                        entry.fn_targets.extend(val.fn_targets.iter().cloned());
+                                        entry
+                                            .aliased_owners
+                                            .extend(val.touched_owners.iter().copied());
+                                    } else {
+                                        entry.provenance = val.provenance.clone();
+                                        entry.fn_targets = val.fn_targets.clone();
+                                        entry.aliased_owners = val.touched_owners.clone();
+                                    }
                                 }
                             }
                         } else if val.provenance.is_borrowed() {
@@ -1089,8 +1194,8 @@ impl<'a> Analyzer<'a> {
                     let mut touched = info.aliased_owners.clone();
                     touched.insert(info.owner);
                     let mut fn_targets = info.fn_targets.clone();
-                    if self.fn_defs.contains_key(name) {
-                        fn_targets.insert(name.clone());
+                    if let Some(resolved) = self.resolve_fn_key(name) {
+                        fn_targets.insert(resolved);
                     }
                     EvalValue {
                         provenance: info.provenance,
@@ -1100,8 +1205,8 @@ impl<'a> Analyzer<'a> {
                     }
                 } else {
                     let mut fn_targets = BTreeSet::new();
-                    if self.fn_defs.contains_key(name) {
-                        fn_targets.insert(name.clone());
+                    if let Some(resolved) = self.resolve_fn_key(name) {
+                        fn_targets.insert(resolved);
                     }
                     let o = self.id_gen.next_owner();
                     EvalValue {
@@ -1367,43 +1472,68 @@ impl<'a> Analyzer<'a> {
     ) -> EvalValue {
         if let Some(spec) = self.registry.borrow_producers.get(name) {
             if let Some(owner_arg) = arg_vals.get(spec.owner_arg_idx) {
-                let owner_id = owner_arg
-                    .origin_owner
-                    .unwrap_or_else(|| self.id_gen.next_owner());
-                // Check conflict with existing loans on this owner
-                let existing = self.active_loans_for_owner(state, owner_id);
-                let conflict = if spec.mutable {
-                    !existing.is_empty()
+                let mut target_owners = BTreeSet::new();
+                if let Provenance::Borrowed { loans, owners } = &owner_arg.provenance {
+                    if spec.mutable {
+                        let any_shared = loans
+                            .iter()
+                            .filter_map(|lid| state.loans.get(lid))
+                            .any(|l| !l.mutable);
+                        if any_shared {
+                            self.emit(
+                                LifetimeDiagCode::E4G004,
+                                format!("cannot create mutable borrow via `{name}` from shared borrow"),
+                                span,
+                            );
+                        }
+                    }
+                    target_owners.extend(owners.iter().copied());
                 } else {
-                    existing.iter().any(|l| l.mutable)
-                };
-                if conflict {
-                    self.emit(
-                        LifetimeDiagCode::E4G004,
-                        format!("conflicting borrow on `{name}` while owner already borrowed"),
-                        span,
-                    );
+                    let owner_id = owner_arg
+                        .origin_owner
+                        .unwrap_or_else(|| self.id_gen.next_owner());
+                    target_owners.insert(owner_id);
                 }
-                let lid = self.id_gen.next_loan();
+
+                let mut new_loans = BTreeSet::new();
                 let region = state.current_region();
-                state.loans.insert(
-                    lid,
-                    Loan {
-                        id: lid,
-                        owner: owner_id,
-                        origin_region: region,
-                        mutable: spec.mutable,
-                        span,
-                    },
-                );
-                let mut loans = BTreeSet::new();
-                loans.insert(lid);
-                let mut owners = BTreeSet::new();
-                owners.insert(owner_id);
+                let is_reborrow = owner_arg.provenance.is_borrowed();
+                for &owner_id in &target_owners {
+                    if !is_reborrow {
+                        let existing = self.active_loans_for_owner(state, owner_id);
+                        let conflict = if spec.mutable {
+                            !existing.is_empty()
+                        } else {
+                            existing.iter().any(|l| l.mutable)
+                        };
+                        if conflict {
+                            self.emit(
+                                LifetimeDiagCode::E4G004,
+                                format!("conflicting borrow on `{name}` while owner already borrowed"),
+                                span,
+                            );
+                        }
+                    }
+                    let lid = self.id_gen.next_loan();
+                    state.loans.insert(
+                        lid,
+                        Loan {
+                            id: lid,
+                            owner: owner_id,
+                            origin_region: region,
+                            mutable: spec.mutable,
+                            span,
+                        },
+                    );
+                    new_loans.insert(lid);
+                }
                 let mut touched = owner_arg.touched_owners.clone();
-                touched.insert(owner_id);
+                touched.extend(target_owners.iter().copied());
                 return EvalValue {
-                    provenance: Provenance::Borrowed { loans, owners },
+                    provenance: Provenance::Borrowed {
+                        loans: new_loans,
+                        owners: target_owners,
+                    },
                     fn_targets: BTreeSet::new(),
                     origin_owner: None,
                     touched_owners: touched,
@@ -1440,7 +1570,11 @@ impl<'a> Analyzer<'a> {
             return EvalValue::owned(self.id_gen.next_owner());
         }
 
-        if let Some(summary) = self.summaries.get(name) {
+        let summary_opt = self
+            .summaries
+            .get(name)
+            .or_else(|| self.resolve_fn_key(name).and_then(|k| self.summaries.get(&k)));
+        if let Some(summary) = summary_opt {
             if summary.may_suspend {
                 self.check_borrow_suspension(state, name, arg_vals, span);
             }
@@ -1460,12 +1594,34 @@ impl<'a> Analyzer<'a> {
                             format!("call to `{name}` may capture borrowed argument #{idx}"),
                             span,
                         );
-                    } else if !summary.is_safe_sync_readonly_for_arg(idx) {
-                        self.emit(
-                            LifetimeDiagCode::E4G005,
-                            format!("call to `{name}` lacks proven safe summary for argument #{idx}"),
-                            span,
-                        );
+                    } else {
+                        let is_exclusive_mut = match &av.provenance {
+                            Provenance::Borrowed { loans, .. } if !loans.is_empty() => loans
+                                .iter()
+                                .all(|lid| state.loans.get(lid).is_some_and(|l| l.mutable)),
+                            _ => false,
+                        };
+                        if is_exclusive_mut {
+                            if !summary.is_safe_sync_mut_for_arg(idx) {
+                                self.emit(
+                                    LifetimeDiagCode::E4G005,
+                                    format!("call to `{name}` lacks proven safe mutable summary for argument #{idx}"),
+                                    span,
+                                );
+                            }
+                        } else if summary.mutates_params.contains(&idx) {
+                            self.emit(
+                                LifetimeDiagCode::E4G004,
+                                format!("call to `{name}` mutates shared borrowed argument #{idx}"),
+                                span,
+                            );
+                        } else if !summary.is_safe_sync_readonly_for_arg(idx) {
+                            self.emit(
+                                LifetimeDiagCode::E4G005,
+                                format!("call to `{name}` lacks proven safe summary for argument #{idx}"),
+                                span,
+                            );
+                        }
                     }
                 }
             }
@@ -1780,20 +1936,29 @@ fn compute_fn_summaries(
             let mut next = summaries.get(name).cloned().unwrap_or_default();
             let mut calls = Vec::new();
             let mut returns_param = BTreeSet::new();
+            let mut escapes_global = BTreeSet::new();
             let mut mutates_param = BTreeSet::new();
             let mut captures_param = BTreeSet::new();
+            let mut locals: HashSet<String> = param_names.keys().cloned().collect();
             for stmt in &def.body {
                 scan_fn_summary_stmt(
                     stmt,
                     &param_names,
+                    &mut locals,
                     &mut calls,
                     &mut returns_param,
+                    &mut escapes_global,
                     &mut mutates_param,
                     &mut captures_param,
                 );
             }
             for idx in returns_param {
                 if next.escapes_params_to_return.insert(idx) {
+                    changed = true;
+                }
+            }
+            for idx in escapes_global {
+                if next.escapes_params_to_global.insert(idx) {
                     changed = true;
                 }
             }
@@ -1833,45 +1998,58 @@ fn compute_fn_summaries(
                             }
                         }
                     }
-                } else if let Some(csum) = summaries.get(&callee) {
-                    let is_recursive = callee == *name || calls_reach(&fn_defs, &callee, name);
-                    if csum.may_suspend && !next.may_suspend {
-                        next.may_suspend = true;
-                        changed = true;
-                    }
-                    for (pos, opt_pidx) in arg_param_idxs.into_iter().enumerate() {
-                        if let Some(pidx) = opt_pidx {
-                            if is_recursive && next.unproven_params.insert(pidx) {
-                                changed = true;
-                            }
-                            if csum.escapes_params_to_global.contains(&pos)
-                                && next.escapes_params_to_global.insert(pidx)
-                            {
-                                changed = true;
-                            }
-                            if csum.mutates_params.contains(&pos)
-                                && next.mutates_params.insert(pidx)
-                            {
-                                changed = true;
-                            }
-                            if csum.captures_params.contains(&pos)
-                                && next.captures_params.insert(pidx)
-                            {
-                                changed = true;
-                            }
-                            if csum.unproven_params.contains(&pos)
-                                && next.unproven_params.insert(pidx)
-                            {
-                                changed = true;
+                } else {
+                    let resolved_callee = if summaries.contains_key(&callee) {
+                        Some(callee.clone())
+                    } else if !callee.contains('.') {
+                        name.rsplit_once('.')
+                            .map(|(prefix, _)| format!("{prefix}.{callee}"))
+                            .filter(|q| summaries.contains_key(q))
+                    } else {
+                        None
+                    };
+                    if let Some(callee_key) = resolved_callee {
+                        let csum = summaries.get(&callee_key).unwrap();
+                        let is_recursive =
+                            callee_key == *name || calls_reach(&fn_defs, &callee_key, name);
+                        if csum.may_suspend && !next.may_suspend {
+                            next.may_suspend = true;
+                            changed = true;
+                        }
+                        for (pos, opt_pidx) in arg_param_idxs.into_iter().enumerate() {
+                            if let Some(pidx) = opt_pidx {
+                                if is_recursive && next.unproven_params.insert(pidx) {
+                                    changed = true;
+                                }
+                                if csum.escapes_params_to_global.contains(&pos)
+                                    && next.escapes_params_to_global.insert(pidx)
+                                {
+                                    changed = true;
+                                }
+                                if csum.mutates_params.contains(&pos)
+                                    && next.mutates_params.insert(pidx)
+                                {
+                                    changed = true;
+                                }
+                                if csum.captures_params.contains(&pos)
+                                    && next.captures_params.insert(pidx)
+                                {
+                                    changed = true;
+                                }
+                                if csum.unproven_params.contains(&pos)
+                                    && next.unproven_params.insert(pidx)
+                                {
+                                    changed = true;
+                                }
                             }
                         }
-                    }
-                } else {
-                    // Unknown / native / unaudited callee fails closed for forwarded borrows
-                    for opt_pidx in arg_param_idxs {
-                        if let Some(pidx) = opt_pidx {
-                            if next.unproven_params.insert(pidx) {
-                                changed = true;
+                    } else {
+                        // Unknown / native / unaudited callee fails closed for forwarded borrows
+                        for opt_pidx in arg_param_idxs {
+                            if let Some(pidx) = opt_pidx {
+                                if next.unproven_params.insert(pidx) {
+                                    changed = true;
+                                }
                             }
                         }
                     }
@@ -1884,6 +2062,58 @@ fn compute_fn_summaries(
         }
     }
     summaries
+}
+
+fn collect_direct_param_escapes(
+    expr: &Expr,
+    params: &HashMap<String, usize>,
+    out: &mut BTreeSet<usize>,
+) {
+    match &expr.kind {
+        ExprKind::Identifier(name) => {
+            if let Some(&idx) = params.get(name) {
+                out.insert(idx);
+            }
+        }
+        ExprKind::Paren(inner)
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::FieldAccess { object: inner, .. }
+        | ExprKind::Index { object: inner, .. } => {
+            collect_direct_param_escapes(inner, params, out);
+        }
+        ExprKind::Array(items) | ExprKind::Tuple(items) => {
+            for item in items {
+                collect_direct_param_escapes(item, params, out);
+            }
+        }
+        ExprKind::Map(pairs) => {
+            for (k, v) in pairs {
+                collect_direct_param_escapes(k, params, out);
+                collect_direct_param_escapes(v, params, out);
+            }
+        }
+        ExprKind::StructLiteral { fields, .. } => {
+            for f in fields {
+                collect_direct_param_escapes(&f.value, params, out);
+            }
+        }
+        ExprKind::EnumConstructor { args, .. } => {
+            for a in args {
+                collect_direct_param_escapes(a, params, out);
+            }
+        }
+        ExprKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_direct_param_escapes(then_branch, params, out);
+            if let Some(eb) = else_branch {
+                collect_direct_param_escapes(eb, params, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn calls_reach(
@@ -1899,19 +2129,40 @@ fn calls_reach(
         }
         if let Some(def) = fn_defs.get(&curr) {
             let dummy_params = HashMap::new();
+            let mut locals = HashSet::new();
             let mut calls = Vec::new();
             let mut d1 = BTreeSet::new();
             let mut d2 = BTreeSet::new();
             let mut d3 = BTreeSet::new();
+            let mut d4 = BTreeSet::new();
             for s in &def.body {
-                scan_fn_summary_stmt(s, &dummy_params, &mut calls, &mut d1, &mut d2, &mut d3);
+                scan_fn_summary_stmt(
+                    s,
+                    &dummy_params,
+                    &mut locals,
+                    &mut calls,
+                    &mut d1,
+                    &mut d2,
+                    &mut d3,
+                    &mut d4,
+                );
             }
             for (next, _) in calls {
-                if next == target {
+                let resolved = if fn_defs.contains_key(&next) {
+                    next
+                } else if !next.contains('.') {
+                    curr.rsplit_once('.')
+                        .map(|(prefix, _)| format!("{prefix}.{next}"))
+                        .filter(|q| fn_defs.contains_key(q))
+                        .unwrap_or(next)
+                } else {
+                    next
+                };
+                if resolved == target {
                     return true;
                 }
-                if !visited.contains(&next) && fn_defs.contains_key(&next) {
-                    queue.push(next);
+                if !visited.contains(&resolved) && fn_defs.contains_key(&resolved) {
+                    queue.push(resolved);
                 }
             }
         }
@@ -1919,39 +2170,63 @@ fn calls_reach(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_fn_summary_stmt(
     stmt: &Stmt,
     params: &HashMap<String, usize>,
+    locals: &mut HashSet<String>,
     calls: &mut Vec<(String, Vec<Option<usize>>)>,
     returns_param: &mut BTreeSet<usize>,
+    escapes_global: &mut BTreeSet<usize>,
     mutates_param: &mut BTreeSet<usize>,
     captures_param: &mut BTreeSet<usize>,
 ) {
     match &stmt.kind {
-        StmtKind::Local { initializer, .. } => {
+        StmtKind::Local {
+            bindings,
+            initializer,
+        } => {
             if let Some(inits) = initializer {
                 for e in inits {
                     scan_fn_summary_expr(
                         e,
                         params,
+                        locals,
                         calls,
                         returns_param,
+                        escapes_global,
                         mutates_param,
                         captures_param,
                     );
                 }
             }
+            for b in bindings {
+                locals.insert(b.name.clone());
+            }
         }
         StmtKind::Assign { targets, values } => {
-            for t in targets {
+            for (idx, t) in targets.iter().enumerate() {
                 if let Some(root) = expr_root_name(t) {
-                    if let Some(&idx) = params.get(root) {
-                        mutates_param.insert(idx);
+                    if let Some(&pidx) = params.get(root) {
+                        mutates_param.insert(pidx);
+                    } else if !locals.contains(root) {
+                        if let Some(val) = values.get(idx) {
+                            collect_direct_param_escapes(val, params, escapes_global);
+                        }
                     }
                 }
             }
             for v in values {
-                scan_fn_summary_expr(v, params, calls, returns_param, mutates_param, captures_param);
+                scan_fn_summary_expr(
+                    v,
+                    params,
+                    locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
             }
         }
         StmtKind::CompoundAssign { target, value, .. } => {
@@ -1963,8 +2238,10 @@ fn scan_fn_summary_stmt(
             scan_fn_summary_expr(
                 value,
                 params,
+                locals,
                 calls,
                 returns_param,
+                escapes_global,
                 mutates_param,
                 captures_param,
             );
@@ -1972,19 +2249,26 @@ fn scan_fn_summary_stmt(
         StmtKind::Expr(e) => scan_fn_summary_expr(
             e,
             params,
+            locals,
             calls,
             returns_param,
+            escapes_global,
             mutates_param,
             captures_param,
         ),
         StmtKind::Return(vals) => {
             for v in vals {
-                if let Some(root) = expr_root_name(v) {
-                    if let Some(&idx) = params.get(root) {
-                        returns_param.insert(idx);
-                    }
-                }
-                scan_fn_summary_expr(v, params, calls, returns_param, mutates_param, captures_param);
+                collect_direct_param_escapes(v, params, returns_param);
+                scan_fn_summary_expr(
+                    v,
+                    params,
+                    locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
             }
         }
         StmtKind::If {
@@ -1996,41 +2280,61 @@ fn scan_fn_summary_stmt(
             scan_fn_summary_expr(
                 condition,
                 params,
+                locals,
                 calls,
                 returns_param,
+                escapes_global,
                 mutates_param,
                 captures_param,
             );
+            let mut tb_locals = locals.clone();
             for s in then_block {
-                scan_fn_summary_stmt(s, params, calls, returns_param, mutates_param, captures_param);
+                scan_fn_summary_stmt(
+                    s,
+                    params,
+                    &mut tb_locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
             }
             for (c, b) in elseif_branches {
                 scan_fn_summary_expr(
                     c,
                     params,
+                    locals,
                     calls,
                     returns_param,
+                    escapes_global,
                     mutates_param,
                     captures_param,
                 );
+                let mut eb_locals = locals.clone();
                 for s in b {
                     scan_fn_summary_stmt(
                         s,
                         params,
+                        &mut eb_locals,
                         calls,
                         returns_param,
+                        escapes_global,
                         mutates_param,
                         captures_param,
                     );
                 }
             }
             if let Some(eb) = else_block {
+                let mut eb_locals = locals.clone();
                 for s in eb {
                     scan_fn_summary_stmt(
                         s,
                         params,
+                        &mut eb_locals,
                         calls,
                         returns_param,
+                        escapes_global,
                         mutates_param,
                         captures_param,
                     );
@@ -2041,61 +2345,152 @@ fn scan_fn_summary_stmt(
             scan_fn_summary_expr(
                 condition,
                 params,
+                locals,
                 calls,
                 returns_param,
+                escapes_global,
                 mutates_param,
                 captures_param,
             );
+            let mut b_locals = locals.clone();
             for s in body {
-                scan_fn_summary_stmt(s, params, calls, returns_param, mutates_param, captures_param);
+                scan_fn_summary_stmt(
+                    s,
+                    params,
+                    &mut b_locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
             }
         }
         StmtKind::ForNumeric {
+            variable,
             start,
             end,
             step,
             body,
-            ..
         } => {
-            scan_fn_summary_expr(start, params, calls, returns_param, mutates_param, captures_param);
-            scan_fn_summary_expr(end, params, calls, returns_param, mutates_param, captures_param);
-            if let Some(st) = step {
-                scan_fn_summary_expr(st, params, calls, returns_param, mutates_param, captures_param);
-            }
-            for s in body {
-                scan_fn_summary_stmt(s, params, calls, returns_param, mutates_param, captures_param);
-            }
-        }
-        StmtKind::ForIn { iterator, body, .. } => {
             scan_fn_summary_expr(
-                iterator,
+                start,
                 params,
+                locals,
                 calls,
                 returns_param,
+                escapes_global,
                 mutates_param,
                 captures_param,
             );
+            scan_fn_summary_expr(
+                end,
+                params,
+                locals,
+                calls,
+                returns_param,
+                escapes_global,
+                mutates_param,
+                captures_param,
+            );
+            if let Some(st) = step {
+                scan_fn_summary_expr(
+                    st,
+                    params,
+                    locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
+            }
+            let mut b_locals = locals.clone();
+            b_locals.insert(variable.clone());
             for s in body {
-                scan_fn_summary_stmt(s, params, calls, returns_param, mutates_param, captures_param);
+                scan_fn_summary_stmt(
+                    s,
+                    params,
+                    &mut b_locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
+            }
+        }
+        StmtKind::ForIn {
+            variables,
+            iterator,
+            body,
+        } => {
+            scan_fn_summary_expr(
+                iterator,
+                params,
+                locals,
+                calls,
+                returns_param,
+                escapes_global,
+                mutates_param,
+                captures_param,
+            );
+            let mut b_locals = locals.clone();
+            for v in variables {
+                b_locals.insert(v.clone());
+            }
+            for s in body {
+                scan_fn_summary_stmt(
+                    s,
+                    params,
+                    &mut b_locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
             }
         }
         StmtKind::Block(stmts) | StmtKind::Scoped(stmts) => {
+            let mut b_locals = locals.clone();
             for s in stmts {
-                scan_fn_summary_stmt(s, params, calls, returns_param, mutates_param, captures_param);
+                scan_fn_summary_stmt(
+                    s,
+                    params,
+                    &mut b_locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
             }
         }
         StmtKind::Defer(inner) | StmtKind::ErrDefer(inner) => {
-            scan_fn_summary_stmt(inner, params, calls, returns_param, mutates_param, captures_param);
+            scan_fn_summary_stmt(
+                inner,
+                params,
+                locals,
+                calls,
+                returns_param,
+                escapes_global,
+                mutates_param,
+                captures_param,
+            );
         }
         StmtKind::Break | StmtKind::Continue => {}
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_fn_summary_expr(
     expr: &Expr,
     params: &HashMap<String, usize>,
+    locals: &mut HashSet<String>,
     calls: &mut Vec<(String, Vec<Option<usize>>)>,
     returns_param: &mut BTreeSet<usize>,
+    escapes_global: &mut BTreeSet<usize>,
     mutates_param: &mut BTreeSet<usize>,
     captures_param: &mut BTreeSet<usize>,
 ) {
@@ -2109,7 +2504,16 @@ fn scan_fn_summary_expr(
                 calls.push((name, idxs));
             }
             for a in args {
-                scan_fn_summary_expr(a, params, calls, returns_param, mutates_param, captures_param);
+                scan_fn_summary_expr(
+                    a,
+                    params,
+                    locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
             }
         }
         ExprKind::Lambda {
@@ -2127,8 +2531,26 @@ fn scan_fn_summary_expr(
             }
         }
         ExprKind::Binary { left, right, .. } | ExprKind::Range { start: left, end: right, .. } => {
-            scan_fn_summary_expr(left, params, calls, returns_param, mutates_param, captures_param);
-            scan_fn_summary_expr(right, params, calls, returns_param, mutates_param, captures_param);
+            scan_fn_summary_expr(
+                left,
+                params,
+                locals,
+                calls,
+                returns_param,
+                escapes_global,
+                mutates_param,
+                captures_param,
+            );
+            scan_fn_summary_expr(
+                right,
+                params,
+                locals,
+                calls,
+                returns_param,
+                escapes_global,
+                mutates_param,
+                captures_param,
+            );
         }
         ExprKind::Unary { operand, .. }
         | ExprKind::Paren(operand)
@@ -2139,38 +2561,96 @@ fn scan_fn_summary_expr(
             scan_fn_summary_expr(
                 operand,
                 params,
+                locals,
                 calls,
                 returns_param,
+                escapes_global,
                 mutates_param,
                 captures_param,
             );
         }
         ExprKind::Index { object, index } => {
-            scan_fn_summary_expr(object, params, calls, returns_param, mutates_param, captures_param);
-            scan_fn_summary_expr(index, params, calls, returns_param, mutates_param, captures_param);
+            scan_fn_summary_expr(
+                object,
+                params,
+                locals,
+                calls,
+                returns_param,
+                escapes_global,
+                mutates_param,
+                captures_param,
+            );
+            scan_fn_summary_expr(
+                index,
+                params,
+                locals,
+                calls,
+                returns_param,
+                escapes_global,
+                mutates_param,
+                captures_param,
+            );
         }
         ExprKind::MethodCall { receiver, args, .. } => {
             scan_fn_summary_expr(
                 receiver,
                 params,
+                locals,
                 calls,
                 returns_param,
+                escapes_global,
                 mutates_param,
                 captures_param,
             );
             for a in args {
-                scan_fn_summary_expr(a, params, calls, returns_param, mutates_param, captures_param);
+                scan_fn_summary_expr(
+                    a,
+                    params,
+                    locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
             }
         }
         ExprKind::Array(elems) | ExprKind::Tuple(elems) | ExprKind::Return(elems) => {
             for e in elems {
-                scan_fn_summary_expr(e, params, calls, returns_param, mutates_param, captures_param);
+                scan_fn_summary_expr(
+                    e,
+                    params,
+                    locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
             }
         }
         ExprKind::Map(pairs) => {
             for (k, v) in pairs {
-                scan_fn_summary_expr(k, params, calls, returns_param, mutates_param, captures_param);
-                scan_fn_summary_expr(v, params, calls, returns_param, mutates_param, captures_param);
+                scan_fn_summary_expr(
+                    k,
+                    params,
+                    locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
+                scan_fn_summary_expr(
+                    v,
+                    params,
+                    locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
             }
         }
         ExprKind::StructLiteral { fields, .. } => {
@@ -2178,8 +2658,10 @@ fn scan_fn_summary_expr(
                 scan_fn_summary_expr(
                     &f.value,
                     params,
+                    locals,
                     calls,
                     returns_param,
+                    escapes_global,
                     mutates_param,
                     captures_param,
                 );
@@ -2187,7 +2669,16 @@ fn scan_fn_summary_expr(
         }
         ExprKind::EnumConstructor { args, .. } => {
             for a in args {
-                scan_fn_summary_expr(a, params, calls, returns_param, mutates_param, captures_param);
+                scan_fn_summary_expr(
+                    a,
+                    params,
+                    locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
             }
         }
         ExprKind::If {
@@ -2198,16 +2689,20 @@ fn scan_fn_summary_expr(
             scan_fn_summary_expr(
                 condition,
                 params,
+                locals,
                 calls,
                 returns_param,
+                escapes_global,
                 mutates_param,
                 captures_param,
             );
             scan_fn_summary_expr(
                 then_branch,
                 params,
+                locals,
                 calls,
                 returns_param,
+                escapes_global,
                 mutates_param,
                 captures_param,
             );
@@ -2215,16 +2710,28 @@ fn scan_fn_summary_expr(
                 scan_fn_summary_expr(
                     eb,
                     params,
+                    locals,
                     calls,
                     returns_param,
+                    escapes_global,
                     mutates_param,
                     captures_param,
                 );
             }
         }
         ExprKind::Block(stmts) | ExprKind::EffectBlock(stmts) => {
+            let mut b_locals = locals.clone();
             for s in stmts {
-                scan_fn_summary_stmt(s, params, calls, returns_param, mutates_param, captures_param);
+                scan_fn_summary_stmt(
+                    s,
+                    params,
+                    &mut b_locals,
+                    calls,
+                    returns_param,
+                    escapes_global,
+                    mutates_param,
+                    captures_param,
+                );
             }
         }
         ExprKind::Literal(_) | ExprKind::Identifier(_) | ExprKind::RegexLiteral { .. } => {}

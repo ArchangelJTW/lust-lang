@@ -50,10 +50,11 @@ pub struct ValueKey {
 }
 
 impl ValueKey {
+    #[inline]
     pub fn from_value(value: &Value) -> Self {
         ValueKey {
-            original: value.clone(),
-            hashed: value.clone(),
+            original: value.fast_clone(),
+            hashed: value.fast_clone(),
         }
     }
 
@@ -69,11 +70,30 @@ impl ValueKey {
     }
 
     pub fn to_value(&self) -> Value {
-        self.original.clone()
+        self.original.fast_clone()
     }
 
     pub fn owned_values(&self) -> (&Value, &Value) {
         (&self.original, &self.hashed)
+    }
+}
+
+/// Zero-copy lookup key wrapper for `LustMap` (`HashMap<ValueKey, Value, DefaultHashBuilder>`).
+/// Avoids cloning `Value` / bumping `Rc` refcounts twice on every `map.get` / `OP_GET_FIELD`.
+#[derive(Clone, Copy)]
+pub struct ValueKeyRef<'a>(pub &'a Value);
+
+impl Hash for ValueKeyRef<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_value_for_key(self.0, state);
+    }
+}
+
+impl hashbrown::Equivalent<ValueKey> for ValueKeyRef<'_> {
+    #[inline]
+    fn equivalent(&self, key: &ValueKey) -> bool {
+        value_key_eq(self.0, &key.hashed)
     }
 }
 
@@ -97,9 +117,10 @@ impl fmt::Display for ValueKey {
 }
 
 impl From<Value> for ValueKey {
+    #[inline]
     fn from(value: Value) -> Self {
         ValueKey {
-            original: value.clone(),
+            original: value.fast_clone(),
             hashed: value,
         }
     }
@@ -180,24 +201,15 @@ fn unwrap_lua_value_for_key(value: &Value) -> Value {
     value.clone()
 }
 
+#[inline]
 fn value_key_eq(left: &Value, right: &Value) -> bool {
     use Value::*;
 
-    // Check if either side is a LuaValue enum and unwrap if needed
-    let is_lua_value_left = matches!(left, Enum(object) if object.enum_name == "LuaValue");
-    let is_lua_value_right = matches!(right, Enum(object) if object.enum_name == "LuaValue");
-
-    // If either side is a LuaValue, unwrap both and compare
-    if is_lua_value_left || is_lua_value_right {
-        let unwrapped_left = unwrap_lua_value_for_key(left);
-        let unwrapped_right = unwrap_lua_value_for_key(right);
-        return value_key_eq(&unwrapped_left, &unwrapped_right);
-    }
-
     match (left, right) {
+        (Int(a), Int(b)) => a == b,
+        (String(a), String(b)) => Rc::ptr_eq(a, b) || a == b,
         (Nil, Nil) => true,
         (Bool(a), Bool(b)) => a == b,
-        (Int(a), Int(b)) => a == b,
         (Float(a), Float(b)) => {
             if float_is_nan(*a) && float_is_nan(*b) {
                 true
@@ -205,12 +217,20 @@ fn value_key_eq(left: &Value, right: &Value) -> bool {
                 a == b
             }
         }
-        (String(a), String(b)) => a == b,
         (Array(a), Array(b)) => Rc::ptr_eq(a, b),
         (Tuple(a), Tuple(b)) => Rc::ptr_eq(a, b),
         (Map(a), Map(b)) => Rc::ptr_eq(a, b),
         (Struct(a), Struct(b)) => Rc::ptr_eq(a, b),
         (WeakStruct(a), WeakStruct(b)) => Weak::ptr_eq(a.inner(), b.inner()),
+        (Enum(a), _) if a.enum_name == "LuaValue" => {
+            let unwrapped_left = unwrap_lua_value_for_key(left);
+            let unwrapped_right = unwrap_lua_value_for_key(right);
+            value_key_eq(&unwrapped_left, &unwrapped_right)
+        }
+        (_, Enum(b)) if b.enum_name == "LuaValue" => {
+            let unwrapped_right = unwrap_lua_value_for_key(right);
+            value_key_eq(left, &unwrapped_right)
+        }
         // Two enum values are the same value or two unit values of the
         // same variant; a payload is identity, not contents.
         (Enum(a), Enum(b)) => {
@@ -229,26 +249,25 @@ fn value_key_eq(left: &Value, right: &Value) -> bool {
     }
 }
 
+#[inline]
 fn hash_value_for_key<H: Hasher>(value: &Value, state: &mut H) {
     use Value::*;
 
-    // Check if this is a LuaValue enum and unwrap it for consistent hashing
-    if matches!(value, Enum(object) if object.enum_name == "LuaValue") {
-        let unwrapped = unwrap_lua_value_for_key(value);
-        return hash_value_for_key(&unwrapped, state);
-    }
-
     match value {
+        Int(i) => {
+            2u8.hash(state);
+            i.hash(state);
+        }
+        String(s) => {
+            4u8.hash(state);
+            s.hash(state);
+        }
         Nil => {
             0u8.hash(state);
         }
         Bool(b) => {
             1u8.hash(state);
             b.hash(state);
-        }
-        Int(i) => {
-            2u8.hash(state);
-            i.hash(state);
         }
         Float(f) => {
             3u8.hash(state);
@@ -258,10 +277,6 @@ fn hash_value_for_key<H: Hasher>(value: &Value, state: &mut H) {
                 let norm = if *f == 0.0 { 0.0 } else { *f };
                 float_to_hash_bits(norm).hash(state);
             }
-        }
-        String(s) => {
-            4u8.hash(state);
-            s.hash(state);
         }
         Array(arr) => {
             5u8.hash(state);
@@ -282,6 +297,10 @@ fn hash_value_for_key<H: Hasher>(value: &Value, state: &mut H) {
         WeakStruct(weak) => {
             9u8.hash(state);
             (weak.object_ptr() as usize).hash(state);
+        }
+        Enum(object) if object.enum_name == "LuaValue" => {
+            let unwrapped = unwrap_lua_value_for_key(value);
+            hash_value_for_key(&unwrapped, state);
         }
         Enum(object) => {
             10u8.hash(state);
@@ -838,13 +857,15 @@ impl LustArray {
         self as *const Self
     }
 
-    #[inline]
+    #[inline(always)]
     fn invalidate_flat_cache(&self) {
         let next = self.generation.get().wrapping_add(1).max(1);
         self.generation.set(next);
-        if self.has_flat_cache.replace(false) {
-            self.flat_cache.replace(None);
+        if !self.has_flat_cache.get() {
+            return;
         }
+        self.has_flat_cache.set(false);
+        self.flat_cache.replace(None);
     }
 
     #[inline]
@@ -1421,6 +1442,40 @@ pub enum Value {
     Task(TaskHandle),
 }
 
+/// Returns `true` when `value` holds no strong references to any mutable container
+/// (`Array`, `Map`, `Struct`, `Closure`, `Iterator`, or non-plain `Enum`/`Tuple`).
+/// Used to decide whether a `StructObject` can be classified as an all-leaf struct.
+#[inline(always)]
+pub fn is_strict_scalar_leaf(value: &Value) -> bool {
+    match value {
+        Value::Nil
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::String(_)
+        | Value::Function(_)
+        | Value::NativeFunction(_)
+        | Value::WeakStruct(_)
+        | Value::Task(_) => true,
+        Value::Enum(obj) => obj
+            .values
+            .as_ref()
+            .is_none_or(|vals| vals.iter().all(Value::is_plain)),
+        Value::Tuple(items) => items.iter().all(Value::is_plain),
+        _ => false,
+    }
+}
+
+/// Returns `true` when `value` cannot participate in a reference cycle and can safely
+/// skip `CycleCollector::register_value` (including all-leaf `StructObject` instances).
+#[inline(always)]
+pub fn is_cycle_leaf_value(value: &Value) -> bool {
+    match value {
+        Value::Struct(s) => s.is_leaf_struct.get(),
+        other => is_strict_scalar_leaf(other),
+    }
+}
+
 /// A struct value: its name, its layout and its fields, in one allocation
 /// that every clone of the value shares.
 #[repr(C)]
@@ -1428,14 +1483,19 @@ pub struct StructObject {
     pub name: Name,
     pub layout: Rc<StructLayout>,
     pub fields: RefCell<Vec<Value>>,
+    /// `true` while every field holds a strict scalar leaf value (cannot close a cycle).
+    /// Cleared to `false` on the first write of a non-leaf value via `SetField` / `SetFieldSlot`.
+    pub is_leaf_struct: Cell<bool>,
 }
 
 impl StructObject {
     pub fn new(name: impl Into<Name>, layout: Rc<StructLayout>, fields: Vec<Value>) -> Rc<Self> {
+        let is_leaf = fields.iter().all(is_strict_scalar_leaf);
         Rc::new(Self {
             name: name.into(),
             layout,
             fields: RefCell::new(fields),
+            is_leaf_struct: Cell::new(is_leaf),
         })
     }
 }
@@ -1563,10 +1623,12 @@ impl Upvalue {
         }
     }
 
+    #[inline]
     pub fn get(&self) -> Value {
-        self.value.borrow().clone()
+        self.value.borrow().fast_clone()
     }
 
+    #[inline]
     pub fn set(&self, value: Value) {
         *self.value.borrow_mut() = value;
     }
@@ -1997,6 +2059,9 @@ impl Value {
                 let mut borrowed = object.fields.borrow_mut();
                 if index < borrowed.len() {
                     let canonical = object.layout.canonicalize_field_value(index, value)?;
+                    if !is_strict_scalar_leaf(&canonical) {
+                        object.is_leaf_struct.set(false);
+                    }
                     borrowed[index] = canonical;
                     Ok(())
                 } else {
@@ -2235,6 +2300,7 @@ impl fmt::Debug for Value {
                     name,
                     layout,
                     fields,
+                    ..
                 } = object.as_ref();
                 let borrowed = fields.borrow();
                 let mut display_fields = Vec::with_capacity(borrowed.len());
@@ -2419,6 +2485,7 @@ impl fmt::Display for Value {
                     name,
                     layout,
                     fields,
+                    ..
                 } = object.as_ref();
                 let borrowed = fields.borrow();
                 write!(f, "{} {{", name)?;
@@ -3250,9 +3317,14 @@ fn record_specialized_cache_probe() {
 }
 
 #[cfg(feature = "std")]
+static SPECIALIZED_ACTIVE_GLOBAL: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "std")]
 #[inline(always)]
 fn specialized_cache_inc() {
     SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.set(c.get() + 1));
+    SPECIALIZED_ACTIVE_GLOBAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(feature = "std")]
@@ -3267,6 +3339,22 @@ fn specialized_cache_sub(removed: usize) {
             );
             c.set(cur.saturating_sub(removed));
         });
+        SPECIALIZED_ACTIVE_GLOBAL.fetch_sub(removed, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Fast-path inline check for whether any specialized JIT array cache is currently active.
+/// Returns `false` via a single relaxed atomic load whenever `--jit=off` or `--backend cranelift`
+/// is running with no Dynasm specialized array caches populated.
+#[inline(always)]
+pub fn has_active_specialized_caches() -> bool {
+    #[cfg(feature = "std")]
+    {
+        SPECIALIZED_ACTIVE_GLOBAL.load(core::sync::atomic::Ordering::Relaxed) != 0
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        false
     }
 }
 

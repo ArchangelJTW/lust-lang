@@ -40,6 +40,9 @@ impl Compiler {
             }
             panic!("Register overflow (max 255 registers per function)");
         }
+        self.functions[self.current_function]
+            .register_types
+            .remove(&reg);
         reg
     }
 
@@ -287,6 +290,12 @@ impl Compiler {
         self.functions[self.current_function]
             .register_types
             .insert(reg, type_kind);
+    }
+
+    pub(super) fn get_register_type(&self, reg: Register) -> Option<&crate::ast::TypeKind> {
+        self.functions
+            .get(self.current_function)
+            .and_then(|f| f.register_types.get(&reg))
     }
 
     pub(super) fn move_result(&mut self, dest: Register, src: Register, expression_start: usize) {

@@ -588,6 +588,7 @@ pub struct MirFunction {
     pub proven_in_bounds: hashbrown::HashMap<usize, Vec<(LocalId, LocalId)>>,
     pub cleanup_blocks: Vec<MirCleanupEntry>,
     pub sroa_decomposed_structs: Vec<SroaStructRecipe>,
+    pub struct_layouts: Vec<MirStructLayout>,
 }
 
 impl MirFunction {
@@ -633,6 +634,7 @@ impl MirFunction {
             proven_in_bounds: hashbrown::HashMap::new(),
             cleanup_blocks: Vec::new(),
             sroa_decomposed_structs: Vec::new(),
+            struct_layouts: Vec::new(),
         }
     }
 
@@ -1645,6 +1647,8 @@ impl MirFunction {
         // Phase D: Conservative loop-induction bounds proof per reducible loop
         let mut proven_in_bounds: hashbrown::HashMap<usize, Vec<(LocalId, LocalId)>> =
             hashbrown::HashMap::new();
+        let mut proven_in_bounds_at_stmt: hashbrown::HashMap<(usize, usize), Vec<(LocalId, LocalId)>> =
+            hashbrown::HashMap::new();
 
         for lp in &reducible_loops {
             // H1: ZERO Terminator::Call and ZERO Rvalue::Closure anywhere in the loop body
@@ -1712,9 +1716,9 @@ impl MirFunction {
                 continue;
             };
 
-            let Some(candidate_arrays) = idx_access_arrays.get(&j_loc) else {
+            if idx_access_arrays.is_empty() {
                 continue;
-            };
+            }
 
             // Verify `j_loc` is NOT assigned in `hdr` and has EXACTLY ONE assignment in `body`
             if block_assigns_local(&self.blocks[lp.hdr], j_loc) {
@@ -1863,41 +1867,194 @@ impl MirFunction {
                 }
             }
 
-            // H3b + H1b: Check each candidate array accessed by `j_loc`
-            for &arr_loc in candidate_arrays {
-                if arr_loc == j_loc
-                    || excluded_locals.contains(&arr_loc.0)
-                    || assigned_in_loop.contains(&arr_loc.0)
-                    || !matches!(
-                        self.locals.get(arr_loc.0).map(|d| &d.ty),
-                        Some(MirType::Array(_))
-                    )
+            // H3b + H1b: Check each candidate array accessed directly by `j_loc`
+            if let Some(candidate_arrays) = idx_access_arrays.get(&j_loc) {
+                for &arr_loc in candidate_arrays {
+                    if arr_loc == j_loc
+                        || excluded_locals.contains(&arr_loc.0)
+                        || assigned_in_loop.contains(&arr_loc.0)
+                        || !matches!(
+                            self.locals.get(arr_loc.0).map(|d| &d.ty),
+                            Some(MirType::Array(_))
+                        )
+                    {
+                        continue;
+                    }
+                    // Shifted-RawWords alias safety for non-unaliased/param arrays
+                    if !unaliased_local_arrays.contains(&arr_loc.0) {
+                        let other_array_written = has_non_local_index_write
+                            || written_index_roots.iter().any(|&w| w != arr_loc.0);
+                        if other_array_written {
+                            continue;
+                        }
+                    }
+                    let Some(len_facts) = hdr_facts.len_rels.get(&arr_loc.0) else {
+                        continue;
+                    };
+                    if !len_facts_prove_bound(len_facts, &bound_op, is_inclusive, hdr_facts) {
+                        continue;
+                    }
+
+                    // Feed `proven_in_bounds` for all pre-step blocks in `lp.body \ {lp.hdr}`
+                    for &b in &lp.body {
+                        if b == lp.hdr || post_step.contains(&b) {
+                            continue;
+                        }
+                        let entry = proven_in_bounds.entry(b).or_default();
+                        if !entry.contains(&(arr_loc, j_loc)) {
+                            entry.push((arr_loc, j_loc));
+                        }
+                    }
+                }
+            }
+
+            // H3c (`NG-W16-5`): Affine shifted index `idx_loc = offset + j_loc` (e.g. `BENCH-NG-14`
+            // where `offset = (outer + mid) & 511 <= 511` and `0 <= k < 16` => `0 <= idx <= 526 < 1024`).
+            for (&idx_loc, candidate_arrays) in &idx_access_arrays {
+                if idx_loc == j_loc
+                    || excluded_locals.contains(&idx_loc.0)
+                    || !self
+                        .locals
+                        .get(idx_loc.0)
+                        .is_some_and(|d| d.ty == MirType::Int)
+                    || block_assigns_local(&self.blocks[lp.hdr], idx_loc)
                 {
                     continue;
                 }
-                // Shifted-RawWords alias safety for non-unaliased/param arrays
-                if !unaliased_local_arrays.contains(&arr_loc.0) {
-                    let other_array_written = has_non_local_index_write
-                        || written_index_roots.iter().any(|&w| w != arr_loc.0);
-                    if other_array_written {
-                        continue;
+                let mut idx_assigns: Vec<(usize, usize)> = Vec::new();
+                for &b in &lp.body {
+                    for (s_idx, stmt) in self.blocks[b].statements.iter().enumerate() {
+                        if matches!(stmt, Statement::Assign(Place::Local(d), _, _) if *d == idx_loc)
+                        {
+                            idx_assigns.push((b, s_idx));
+                        }
                     }
                 }
-                let Some(len_facts) = hdr_facts.len_rels.get(&arr_loc.0) else {
+                if idx_assigns.len() != 1 {
+                    continue;
+                }
+                let (idx_def_bb, idx_def_stmt) = idx_assigns[0];
+                if idx_def_bb == lp.hdr
+                    || post_step.contains(&idx_def_bb)
+                    || (idx_def_bb == step_bb && idx_def_stmt >= step_stmt_idx)
+                {
+                    continue;
+                }
+                let idx_def_in_inner_loop = reducible_loops.iter().any(|other| {
+                    other.hdr != lp.hdr
+                        && lp.body.contains(&other.hdr)
+                        && other.body.len() < lp.body.len()
+                        && other.body.contains(&idx_def_bb)
+                });
+                if idx_def_in_inner_loop {
+                    continue;
+                }
+                let Some(offset_op) =
+                    extract_affine_add_offset(&self.blocks[idx_def_bb], idx_def_stmt, idx_loc, j_loc)
+                else {
                     continue;
                 };
-                if !len_facts_prove_bound(len_facts, &bound_op, is_inclusive, hdr_facts) {
+                let offset_iv = match &offset_op {
+                    Operand::Constant(MirConstant::Int(c)) => IntInterval { lo: *c, hi: *c },
+                    Operand::Copy(Place::Local(o_loc)) | Operand::Move(Place::Local(o_loc)) => {
+                        if *o_loc == j_loc
+                            || *o_loc == idx_loc
+                            || excluded_locals.contains(&o_loc.0)
+                            || assigned_in_loop.contains(&o_loc.0)
+                            || !self
+                                .locals
+                                .get(o_loc.0)
+                                .is_some_and(|d| d.ty == MirType::Int)
+                        {
+                            continue;
+                        }
+                        hdr_facts.interval(*o_loc)
+                    }
+                    _ => continue,
+                };
+                if offset_iv.lo < 0 || offset_iv.hi == i64::MAX {
                     continue;
                 }
+                let max_idx_i128 = (offset_iv.hi as i128) + (max_j_in_body as i128);
+                if max_idx_i128 < 0 || max_idx_i128 > (i64::MAX as i128) {
+                    continue;
+                }
+                let max_idx = max_idx_i128 as i64;
+                let max_idx_op = Operand::Constant(MirConstant::Int(max_idx));
 
-                // Feed `proven_in_bounds` for all pre-step blocks in `lp.body \ {lp.hdr}`
-                for &b in &lp.body {
-                    if b == lp.hdr || post_step.contains(&b) {
+                // Blocks in `lp.body \ {lp.hdr}` reachable from successors of `idx_def_bb` (not post_step)
+                let mut post_idx_def: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
+                let mut pd_queue: VecDeque<usize> = VecDeque::new();
+                if let Some(term) = &self.blocks[idx_def_bb].terminator {
+                    for succ in term.successors() {
+                        if succ != lp.hdr
+                            && lp.body.contains(&succ)
+                            && !post_step.contains(&succ)
+                            && post_idx_def.insert(succ)
+                        {
+                            pd_queue.push_back(succ);
+                        }
+                    }
+                }
+                while let Some(cur) = pd_queue.pop_front() {
+                    if let Some(term) = &self.blocks[cur].terminator {
+                        for succ in term.successors() {
+                            if succ != lp.hdr
+                                && lp.body.contains(&succ)
+                                && !post_step.contains(&succ)
+                                && post_idx_def.insert(succ)
+                            {
+                                pd_queue.push_back(succ);
+                            }
+                        }
+                    }
+                }
+
+                for &arr_loc in candidate_arrays {
+                    if arr_loc == j_loc
+                        || arr_loc == idx_loc
+                        || excluded_locals.contains(&arr_loc.0)
+                        || assigned_in_loop.contains(&arr_loc.0)
+                        || !matches!(
+                            self.locals.get(arr_loc.0).map(|d| &d.ty),
+                            Some(MirType::Array(_))
+                        )
+                    {
                         continue;
                     }
-                    let entry = proven_in_bounds.entry(b).or_default();
-                    if !entry.contains(&(arr_loc, j_loc)) {
-                        entry.push((arr_loc, j_loc));
+                    if !unaliased_local_arrays.contains(&arr_loc.0) {
+                        let other_array_written = has_non_local_index_write
+                            || written_index_roots.iter().any(|&w| w != arr_loc.0);
+                        if other_array_written {
+                            continue;
+                        }
+                    }
+                    let Some(len_facts) = hdr_facts.len_rels.get(&arr_loc.0) else {
+                        continue;
+                    };
+                    if !len_facts_prove_bound(len_facts, &max_idx_op, true, hdr_facts) {
+                        continue;
+                    }
+
+                    // Mark `(arr_loc, idx_loc)` proven for all statements after `idx_def_stmt` in `idx_def_bb`
+                    for s_after in (idx_def_stmt + 1)..self.blocks[idx_def_bb].statements.len() {
+                        let entry = proven_in_bounds_at_stmt
+                            .entry((idx_def_bb, s_after))
+                            .or_default();
+                        if !entry.contains(&(arr_loc, idx_loc)) {
+                            entry.push((arr_loc, idx_loc));
+                        }
+                    }
+                    // And at block entry for `idx_def_bb` (if dominated/not read before def) + successors in `lp.body`
+                    for &b in &post_idx_def {
+                        let entry = proven_in_bounds.entry(b).or_default();
+                        if !entry.contains(&(arr_loc, idx_loc)) {
+                            entry.push((arr_loc, idx_loc));
+                        }
+                    }
+                    let def_entry = proven_in_bounds.entry(idx_def_bb).or_default();
+                    if !def_entry.contains(&(arr_loc, idx_loc)) {
+                        def_entry.push((arr_loc, idx_loc));
                     }
                 }
             }
@@ -1905,8 +2062,39 @@ impl MirFunction {
 
         // Phase E (`NG-W15-6`): Direct interval/length-relation bounds proofs from Phase C
         // (e.g., `n = array.len(stack); if n >= 4 then mid = n / 2; if stack[mid] is Ok(v)`).
-        let mut proven_in_bounds_at_stmt: hashbrown::HashMap<(usize, usize), Vec<(LocalId, LocalId)>> =
+        // Collect all `(arr_idx, idx_loc)` pairs actually indexed anywhere in the function so
+        // constant-length interval proofs stay targeted and zero-overhead.
+        let mut indexed_pairs_by_arr: hashbrown::HashMap<usize, Vec<LocalId>> =
             hashbrown::HashMap::new();
+        for b in 0..num_blocks {
+            if !reachable.contains(&b) {
+                continue;
+            }
+            let mut local_idx_map: hashbrown::HashMap<LocalId, Vec<LocalId>> =
+                hashbrown::HashMap::new();
+            for stmt in &self.blocks[b].statements {
+                if let Statement::Assign(lhs, rval, _) = stmt {
+                    if let Place::Index(base, idx) = lhs
+                        && let Place::Local(arr_loc) = base.as_ref()
+                    {
+                        let e = local_idx_map.entry(*idx).or_default();
+                        if !e.contains(arr_loc) {
+                            e.push(*arr_loc);
+                        }
+                    }
+                    collect_rvalue_index_accesses(rval, &mut local_idx_map);
+                }
+            }
+            for (idx_loc, arrs) in local_idx_map {
+                for arr_loc in arrs {
+                    let e = indexed_pairs_by_arr.entry(arr_loc.0).or_default();
+                    if !e.contains(&idx_loc) {
+                        e.push(idx_loc);
+                    }
+                }
+            }
+        }
+
         for b in 0..num_blocks {
             if !reachable.contains(&b) {
                 continue;
@@ -1914,7 +2102,7 @@ impl MirFunction {
             let Some(in_facts) = facts_in[b].as_ref() else {
                 continue;
             };
-            // Block-entry proven pairs: `idx.lo >= 0` and `len(arr) > idx`.
+            // Block-entry proven pairs: `idx.lo >= 0` and (`len(arr) > idx` or `idx.hi < const_len`).
             for (&arr_idx, arr_facts) in &in_facts.len_rels {
                 if !matches!(self.locals.get(arr_idx).map(|d| &d.ty), Some(MirType::Array(_))) {
                     continue;
@@ -1932,10 +2120,32 @@ impl MirFunction {
                         }
                     }
                 }
+                if let Some(cand_idxs) = indexed_pairs_by_arr.get(&arr_idx) {
+                    for &idx_loc in cand_idxs {
+                        if arr_idx == idx_loc.0 || excluded_locals.contains(&idx_loc.0) {
+                            continue;
+                        }
+                        let iv = in_facts.interval(idx_loc);
+                        if iv.lo >= 0 && iv.hi < i64::MAX {
+                            let ok = arr_facts.iter().any(|lf| match lf {
+                                LenFact::GeConst(k) => iv.hi < *k,
+                                LenFact::GtConst(k) => iv.hi <= *k,
+                                _ => false,
+                            });
+                            if ok {
+                                let entry = proven_in_bounds.entry(b).or_default();
+                                let pair = (LocalId(arr_idx), idx_loc);
+                                if !entry.contains(&pair) {
+                                    entry.push(pair);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
-            // Per-statement proven pairs inside `b` (handles `mid = n / 2` defined in the
-            // same block as `if stack[mid] is Ok(v)`).
+            // Per-statement proven pairs inside `b` (handles `mid = n / 2` and `idx = offset + k`
+            // defined in the same block as `if arr[idx] is Ok(v)`).
             let mut cur_facts = in_facts.clone();
             for (stmt_idx, stmt) in self.blocks[b].statements.iter().enumerate() {
                 if !cur_facts.len_rels.is_empty() {
@@ -1959,9 +2169,35 @@ impl MirFunction {
                                 }
                             }
                         }
+                        if let Some(cand_idxs) = indexed_pairs_by_arr.get(&arr_idx) {
+                            for &idx_loc in cand_idxs {
+                                if arr_idx == idx_loc.0 || excluded_locals.contains(&idx_loc.0) {
+                                    continue;
+                                }
+                                let iv = cur_facts.interval(idx_loc);
+                                if iv.lo >= 0 && iv.hi < i64::MAX {
+                                    let ok = arr_facts.iter().any(|lf| match lf {
+                                        LenFact::GeConst(k) => iv.hi < *k,
+                                        LenFact::GtConst(k) => iv.hi <= *k,
+                                        _ => false,
+                                    });
+                                    if ok {
+                                        let pair = (LocalId(arr_idx), idx_loc);
+                                        if !pairs.contains(&pair) {
+                                            pairs.push(pair);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     if !pairs.is_empty() {
-                        proven_in_bounds_at_stmt.insert((b, stmt_idx), pairs);
+                        let entry = proven_in_bounds_at_stmt.entry((b, stmt_idx)).or_default();
+                        for pair in pairs {
+                            if !entry.contains(&pair) {
+                                entry.push(pair);
+                            }
+                        }
                     }
                 }
                 self.transfer_statement_facts(stmt, &mut cur_facts, excluded_locals);
@@ -1986,6 +2222,7 @@ impl MirFunction {
         let mut copy_from: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); n_locals];
         let mut read_count = vec![0usize; n_locals];
         let mut escaped = vec![false; n_locals];
+        let mut mutated_via_index_or_push = vec![false; n_locals];
 
         for &p in &self.params {
             if p.0 < n_locals {
@@ -2036,6 +2273,7 @@ impl MirFunction {
                             if let Place::Local(b_loc) = base.as_ref() {
                                 if b_loc.0 < n_locals {
                                     read_count[b_loc.0] += 1;
+                                    mutated_via_index_or_push[b_loc.0] = true;
                                 }
                             } else {
                                 mark_place_escaped(base, &mut escaped, &mut read_count);
@@ -2111,6 +2349,9 @@ impl MirFunction {
                             {
                                 if loc.0 < n_locals {
                                     read_count[loc.0] += 1;
+                                    if matches!(callee.as_str(), "array.push" | "table.push") {
+                                        mutated_via_index_or_push[loc.0] = true;
+                                    }
                                 }
                             } else {
                                 mark_operand_escaped(arg, &mut escaped, &mut read_count);
@@ -2174,7 +2415,9 @@ impl MirFunction {
             }
         }
 
-        // Also ensure no `valid_unaliased` local was copied into ANY OTHER local (making an alias!)
+        // Also ensure no `valid_unaliased` local was copied into ANY mutating/escaping OTHER local.
+        // A strictly read-only, non-escaping, non-re-copied parameter alias (e.g. `inner_kernel_arr = Copy(data)`
+        // after `MirInliner` inlines a read-only helper in `BENCH-NG-14`) cannot mutate `data` or its length.
         let mut copied_out_to_other = vec![false; n_locals];
         for dst in 0..n_locals {
             for &(_, _, src) in &copy_from[dst] {
@@ -2183,7 +2426,19 @@ impl MirFunction {
                 }
             }
         }
-        valid_unaliased.retain(|&loc| !copied_out_to_other[loc]);
+        let mut unsafe_copy_out = vec![false; n_locals];
+        for dst in 0..n_locals {
+            let dst_is_readonly_leaf_alias =
+                !escaped[dst] && !mutated_via_index_or_push[dst] && !copied_out_to_other[dst];
+            if !dst_is_readonly_leaf_alias {
+                for &(_, _, src) in &copy_from[dst] {
+                    if src < n_locals && src != dst {
+                        unsafe_copy_out[src] = true;
+                    }
+                }
+            }
+        }
+        valid_unaliased.retain(|&loc| !unsafe_copy_out[loc]);
         valid_unaliased
     }
 
@@ -2896,6 +3151,20 @@ fn eval_rvalue_interval(rval: &Rvalue, facts: &BlockFacts) -> Option<IntInterval
                 IntInterval::TOP
             }
         }
+        Rvalue::BinaryOp(MirBinaryOp::BitAnd, lhs, Operand::Constant(MirConstant::Int(mask)))
+            if *mask >= 0 =>
+        {
+            let a = facts.operand_interval(lhs);
+            let hi = if a.lo >= 0 { (*mask).min(a.hi) } else { *mask };
+            IntInterval { lo: 0, hi }
+        }
+        Rvalue::BinaryOp(MirBinaryOp::BitAnd, Operand::Constant(MirConstant::Int(mask)), rhs)
+            if *mask >= 0 =>
+        {
+            let b = facts.operand_interval(rhs);
+            let hi = if b.lo >= 0 { (*mask).min(b.hi) } else { *mask };
+            IntInterval { lo: 0, hi }
+        }
         _ => IntInterval::TOP,
     };
     if iv.is_top() { None } else { Some(iv) }
@@ -3217,6 +3486,63 @@ fn extract_induction_step(
                     }
                 }
                 return Some(step);
+            }
+        }
+    }
+    None
+}
+
+fn extract_affine_add_offset(
+    block: &BasicBlock,
+    def_stmt_idx: usize,
+    idx_loc: LocalId,
+    j_loc: LocalId,
+) -> Option<Operand> {
+    let Statement::Assign(Place::Local(dst), rval, _) = block.statements.get(def_stmt_idx)? else {
+        return None;
+    };
+    if *dst != idx_loc {
+        return None;
+    }
+    let match_add = |rv: &Rvalue| -> Option<Operand> {
+        let Rvalue::BinaryOp(MirBinaryOp::Add, l, r) = rv else {
+            return None;
+        };
+        if operand_local_id(l) == Some(j_loc) {
+            Some(r.clone())
+        } else if operand_local_id(r) == Some(j_loc) {
+            Some(l.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(off) = match_add(rval) {
+        return Some(off);
+    }
+    // 2-statement temporary form: `_tmp = offset + j; idx = move/copy _tmp;`
+    if let Rvalue::Use(op) = rval
+        && let Some(tmp_loc) = operand_local_id(op)
+        && tmp_loc != idx_loc
+        && tmp_loc != j_loc
+    {
+        for (i, stmt) in block.statements[..def_stmt_idx].iter().enumerate().rev() {
+            if let Statement::Assign(Place::Local(d), prev_rval, _) = stmt
+                && *d == tmp_loc
+            {
+                let off = match_add(prev_rval)?;
+                let off_loc = operand_local_id(&off);
+                for mid in &block.statements[i + 1..def_stmt_idx] {
+                    if let Statement::Assign(Place::Local(md), _, _) = mid {
+                        if *md == j_loc || *md == tmp_loc || Some(*md) == off_loc {
+                            return None;
+                        }
+                    } else if let Statement::StorageDead(md, _) = mid {
+                        if *md == j_loc || *md == tmp_loc || Some(*md) == off_loc {
+                            return None;
+                        }
+                    }
+                }
+                return Some(off);
             }
         }
     }

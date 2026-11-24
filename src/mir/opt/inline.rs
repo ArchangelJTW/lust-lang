@@ -1,6 +1,7 @@
 use crate::ast::Span;
+use crate::data::layout::CanonicalTypeTag;
 use crate::mir::ir::*;
-use alloc::{format, string::String, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec::Vec};
 use hashbrown::{HashMap, HashSet};
 
 /// Configuration for MIR-to-MIR inlining pass.
@@ -82,10 +83,12 @@ impl MirInliner {
             .iter()
             .map(|f| (f.signature.name.clone(), f.clone()))
             .collect();
+        let struct_layouts = collect_module_struct_layouts(module);
 
         let mut overall_changed = false;
         for func in &mut module.functions {
-            overall_changed |= self.inline_function(func, &callees);
+            overall_changed |=
+                self.inline_function_with_layouts(func, &callees, &struct_layouts);
         }
 
         overall_changed
@@ -97,69 +100,120 @@ impl MirInliner {
         caller: &mut MirFunction,
         callees: &HashMap<String, MirFunction>,
     ) -> bool {
+        let mut struct_layouts = HashMap::new();
+        register_fn_struct_layouts(&mut struct_layouts, caller);
+        for f in callees.values() {
+            register_fn_struct_layouts(&mut struct_layouts, f);
+        }
+        self.inline_function_with_layouts(caller, callees, &struct_layouts)
+    }
+
+    fn inline_function_with_layouts(
+        &self,
+        caller: &mut MirFunction,
+        callees: &HashMap<String, MirFunction>,
+        struct_layouts: &HashMap<String, MirStructLayout>,
+    ) -> bool {
         let mut block_stacks: Vec<Vec<String>> =
             vec![vec![caller.signature.name.clone()]; caller.blocks.len()];
-        self.inline_function_with_stacks(caller, callees, &mut block_stacks)
+        self.inline_function_with_stacks(caller, callees, struct_layouts, &mut block_stacks)
     }
 
     fn inline_function_with_stacks(
         &self,
         caller: &mut MirFunction,
         callees: &HashMap<String, MirFunction>,
+        struct_layouts: &HashMap<String, MirStructLayout>,
         block_stacks: &mut Vec<Vec<String>>,
     ) -> bool {
         let mut changed = false;
-        let mut block_idx = 0;
 
-        // Iterate over blocks by index (blocks list grows as new inlined blocks are added)
-        while block_idx < caller.blocks.len() {
-            let term = caller.blocks[block_idx].terminator.clone();
-            if let Some(Terminator::Call {
-                callee,
-                args,
-                destination,
-                success,
-                error,
-                span,
-            }) = term
-            {
-                if let Some(callee_fn) = callees.get(&callee) {
-                    let current_stack = if block_idx < block_stacks.len() {
-                        block_stacks[block_idx].clone()
-                    } else {
-                        vec![caller.signature.name.clone()]
-                    };
+        for _round in 0..8 {
+            let mut round_changed = false;
 
-                    if self.is_eligible_callee(callee_fn, &caller.signature.name, &current_stack)
-                        && callee_fn.params.len() == args.len()
-                    {
-                        let mut next_stack = current_stack.clone();
-                        next_stack.push(callee.clone());
+            // Pre-pass: specialize direct non-mutating closures & devirtualize known struct calls
+            if self.specialize_caller_calls(
+                caller,
+                callees,
+                struct_layouts,
+                block_stacks,
+                None,
+                None,
+                None,
+            ) {
+                round_changed = true;
+                changed = true;
+            }
 
-                        let added_blocks = self.perform_inline(
-                            caller,
-                            block_idx,
-                            callee_fn,
-                            &args,
-                            destination,
-                            success,
-                            error,
-                            span,
-                        );
+            let mut block_idx = 0;
+            // Iterate over blocks by index (blocks list grows as new inlined blocks are added)
+            while block_idx < caller.blocks.len() {
+                let term = caller.blocks[block_idx].terminator.clone();
+                if let Some(Terminator::Call {
+                    callee,
+                    args,
+                    destination,
+                    success,
+                    error,
+                    span,
+                }) = term
+                {
+                    if let Some(callee_fn) = callees.get(&callee) {
+                        let current_stack = if block_idx < block_stacks.len() {
+                            block_stacks[block_idx].clone()
+                        } else {
+                            vec![caller.signature.name.clone()]
+                        };
 
-                        for _ in 0..added_blocks {
-                            block_stacks.push(next_stack.clone());
+                        if self.is_eligible_callee(callee_fn, &caller.signature.name, &current_stack)
+                            && callee_fn.params.len() == args.len()
+                        {
+                            let mut next_stack = current_stack.clone();
+                            next_stack.push(callee.clone());
+
+                            let added_blocks = self.perform_inline(
+                                caller,
+                                block_idx,
+                                callee_fn,
+                                &args,
+                                destination,
+                                success,
+                                error,
+                                span,
+                            );
+
+                            for _ in 0..added_blocks {
+                                block_stacks.push(next_stack.clone());
+                            }
+
+                            round_changed = true;
+                            changed = true;
+                            // Respecialize newly exposed unknown/closure calls immediately so chained
+                            // callees (e.g. eval_poly -> NodeA:score, apply_twice -> step_fn) inline.
+                            if self.specialize_caller_calls(
+                                caller,
+                                callees,
+                                struct_layouts,
+                                block_stacks,
+                                None,
+                                None,
+                                None,
+                            ) {
+                                round_changed = true;
+                            }
                         }
-
-                        changed = true;
-                        // Continue loop: newly added inlined blocks will be scanned for further calls.
                     }
                 }
+                block_idx += 1;
             }
-            block_idx += 1;
+
+            if !round_changed {
+                break;
+            }
         }
 
         if changed {
+            remove_dead_closure_stmts(caller);
             while Self::simplify_cfg(caller) {}
             renumber_blocks_rpo(caller);
         }
@@ -225,17 +279,18 @@ impl MirInliner {
     }
 
     /// Evaluates whether a loop-bearing `callee` is a small single-loop leaf function safe to inline
-    /// into a loop call site (`NG-W15-2`):
-    /// - `callee.blocks.len() <= 8` and total non-storage statements across all blocks `<= 32`.
+    /// into a loop call site (`NG-W15-2` / `NG-W16-5`):
+    /// - `callee.blocks.len() <= 32` and total non-storage statements across all blocks `<= 128`.
     /// - Exactly one dominance-verified loop header (`Safepoints::find_loop_headers_in_fn(callee).len() == 1`).
     /// - Zero `cleanup_blocks`, zero `is_cleanup` blocks, zero `Rvalue::Closure` statements.
     /// - Every block terminator is `Goto`, `Cond`, `Return`, or a primitive leaf builtin `Call`
-    ///   (e.g. `array.len`, `table.len`, `string.len`, `math.*`) with `error: None` — zero user calls.
+    ///   (e.g. `array.len`, `table.len`, `string.len`, `string.sub`, `string.split`, `string.eq`,
+    ///   `math.*`) with `error: None` — zero user calls.
     pub fn is_eligible_small_loop_leaf_callee(callee: &MirFunction) -> bool {
         if callee.blocks.is_empty() || callee.entry.0 >= callee.blocks.len() {
             return false;
         }
-        if callee.blocks.len() > 8 {
+        if callee.blocks.len() > 32 {
             return false;
         }
         let exec_stmts: usize = callee
@@ -244,7 +299,7 @@ impl MirInliner {
             .flat_map(|b| b.statements.iter())
             .filter(|s| !matches!(s, Statement::StorageLive(..) | Statement::StorageDead(..)))
             .count();
-        if exec_stmts > 32 {
+        if exec_stmts > 128 {
             return false;
         }
         if !callee.cleanup_blocks.is_empty() || callee.blocks.iter().any(|b| b.is_cleanup) {
@@ -268,6 +323,59 @@ impl MirInliner {
                     error: None,
                     ..
                 }) if is_primitive_leaf_builtin_callee(inner) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    fn is_eligible_small_loop_callee_with_helpers(
+        callee: &MirFunction,
+        callees: &HashMap<String, MirFunction>,
+    ) -> bool {
+        if Self::is_eligible_small_loop_leaf_callee(callee) {
+            return true;
+        }
+        if callee.blocks.is_empty() || callee.entry.0 >= callee.blocks.len() {
+            return false;
+        }
+        if callee.blocks.len() > 32 {
+            return false;
+        }
+        let exec_stmts: usize = callee
+            .blocks
+            .iter()
+            .flat_map(|b| b.statements.iter())
+            .filter(|s| !matches!(s, Statement::StorageLive(..) | Statement::StorageDead(..)))
+            .count();
+        if exec_stmts > 128 {
+            return false;
+        }
+        if !callee.cleanup_blocks.is_empty() || callee.blocks.iter().any(|b| b.is_cleanup) {
+            return false;
+        }
+        if crate::mir::opt::Safepoints::find_loop_headers_in_fn(callee).len() != 1 {
+            return false;
+        }
+        for block in &callee.blocks {
+            for stmt in &block.statements {
+                if matches!(stmt, Statement::Assign(_, Rvalue::Closure { .. }, _)) {
+                    return false;
+                }
+            }
+            match &block.terminator {
+                Some(Terminator::Goto(..))
+                | Some(Terminator::Cond { .. })
+                | Some(Terminator::Return(..)) => {}
+                Some(Terminator::Call {
+                    callee: inner,
+                    error: None,
+                    ..
+                }) if is_primitive_leaf_builtin_callee(inner)
+                    || (inner != &callee.signature.name
+                        && callees
+                            .get(inner)
+                            .is_some_and(Self::is_eligible_small_loop_leaf_callee)) => {}
                 _ => return false,
             }
         }
@@ -298,6 +406,7 @@ impl MirInliner {
             call_stack,
             jit_config,
             false,
+            None,
         )
     }
 
@@ -309,6 +418,7 @@ impl MirInliner {
         call_stack: &[String],
         jit_config: &JitInlineConfig,
         call_site_in_loop: bool,
+        callees: Option<&HashMap<String, MirFunction>>,
     ) -> bool {
         if jit_config.excluded_functions.contains(caller_name)
             || jit_config.excluded_functions.contains(&callee.signature.name)
@@ -321,9 +431,11 @@ impl MirInliner {
         if callee_has_effect_or_handler_call(callee) {
             return false;
         }
-        if callee_has_loops(callee)
-            && !(call_site_in_loop && Self::is_eligible_small_loop_leaf_callee(callee))
-        {
+        let small_loop_ok = match callees {
+            Some(map) => Self::is_eligible_small_loop_callee_with_helpers(callee, map),
+            None => Self::is_eligible_small_loop_leaf_callee(callee),
+        };
+        if callee_has_loops(callee) && !(call_site_in_loop && small_loop_ok) {
             return false;
         }
         if callee
@@ -360,6 +472,7 @@ impl MirInliner {
             .iter()
             .map(|f| (f.signature.name.clone(), f.clone()))
             .collect();
+        let struct_layouts = collect_module_struct_layouts(module);
 
         let recursive_fns = compute_recursive_functions(&callees);
         let transitive_effect_fns = compute_transitive_effect_functions(&callees);
@@ -373,6 +486,7 @@ impl MirInliner {
             let changed = inliner.inline_function_for_jit(
                 func,
                 &callees,
+                &struct_layouts,
                 jit_config,
                 &recursive_fns,
                 &transitive_effect_fns,
@@ -393,6 +507,7 @@ impl MirInliner {
         &self,
         caller: &mut MirFunction,
         callees: &HashMap<String, MirFunction>,
+        struct_layouts: &HashMap<String, MirStructLayout>,
         jit_config: &JitInlineConfig,
         recursive_fns: &HashSet<String>,
         transitive_effect_fns: &HashSet<String>,
@@ -404,66 +519,103 @@ impl MirInliner {
             vec![vec![caller.signature.name.clone()]; caller.blocks.len()];
         let mut caller_loop_blocks = compute_natural_loop_blocks(caller);
         let mut changed = false;
-        let mut block_idx = 0;
 
-        while block_idx < caller.blocks.len() {
-            let term = caller.blocks[block_idx].terminator.clone();
-            if let Some(Terminator::Call {
-                callee,
-                args,
-                destination,
-                success,
-                error,
-                span,
-            }) = term
-            {
-                if !recursive_fns.contains(&callee)
-                    && !transitive_effect_fns.contains(&callee)
-                    && let Some(callee_fn) = callees.get(&callee)
+        for _round in 0..8 {
+            let mut round_changed = false;
+
+            if self.specialize_caller_calls(
+                caller,
+                callees,
+                struct_layouts,
+                &mut block_stacks,
+                Some(jit_config),
+                Some(recursive_fns),
+                Some(transitive_effect_fns),
+            ) {
+                caller_loop_blocks = compute_natural_loop_blocks(caller);
+                round_changed = true;
+                changed = true;
+            }
+
+            let mut block_idx = 0;
+            while block_idx < caller.blocks.len() {
+                let term = caller.blocks[block_idx].terminator.clone();
+                if let Some(Terminator::Call {
+                    callee,
+                    args,
+                    destination,
+                    success,
+                    error,
+                    span,
+                }) = term
                 {
-                    let current_stack = if block_idx < block_stacks.len() {
-                        block_stacks[block_idx].clone()
-                    } else {
-                        vec![caller.signature.name.clone()]
-                    };
-                    let call_site_in_loop = caller_loop_blocks.contains(&BlockId(block_idx));
-
-                    if self.is_eligible_callee_for_jit_at_site(
-                        callee_fn,
-                        &caller.signature.name,
-                        caller.locals.len(),
-                        &current_stack,
-                        jit_config,
-                        call_site_in_loop,
-                    ) && callee_fn.params.len() == args.len()
+                    if !recursive_fns.contains(&callee)
+                        && !transitive_effect_fns.contains(&callee)
+                        && let Some(callee_fn) = callees.get(&callee)
                     {
-                        let mut next_stack = current_stack;
-                        next_stack.push(callee);
+                        let current_stack = if block_idx < block_stacks.len() {
+                            block_stacks[block_idx].clone()
+                        } else {
+                            vec![caller.signature.name.clone()]
+                        };
+                        let call_site_in_loop = caller_loop_blocks.contains(&BlockId(block_idx));
 
-                        let added_blocks = self.perform_inline(
-                            caller,
-                            block_idx,
+                        if self.is_eligible_callee_for_jit_at_site(
                             callee_fn,
-                            &args,
-                            destination,
-                            success,
-                            error,
-                            span,
-                        );
+                            &caller.signature.name,
+                            caller.locals.len(),
+                            &current_stack,
+                            jit_config,
+                            call_site_in_loop,
+                            Some(callees),
+                        ) && callee_fn.params.len() == args.len()
+                        {
+                            let mut next_stack = current_stack;
+                            next_stack.push(callee);
 
-                        for _ in 0..added_blocks {
-                            block_stacks.push(next_stack.clone());
+                            let added_blocks = self.perform_inline(
+                                caller,
+                                block_idx,
+                                callee_fn,
+                                &args,
+                                destination,
+                                success,
+                                error,
+                                span,
+                            );
+
+                            for _ in 0..added_blocks {
+                                block_stacks.push(next_stack.clone());
+                            }
+                            caller_loop_blocks = compute_natural_loop_blocks(caller);
+
+                            round_changed = true;
+                            changed = true;
+
+                            if self.specialize_caller_calls(
+                                caller,
+                                callees,
+                                struct_layouts,
+                                &mut block_stacks,
+                                Some(jit_config),
+                                Some(recursive_fns),
+                                Some(transitive_effect_fns),
+                            ) {
+                                caller_loop_blocks = compute_natural_loop_blocks(caller);
+                            }
                         }
-                        caller_loop_blocks = compute_natural_loop_blocks(caller);
-
-                        changed = true;
                     }
                 }
+                block_idx += 1;
             }
-            block_idx += 1;
+
+            if !round_changed {
+                break;
+            }
         }
 
         if changed {
+            remove_dead_closure_stmts(caller);
             while Self::simplify_cfg(caller) {}
             renumber_blocks_rpo(caller);
         }
@@ -527,22 +679,117 @@ impl MirInliner {
         err_bb: Option<BlockId>,
         call_span: Span,
     ) -> usize {
-        // 1. Allocate fresh locals in caller for every local in callee
+        self.inline_call_site_unmerged_with_bound_params(
+            caller,
+            call_block_idx,
+            callee,
+            &[],
+            call_args,
+            destination,
+            succ_bb,
+            err_bb,
+            call_span,
+        )
+    }
+
+    /// Splices `callee` into `caller` at `call_block_idx`, mapping the first `bound_capture_locals.len()`
+    /// parameters directly to existing caller locals (for persistent closure capture cells) and
+    /// initializing the remaining parameters from `call_args`.
+    fn inline_call_site_unmerged_with_bound_params(
+        &self,
+        caller: &mut MirFunction,
+        call_block_idx: usize,
+        callee: &MirFunction,
+        bound_capture_locals: &[LocalId],
+        call_args: &[Operand],
+        destination: Place,
+        succ_bb: BlockId,
+        err_bb: Option<BlockId>,
+        call_span: Span,
+    ) -> usize {
+        // Collect local names referenced as call targets inside `callee` (e.g. `f(x)` in `apply_twice`).
+        let mut callee_called_names: HashSet<&str> = HashSet::new();
+        for blk in &callee.blocks {
+            if let Some(Terminator::Call { callee: sub_c, .. }) = &blk.terminator
+                && !sub_c.contains('.')
+                && !sub_c.contains(':')
+            {
+                callee_called_names.insert(sub_c.as_str());
+            }
+        }
+        let existing_caller_names: HashSet<String> = caller
+            .locals
+            .iter()
+            .filter_map(|l| l.name.clone())
+            .collect();
+        let mut allocated_names: HashSet<String> = HashSet::new();
+
+        // Determine concrete argument types to propagate into `MirType::Unknown` unmutated params.
+        let mut concrete_param_types: HashMap<LocalId, MirType> = HashMap::new();
+        let n_bound = bound_capture_locals.len();
+        for (arg_i, p_id) in callee.params.iter().skip(n_bound).enumerate() {
+            if let Some(arg_op) = call_args.get(arg_i)
+                && callee.locals[p_id.0].ty == MirType::Unknown
+                && !local_is_mutated_in_fn(callee, *p_id)
+                && let Some(arg_ty) = operand_mir_type_in_fn(arg_op, caller)
+                && is_concrete_specializable_type(&arg_ty)
+            {
+                concrete_param_types.insert(*p_id, arg_ty);
+            }
+        }
+
+        // 1. Map bound capture params directly to persistent caller locals; allocate fresh locals for all others.
         let mut local_map: HashMap<LocalId, LocalId> = HashMap::new();
+        let mut bound_param_ids: HashSet<LocalId> = HashSet::new();
+        for (i, &cap_cell) in bound_capture_locals.iter().enumerate() {
+            if let Some(&p_id) = callee.params.get(i) {
+                local_map.insert(p_id, cap_cell);
+                bound_param_ids.insert(p_id);
+            }
+        }
+
+        let mut callee_local_callee_remap: HashMap<String, String> = HashMap::new();
         for decl in &callee.locals {
-            let mapped_name = decl
-                .name
-                .as_ref()
-                .map(|n| format!("{}_{}", callee.signature.name, n));
+            if bound_param_ids.contains(&decl.id) {
+                if let Some(orig_name) = &decl.name
+                    && callee_called_names.contains(orig_name.as_str())
+                    && let Some(cell_name) = caller.locals[local_map[&decl.id].0].name.clone()
+                {
+                    callee_local_callee_remap.insert(orig_name.clone(), cell_name);
+                }
+                continue;
+            }
+            let mapped_name = decl.name.as_ref().map(|n| {
+                let base = format!("{}_{}", callee.signature.name, n);
+                if callee_called_names.contains(n.as_str())
+                    && (existing_caller_names.contains(&base) || allocated_names.contains(&base))
+                {
+                    format!("{}_{}_l{}", callee.signature.name, n, caller.locals.len())
+                } else {
+                    base
+                }
+            });
+            if let Some(ref mn) = mapped_name {
+                allocated_names.insert(mn.clone());
+                if let Some(orig_name) = &decl.name
+                    && callee_called_names.contains(orig_name.as_str())
+                {
+                    callee_local_callee_remap.insert(orig_name.clone(), mn.clone());
+                }
+            }
+            let local_ty = concrete_param_types
+                .get(&decl.id)
+                .cloned()
+                .unwrap_or_else(|| decl.ty.clone());
             let new_local_id =
-                caller.add_local(mapped_name, decl.ty.clone(), decl.is_mut, decl.span);
+                caller.add_local(mapped_name, local_ty, decl.is_mut, decl.span);
             local_map.insert(decl.id, new_local_id);
         }
 
-        // 2. Prepend parameter assignments to caller's call block before the jump
-        for (i, p_id) in callee.params.iter().enumerate() {
+        // 2. Prepend parameter assignments for non-bound params to caller's call block before the jump
+        for (arg_i, p_id) in callee.params.iter().skip(n_bound).enumerate() {
             let mapped_param = local_map[p_id];
-            let arg_op = call_args[i].clone();
+            let arg_op = call_args[arg_i].clone();
 
             caller.blocks[call_block_idx]
                 .statements
@@ -574,6 +821,11 @@ impl MirInliner {
             let mut stmts = Vec::with_capacity(c_block.statements.len() + 1);
 
             for stmt in &c_block.statements {
+                // Skip StorageLive/StorageDead on bound capture cells so their value persists.
+                if matches!(stmt, Statement::StorageLive(id, _) | Statement::StorageDead(id, _) if bound_param_ids.contains(id))
+                {
+                    continue;
+                }
                 stmts.push(remap_statement(stmt, &local_map));
             }
 
@@ -613,17 +865,23 @@ impl MirInliner {
                     success: sub_s,
                     error: sub_e,
                     span: s,
-                }) => Some(Terminator::Call {
-                    callee: sub_c.clone(),
-                    args: sub_a
-                        .iter()
-                        .map(|a| remap_operand(a, &local_map))
-                        .collect(),
-                    destination: remap_place(sub_d, &local_map),
-                    success: block_map[sub_s],
-                    error: sub_e.map(|e| block_map[&e]),
-                    span: *s,
-                }),
+                }) => {
+                    let remapped_callee = callee_local_callee_remap
+                        .get(sub_c)
+                        .cloned()
+                        .unwrap_or_else(|| sub_c.clone());
+                    Some(Terminator::Call {
+                        callee: remapped_callee,
+                        args: sub_a
+                            .iter()
+                            .map(|a| remap_operand(a, &local_map))
+                            .collect(),
+                        destination: remap_place(sub_d, &local_map),
+                        success: block_map[sub_s],
+                        error: sub_e.map(|e| block_map[&e]),
+                        span: *s,
+                    })
+                }
                 Some(Terminator::Return(opt_ret, s)) => {
                     // Return from callee: assign return value to caller destination, then jump to success block
                     if let Some(ret_op) = opt_ret {
@@ -666,6 +924,525 @@ impl MirInliner {
         }
 
         callee.blocks.len()
+    }
+
+    /// Post-inlining specialization sweep (`NG-W16-5`):
+    /// 1. Propagates concrete types through single-def copies and integer binary ops.
+    /// 2. Devirtualizes `__mir_unknown_get_field` on concrete `MirType::Struct(sname)` receivers
+    ///    into direct `Place::Field(recv, field_idx)` loads with refined field types.
+    /// 3. Devirtualizes `__mir_unknown_call_method` on concrete `MirType::Struct(sname)` receivers
+    ///    into direct `Terminator::Call { callee: "{sname}:{method}", args: [recv, ..] }`.
+    /// 4. Specializes direct/inlined calls to locals bound to `Rvalue::Closure { func_name, captures }`:
+    ///    - Pure/non-mutating closures: rewrites `call c(args)` -> `call func_name(..captures, ..args)`.
+    ///    - Non-escaping closures with mutated scalar captures (e.g. `step_fn` in `BENCH-NG-04`):
+    ///      materializes persistent closure-owned capture cells at the `Rvalue::Closure` site and
+    ///      inlines every call site directly against those cells.
+    #[allow(clippy::too_many_arguments)]
+    fn specialize_caller_calls(
+        &self,
+        caller: &mut MirFunction,
+        callees: &HashMap<String, MirFunction>,
+        struct_layouts: &HashMap<String, MirStructLayout>,
+        block_stacks: &mut Vec<Vec<String>>,
+        jit_config: Option<&JitInlineConfig>,
+        recursive_fns: Option<&HashSet<String>>,
+        transitive_effect_fns: Option<&HashSet<String>>,
+    ) -> bool {
+        let mut any_changed = false;
+
+        for _pass in 0..6 {
+            let mut pass_changed = false;
+
+            // Step A: Single-def concrete type propagation (copies + concrete int arithmetic)
+            if propagate_concrete_local_types(caller) {
+                pass_changed = true;
+            }
+
+            // Step B & C: Devirtualize `__mir_unknown_get_field` and `__mir_unknown_call_method`
+            for b_idx in 0..caller.blocks.len() {
+                let term = caller.blocks[b_idx].terminator.clone();
+                match term {
+                    Some(Terminator::Call {
+                        ref callee,
+                        ref args,
+                        ref destination,
+                        success,
+                        error: None,
+                        span,
+                    }) if callee == "__mir_unknown_get_field" && args.len() == 2 => {
+                        let recv_loc = match &args[0] {
+                            Operand::Copy(Place::Local(l)) | Operand::Move(Place::Local(l)) => {
+                                Some(*l)
+                            }
+                            _ => None,
+                        };
+                        let field_name = match &args[1] {
+                            Operand::Constant(MirConstant::String(s)) => Some(s.as_str()),
+                            _ => None,
+                        };
+                        if let (Some(r_loc), Some(fname)) = (recv_loc, field_name)
+                            && let MirType::Struct(ref sname) = caller.locals[r_loc.0].ty
+                            && !sname.is_empty()
+                            && sname != "LuaValue"
+                            && let Some(layout) = lookup_struct_layout(struct_layouts, sname)
+                            && let Some(f_desc) = layout.field_by_name(fname)
+                        {
+                            let field_idx = f_desc.ordinal as usize;
+                            let field_ty = mir_type_from_canonical_tag(f_desc.tag);
+                            let dest = destination.clone();
+                            caller.blocks[b_idx].statements.push(Statement::Assign(
+                                dest.clone(),
+                                Rvalue::Use(Operand::Copy(Place::Field(
+                                    Box::new(Place::Local(r_loc)),
+                                    field_idx,
+                                ))),
+                                span,
+                            ));
+                            caller.blocks[b_idx].terminator = Some(Terminator::Goto(success, span));
+                            if let Place::Local(dst_loc) = dest
+                                && caller.locals[dst_loc.0].ty == MirType::Unknown
+                            {
+                                caller.locals[dst_loc.0].ty = field_ty;
+                            }
+                            pass_changed = true;
+                        }
+                    }
+                    Some(Terminator::Call {
+                        ref callee,
+                        ref args,
+                        ref destination,
+                        success,
+                        error,
+                        span,
+                    }) if callee == "__mir_unknown_call_method" && args.len() >= 2 => {
+                        let recv_sname = match operand_mir_type_in_fn(&args[0], caller) {
+                            Some(MirType::Struct(sname))
+                                if !sname.is_empty() && sname != "LuaValue" =>
+                            {
+                                Some(sname)
+                            }
+                            _ => None,
+                        };
+                        let method_name = match &args[1] {
+                            Operand::Constant(MirConstant::String(s)) => Some(s.as_str()),
+                            _ => None,
+                        };
+                        if let (Some(sname), Some(mname)) = (recv_sname, method_name)
+                            && let Some((direct_callee, callee_fn)) =
+                                lookup_method_callee(callees, &sname, mname)
+                            && callee_fn.params.len() == 1 + (args.len() - 2)
+                        {
+                            let mut new_args = Vec::with_capacity(args.len() - 1);
+                            new_args.push(args[0].clone());
+                            new_args.extend_from_slice(&args[2..]);
+                            let ret_ty = callee_fn.signature.return_type.clone();
+                            let dest = destination.clone();
+                            caller.blocks[b_idx].terminator = Some(Terminator::Call {
+                                callee: direct_callee,
+                                args: new_args,
+                                destination: dest.clone(),
+                                success,
+                                error,
+                                span,
+                            });
+                            if let Place::Local(dst_loc) = dest
+                                && caller.locals[dst_loc.0].ty == MirType::Unknown
+                                && ret_ty != MirType::Unknown
+                            {
+                                caller.locals[dst_loc.0].ty = ret_ty;
+                            }
+                            pass_changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Step D: Closure call specialization (`Rvalue::Closure` -> direct call or cell-backed inline)
+            if self.specialize_closure_calls(
+                caller,
+                callees,
+                block_stacks,
+                jit_config,
+                recursive_fns,
+                transitive_effect_fns,
+            ) {
+                pass_changed = true;
+            }
+
+            if pass_changed {
+                any_changed = true;
+            } else {
+                break;
+            }
+        }
+
+        any_changed
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn specialize_closure_calls(
+        &self,
+        caller: &mut MirFunction,
+        callees: &HashMap<String, MirFunction>,
+        block_stacks: &mut Vec<Vec<String>>,
+        jit_config: Option<&JitInlineConfig>,
+        recursive_fns: Option<&HashSet<String>>,
+        transitive_effect_fns: Option<&HashSet<String>>,
+    ) -> bool {
+        // Count local definitions so we only trace single-def closure roots and copy chains.
+        let mut def_counts: Vec<usize> = alloc::vec![0usize; caller.locals.len()];
+        for &p in &caller.params {
+            if p.0 < def_counts.len() {
+                def_counts[p.0] += 1;
+            }
+        }
+        let mut closure_defs: HashMap<
+            LocalId,
+            (usize, usize, String, Vec<(String, Operand, MirType)>, Span),
+        > = HashMap::new();
+        for (b_idx, blk) in caller.blocks.iter().enumerate() {
+            for (s_idx, stmt) in blk.statements.iter().enumerate() {
+                if let Statement::Assign(Place::Local(dst), rval, span) = stmt {
+                    if dst.0 < def_counts.len() {
+                        def_counts[dst.0] += 1;
+                    }
+                    if let Rvalue::Closure {
+                        func_name,
+                        captures,
+                    } = rval
+                    {
+                        closure_defs.insert(
+                            *dst,
+                            (b_idx, s_idx, func_name.clone(), captures.clone(), *span),
+                        );
+                    }
+                }
+            }
+            if let Some(Terminator::Call {
+                destination: Place::Local(dst),
+                ..
+            }) = &blk.terminator
+                && dst.0 < def_counts.len()
+            {
+                def_counts[dst.0] += 1;
+            }
+        }
+        if closure_defs.is_empty() {
+            return false;
+        }
+        // Keep only single-def closure roots.
+        closure_defs.retain(|loc, _| def_counts.get(loc.0).copied().unwrap_or(0) == 1);
+        if closure_defs.is_empty() {
+            return false;
+        }
+
+        // Propagate closure root through single-def copy chains.
+        let mut local_to_root: HashMap<LocalId, LocalId> = HashMap::new();
+        for &root in closure_defs.keys() {
+            local_to_root.insert(root, root);
+        }
+        loop {
+            let mut grew = false;
+            for blk in &caller.blocks {
+                for stmt in &blk.statements {
+                    if let Statement::Assign(
+                        Place::Local(dst),
+                        Rvalue::Use(
+                            Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)),
+                        ),
+                        _,
+                    ) = stmt
+                        && def_counts.get(dst.0).copied().unwrap_or(0) == 1
+                        && !local_to_root.contains_key(dst)
+                        && let Some(&root) = local_to_root.get(src)
+                    {
+                        local_to_root.insert(*dst, root);
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+
+        // Map local name -> LocalId (only when unambiguous).
+        let name_to_local: HashMap<String, LocalId> = {
+            let mut name_counts: HashMap<&str, usize> = HashMap::new();
+            let mut map: HashMap<String, LocalId> = HashMap::new();
+            for decl in &caller.locals {
+                if let Some(ref name) = decl.name {
+                    *name_counts.entry(name.as_str()).or_insert(0) += 1;
+                    map.insert(name.clone(), decl.id);
+                }
+            }
+            map.retain(|name, _| name_counts.get(name.as_str()).copied().unwrap_or(0) == 1);
+            map
+        };
+
+        let mut changed = false;
+
+        // Subcase D1: Pure / non-mutating closures -> direct `Terminator::Call { callee: func_name, args: [..caps, ..args] }`
+        for b_idx in 0..caller.blocks.len() {
+            let Some(Terminator::Call {
+                callee,
+                args,
+                destination,
+                success,
+                error,
+                span,
+            }) = caller.blocks[b_idx].terminator.clone()
+            else {
+                continue;
+            };
+            if callee.contains('.') || callee.contains(':') || callees.contains_key(&callee) {
+                continue;
+            }
+            let Some(&callee_loc) = name_to_local.get(&callee) else {
+                continue;
+            };
+            let Some(&root) = local_to_root.get(&callee_loc) else {
+                continue;
+            };
+            let Some((_, _, func_name, captures, _)) = closure_defs.get(&root) else {
+                continue;
+            };
+            let Some(lifted_fn) = callees.get(func_name) else {
+                continue;
+            };
+            if lifted_fn.params.len() != captures.len() + args.len() {
+                continue;
+            }
+            let any_cap_mutated = (0..captures.len()).any(|ci| {
+                lifted_fn
+                    .params
+                    .get(ci)
+                    .is_some_and(|&pid| local_is_mutated_in_fn(lifted_fn, pid))
+            });
+            if any_cap_mutated {
+                continue;
+            }
+            // Verify every capture operand is immutable in `caller` (or constant) so passing it at
+            // the call site observes the exact value at closure creation.
+            let caps_stable = captures.iter().all(|(_, cap_op, _)| match cap_op {
+                Operand::Constant(_) => true,
+                Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
+                    def_counts.get(loc.0).copied().unwrap_or(0) <= 1
+                }
+                _ => false,
+            });
+            if !caps_stable {
+                continue;
+            }
+            let mut new_args = Vec::with_capacity(captures.len() + args.len());
+            for (_, cap_op, _) in captures {
+                new_args.push(cap_op.clone());
+            }
+            new_args.extend(args);
+            caller.blocks[b_idx].terminator = Some(Terminator::Call {
+                callee: func_name.clone(),
+                args: new_args,
+                destination,
+                success,
+                error,
+                span,
+            });
+            changed = true;
+        }
+        if changed {
+            return true;
+        }
+
+        // Subcase D2: Non-escaping closures with mutated scalar captures (e.g. `step_fn` in BENCH-NG-04).
+        // Materialize closure-owned capture cells at the `Rvalue::Closure` site and inline every call
+        // site directly against those cells so mutable upvalue state persists bit-identically.
+        let mut roots_sorted: Vec<LocalId> = closure_defs.keys().copied().collect();
+        roots_sorted.sort();
+        for root in roots_sorted {
+            let Some((def_bb, def_stmt_idx, func_name, captures, def_span)) =
+                closure_defs.get(&root).cloned()
+            else {
+                continue;
+            };
+            if captures.is_empty() {
+                continue;
+            }
+            let Some(lifted_fn) = callees.get(&func_name) else {
+                continue;
+            };
+            if recursive_fns.is_some_and(|r| r.contains(&func_name))
+                || transitive_effect_fns.is_some_and(|e| e.contains(&func_name))
+            {
+                continue;
+            }
+            if !self.is_eligible_callee(lifted_fn, &caller.signature.name, &[caller.signature.name.clone()])
+                || callee_has_effect_or_handler_call(lifted_fn)
+                || callee_has_loops(lifted_fn)
+                || !lifted_fn.cleanup_blocks.is_empty()
+                || lifted_fn
+                    .blocks
+                    .iter()
+                    .any(|b| b.is_cleanup || matches!(b.terminator, Some(Terminator::Raise(..))))
+            {
+                continue;
+            }
+            // All captures must be scalar (or immutable) so closure-owned cells match VM semantics.
+            let caps_ok = captures.iter().enumerate().all(|(ci, (_, _, cap_ty))| {
+                let mutated = lifted_fn
+                    .params
+                    .get(ci)
+                    .is_some_and(|&pid| local_is_mutated_in_fn(lifted_fn, pid));
+                !mutated || matches!(cap_ty, MirType::Int | MirType::Float | MirType::Bool)
+            });
+            if !caps_ok {
+                continue;
+            }
+
+            // Build alias set for this closure root and verify it NEVER escapes `caller`.
+            let alias_set: HashSet<LocalId> = local_to_root
+                .iter()
+                .filter_map(|(&loc, &r)| (r == root).then_some(loc))
+                .collect();
+            let mut call_sites: Vec<usize> = Vec::new();
+            let mut escapes = false;
+            let expected_call_arity = lifted_fn.params.len().saturating_sub(captures.len());
+
+            for (b_idx, blk) in caller.blocks.iter().enumerate() {
+                for (s_idx, stmt) in blk.statements.iter().enumerate() {
+                    if b_idx == def_bb && s_idx == def_stmt_idx {
+                        continue;
+                    }
+                    match stmt {
+                        Statement::StorageLive(_, _)
+                        | Statement::StorageDead(_, _)
+                        | Statement::ResourceCheck(_, _, _) => {}
+                        Statement::Assign(lhs, rval, _) => {
+                            let is_alias_copy = matches!(
+                                (lhs, rval),
+                                (
+                                    Place::Local(dst),
+                                    Rvalue::Use(
+                                        Operand::Copy(Place::Local(src))
+                                            | Operand::Move(Place::Local(src))
+                                    )
+                                ) if alias_set.contains(dst) && alias_set.contains(src)
+                            );
+                            if !is_alias_copy {
+                                let mut used = HashSet::new();
+                                stmt.collect_uses(&mut used);
+                                if let Place::Local(d) = lhs
+                                    && alias_set.contains(d)
+                                {
+                                    escapes = true;
+                                }
+                                if used.iter().any(|&u| alias_set.contains(&LocalId(u))) {
+                                    escapes = true;
+                                }
+                            }
+                        }
+                    }
+                    if escapes {
+                        break;
+                    }
+                }
+                if escapes {
+                    break;
+                }
+                if let Some(term) = &blk.terminator {
+                    let mut used = HashSet::new();
+                    term.collect_uses(&mut used);
+                    if used.iter().any(|&u| alias_set.contains(&LocalId(u))) {
+                        escapes = true;
+                        break;
+                    }
+                    if let Terminator::Call { callee, args, .. } = term
+                        && !callee.contains('.')
+                        && !callee.contains(':')
+                        && !callees.contains_key(callee)
+                        && let Some(&callee_loc) = name_to_local.get(callee)
+                        && alias_set.contains(&callee_loc)
+                    {
+                        if args.len() != expected_call_arity {
+                            escapes = true;
+                            break;
+                        }
+                        call_sites.push(b_idx);
+                    }
+                }
+            }
+
+            if escapes || call_sites.is_empty() {
+                continue;
+            }
+            // Enforce JIT local budget if configured.
+            if let Some(jcfg) = jit_config {
+                let extra_locals = captures.len() + call_sites.len() * lifted_fn.locals.len();
+                if caller.locals.len().saturating_add(extra_locals) > jcfg.max_caller_locals {
+                    continue;
+                }
+            }
+
+            // Allocate closure-owned capture cells and initialize them right before `Rvalue::Closure`.
+            let mut cap_cell_locals: Vec<LocalId> = Vec::with_capacity(captures.len());
+            let mut init_stmts: Vec<Statement> = Vec::with_capacity(captures.len() * 2);
+            for (ci, (cap_name, cap_op, cap_ty)) in captures.iter().enumerate() {
+                let cell_name = format!("__cap_{}_{}_{}", root.0, cap_name, ci);
+                let cell_id = caller.add_local(Some(cell_name), cap_ty.clone(), true, def_span);
+                cap_cell_locals.push(cell_id);
+                init_stmts.push(Statement::StorageLive(cell_id, def_span));
+                init_stmts.push(Statement::Assign(
+                    Place::Local(cell_id),
+                    Rvalue::Use(cap_op.clone()),
+                    def_span,
+                ));
+            }
+            // Splice init_stmts right before `def_stmt_idx` in `def_bb`.
+            caller.blocks[def_bb]
+                .statements
+                .splice(def_stmt_idx..def_stmt_idx, init_stmts);
+
+            // Inline every call site against `cap_cell_locals` (without merging blocks mid-loop so
+            // existing `call_sites` block indices remain valid).
+            for &site_bb in &call_sites {
+                let Some(Terminator::Call {
+                    args,
+                    destination,
+                    success,
+                    error,
+                    span,
+                    ..
+                }) = caller.blocks[site_bb].terminator.clone()
+                else {
+                    continue;
+                };
+                let cur_stack = if site_bb < block_stacks.len() {
+                    block_stacks[site_bb].clone()
+                } else {
+                    vec![caller.signature.name.clone()]
+                };
+                let mut next_stack = cur_stack;
+                next_stack.push(func_name.clone());
+                let added = self.inline_call_site_unmerged_with_bound_params(
+                    caller,
+                    site_bb,
+                    lifted_fn,
+                    &cap_cell_locals,
+                    &args,
+                    destination,
+                    success,
+                    error,
+                    span,
+                );
+                for _ in 0..added {
+                    block_stacks.push(next_stack.clone());
+                }
+            }
+            remove_dead_closure_stmts(caller);
+            return true;
+        }
+
+        false
     }
 
     /// Performs inlining of `callee` into `caller` at `call_block_idx`.
@@ -981,6 +1758,9 @@ fn is_primitive_leaf_builtin_callee(callee: &str) -> bool {
         "array.len"
             | "table.len"
             | "string.len"
+            | "string.sub"
+            | "string.split"
+            | "string.eq"
             | "math.abs"
             | "abs"
             | "math.min"
@@ -996,6 +1776,317 @@ fn is_primitive_leaf_builtin_callee(callee: &str) -> bool {
             | "math.sqrt"
             | "sqrt"
     )
+}
+
+fn register_fn_struct_layouts(
+    out: &mut HashMap<String, MirStructLayout>,
+    func: &MirFunction,
+) {
+    for layout in &func.struct_layouts {
+        out.entry(layout.type_name.clone())
+            .or_insert_with(|| layout.clone());
+    }
+}
+
+fn collect_module_struct_layouts(module: &MirModule) -> HashMap<String, MirStructLayout> {
+    let mut out: HashMap<String, MirStructLayout> = HashMap::new();
+    for layout in &module.struct_layouts {
+        out.entry(layout.type_name.clone())
+            .or_insert_with(|| layout.clone());
+    }
+    for func in &module.functions {
+        register_fn_struct_layouts(&mut out, func);
+    }
+    out
+}
+
+fn lookup_struct_layout<'a>(
+    layouts: &'a HashMap<String, MirStructLayout>,
+    struct_name: &str,
+) -> Option<&'a MirStructLayout> {
+    if let Some(l) = layouts.get(struct_name) {
+        return Some(l);
+    }
+    let simple = struct_name.rsplit('.').next().unwrap_or(struct_name);
+    if let Some(l) = layouts.get(simple) {
+        return Some(l);
+    }
+    let suffix = format!(".{simple}");
+    let mut matched: Option<&MirStructLayout> = None;
+    for (k, l) in layouts {
+        if k.ends_with(&suffix) {
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(l);
+        }
+    }
+    matched
+}
+
+fn lookup_method_callee<'a>(
+    callees: &'a HashMap<String, MirFunction>,
+    struct_name: &str,
+    method_name: &str,
+) -> Option<(String, &'a MirFunction)> {
+    let exact = format!("{struct_name}:{method_name}");
+    if let Some(f) = callees.get(&exact) {
+        return Some((exact, f));
+    }
+    let simple = struct_name.rsplit('.').next().unwrap_or(struct_name);
+    let simple_key = format!("{simple}:{method_name}");
+    if let Some(f) = callees.get(&simple_key) {
+        return Some((simple_key, f));
+    }
+    let suffix = format!(".{simple}:{method_name}");
+    let mut found: Option<(String, &MirFunction)> = None;
+    for (k, f) in callees {
+        if k.ends_with(&suffix) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some((k.clone(), f));
+        }
+    }
+    found
+}
+
+fn mir_type_from_canonical_tag(tag: CanonicalTypeTag) -> MirType {
+    match tag {
+        CanonicalTypeTag::Bool => MirType::Bool,
+        CanonicalTypeTag::Int64 | CanonicalTypeTag::UInt64 | CanonicalTypeTag::DateTimeUtc => {
+            MirType::Int
+        }
+        CanonicalTypeTag::Float64 => MirType::Float,
+        CanonicalTypeTag::StringSlice => MirType::String,
+        _ => MirType::Int,
+    }
+}
+
+fn is_concrete_specializable_type(ty: &MirType) -> bool {
+    match ty {
+        MirType::Struct(s) => !s.is_empty() && s != "LuaValue",
+        MirType::Function { .. } => true,
+        _ => false,
+    }
+}
+
+fn operand_mir_type_in_fn(op: &Operand, func: &MirFunction) -> Option<MirType> {
+    match op {
+        Operand::Constant(c) => Some(match c {
+            MirConstant::Unit => MirType::Unit,
+            MirConstant::Bool(_) => MirType::Bool,
+            MirConstant::Int(_) => MirType::Int,
+            MirConstant::Float(_) => MirType::Float,
+            MirConstant::String(_) => MirType::String,
+        }),
+        Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
+            func.locals.get(loc.0).map(|d| d.ty.clone())
+        }
+        _ => None,
+    }
+}
+
+fn local_is_mutated_in_fn(func: &MirFunction, loc: LocalId) -> bool {
+    for blk in &func.blocks {
+        for stmt in &blk.statements {
+            if matches!(stmt, Statement::Assign(Place::Local(d), _, _) if *d == loc) {
+                return true;
+            }
+        }
+        if matches!(
+            &blk.terminator,
+            Some(Terminator::Call {
+                destination: Place::Local(d),
+                ..
+            }) if *d == loc
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+fn propagate_concrete_local_types(func: &mut MirFunction) -> bool {
+    let mut def_counts = alloc::vec![0usize; func.locals.len()];
+    for &p in &func.params {
+        if p.0 < def_counts.len() {
+            def_counts[p.0] += 1;
+        }
+    }
+    for blk in &func.blocks {
+        for stmt in &blk.statements {
+            if let Statement::Assign(Place::Local(d), _, _) = stmt
+                && d.0 < def_counts.len()
+            {
+                def_counts[d.0] += 1;
+            }
+        }
+        if let Some(Terminator::Call {
+            destination: Place::Local(d),
+            ..
+        }) = &blk.terminator
+            && d.0 < def_counts.len()
+        {
+            def_counts[d.0] += 1;
+        }
+    }
+
+    let mut any_changed = false;
+    loop {
+        let mut changed = false;
+        for b_idx in 0..func.blocks.len() {
+            let n_stmts = func.blocks[b_idx].statements.len();
+            for s_idx in 0..n_stmts {
+                let (dst, inferred) = {
+                    let stmt = &func.blocks[b_idx].statements[s_idx];
+                    let Statement::Assign(Place::Local(d), rval, _) = stmt else {
+                        continue;
+                    };
+                    if func.locals[d.0].ty != MirType::Unknown || def_counts[d.0] != 1 {
+                        continue;
+                    }
+                    let ty = match rval {
+                        Rvalue::Use(op) => operand_mir_type_in_fn(op, func).filter(|t| {
+                            *t != MirType::Unknown
+                                && !matches!(t, MirType::Struct(s) if s == "LuaValue")
+                        }),
+                        Rvalue::BinaryOp(op, l, r) => {
+                            let lt = operand_mir_type_in_fn(l, func);
+                            let rt = operand_mir_type_in_fn(r, func);
+                            if lt == Some(MirType::Int) && rt == Some(MirType::Int) {
+                                Some(match op {
+                                    MirBinaryOp::Eq
+                                    | MirBinaryOp::NotEq
+                                    | MirBinaryOp::Lt
+                                    | MirBinaryOp::LtEq
+                                    | MirBinaryOp::Gt
+                                    | MirBinaryOp::GtEq => MirType::Bool,
+                                    _ => MirType::Int,
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    (*d, ty)
+                };
+                if let Some(new_ty) = inferred {
+                    func.locals[dst.0].ty = new_ty;
+                    changed = true;
+                    any_changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    any_changed
+}
+
+/// Removes dead `Rvalue::Closure` and dead closure-alias copy assignments whose destination
+/// local has zero remaining reads (and is not called by local name in any `Terminator::Call`).
+fn remove_dead_closure_stmts(func: &mut MirFunction) {
+    loop {
+        let mut read_locals: HashSet<usize> = HashSet::new();
+        let mut called_names: HashSet<String> = HashSet::new();
+        for blk in &func.blocks {
+            for stmt in &blk.statements {
+                stmt.collect_uses(&mut read_locals);
+            }
+            if let Some(term) = &blk.terminator {
+                term.collect_uses(&mut read_locals);
+                if let Terminator::Call { callee, .. } = term
+                    && !callee.contains('.')
+                    && !callee.contains(':')
+                {
+                    called_names.insert(callee.clone());
+                }
+            }
+        }
+        let mut live_by_name: HashSet<usize> = HashSet::new();
+        for decl in &func.locals {
+            if let Some(ref name) = decl.name
+                && called_names.contains(name)
+            {
+                live_by_name.insert(decl.id.0);
+            }
+        }
+
+        let mut removed = false;
+        for blk in &mut func.blocks {
+            let before = blk.statements.len();
+            blk.statements.retain(|stmt| {
+                let Statement::Assign(Place::Local(dst), rval, _) = stmt else {
+                    return true;
+                };
+                let is_dead_closure_or_fn_copy = matches!(rval, Rvalue::Closure { .. })
+                    || (matches!(
+                        func.locals.get(dst.0).map(|d| &d.ty),
+                        Some(MirType::Function { .. })
+                    ) && matches!(rval, Rvalue::Use(_)));
+                if is_dead_closure_or_fn_copy
+                    && !read_locals.contains(&dst.0)
+                    && !live_by_name.contains(&dst.0)
+                {
+                    return false;
+                }
+                true
+            });
+            if blk.statements.len() != before {
+                removed = true;
+            }
+        }
+        if !removed {
+            // Also drop StorageLive/StorageDead and demote unused dead `MirType::Function` locals
+            // to `MirType::Int` so downstream JIT/VM type checks never reject dead closure slots.
+            let mut referenced: HashSet<usize> = HashSet::new();
+            for &p in &func.params {
+                referenced.insert(p.0);
+            }
+            for blk in &func.blocks {
+                for stmt in &blk.statements {
+                    if let Statement::Assign(lhs, _, _) = stmt {
+                        referenced.insert(lhs.root_local().0);
+                    }
+                    stmt.collect_uses(&mut referenced);
+                }
+                if let Some(term) = &blk.terminator {
+                    term.collect_uses(&mut referenced);
+                    if let Terminator::Call { destination, .. } = term {
+                        referenced.insert(destination.root_local().0);
+                    }
+                }
+            }
+            let dead_fn_locals: HashSet<usize> = func
+                .locals
+                .iter()
+                .filter(|d| {
+                    matches!(d.ty, MirType::Function { .. })
+                        && !referenced.contains(&d.id.0)
+                        && !live_by_name.contains(&d.id.0)
+                })
+                .map(|d| d.id.0)
+                .collect();
+            if !dead_fn_locals.is_empty() {
+                for blk in &mut func.blocks {
+                    blk.statements.retain(|stmt| {
+                        !matches!(
+                            stmt,
+                            Statement::StorageLive(id, _) | Statement::StorageDead(id, _)
+                                if dead_fn_locals.contains(&id.0)
+                        )
+                    });
+                }
+                for loc_idx in dead_fn_locals {
+                    func.locals[loc_idx].ty = MirType::Int;
+                }
+            }
+            break;
+        }
+    }
 }
 
 /// Computes all blocks belonging to any natural loop in `func` using dominance-verified

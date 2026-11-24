@@ -4,6 +4,8 @@ use super::*;
 enum HoistedScalarConst {
     Int(LustInt),
     FloatBits(crate::number::FloatBits),
+    Bool(bool),
+    Function(usize),
 }
 
 impl HoistedScalarConst {
@@ -11,6 +13,8 @@ impl HoistedScalarConst {
         match self {
             Self::Int(v) => Compiler::hoisted_int_key(v),
             Self::FloatBits(bits) => Compiler::hoisted_float_key(bits),
+            Self::Bool(b) => Compiler::hoisted_bool_key(b),
+            Self::Function(idx) => Compiler::hoisted_fn_key(idx),
         }
     }
 }
@@ -209,7 +213,13 @@ impl Compiler {
                                         }
                                     }
                                 }
-                                _ => {}
+                                _ => {
+                                    if let Some(struct_name) =
+                                        self.resolve_expr_struct_type(init_expr)
+                                    {
+                                        self.register_type(reg, TypeKind::Named(struct_name));
+                                    }
+                                }
                             }
                         }
                     }
@@ -310,6 +320,24 @@ impl Compiler {
                         }
 
                         self.free_register(rhs_reg);
+                        return Ok(());
+                    }
+
+                    if let Some((tgt_obj, slot_idx, addend_expr)) =
+                        self.try_match_field_add_assign(&targets[0], &values[0])
+                    {
+                        let obj_reg = self.compile_expr(tgt_obj)?;
+                        let saved_freereg = self.next_register;
+                        let addend_reg = self.compile_expr(addend_expr)?;
+                        if self.next_register < saved_freereg {
+                            self.next_register = saved_freereg;
+                        }
+                        self.emit(
+                            Instruction::GetFieldAddSetInt(obj_reg, slot_idx, addend_reg),
+                            0,
+                        );
+                        self.free_register(addend_reg);
+                        self.free_register(obj_reg);
                         return Ok(());
                     }
 
@@ -420,24 +448,63 @@ impl Compiler {
                     }
 
                     ExprKind::FieldAccess { object, field } => {
+                        let field_slot = self.resolve_struct_field_slot(object, field);
                         let obj_reg = self.compile_expr(object)?;
-                        let field_idx = self.add_string_constant(field);
-                        let cur_reg = self.allocate_register();
-                        self.emit(Instruction::GetField(cur_reg, obj_reg, field_idx), 0);
-                        let val_reg = self.compile_expr(value)?;
-                        let res_reg = self.allocate_register();
-                        self.compile_binary_op(
-                            *op,
-                            res_reg,
-                            cur_reg,
-                            val_reg,
-                            (target.span, value.span),
-                        )?;
-                        self.emit(Instruction::SetField(obj_reg, field_idx, res_reg), 0);
-                        self.free_register(res_reg);
-                        self.free_register(val_reg);
-                        self.free_register(cur_reg);
-                        self.free_register(obj_reg);
+                        if let Some((slot_idx, field_tk)) = field_slot {
+                            let is_int_add = *op == BinaryOp::Add
+                                && (matches!(field_tk, TypeKind::Int)
+                                    || self.numeric_type(target.span) == Some(NumericType::Int))
+                                && (self.numeric_type(value.span) == Some(NumericType::Int)
+                                    || matches!(value.kind, ExprKind::Literal(Literal::Integer(_))));
+                            if is_int_add {
+                                let saved_freereg = self.next_register;
+                                let val_reg = self.compile_expr(value)?;
+                                if self.next_register < saved_freereg {
+                                    self.next_register = saved_freereg;
+                                }
+                                self.emit(
+                                    Instruction::GetFieldAddSetInt(obj_reg, slot_idx, val_reg),
+                                    0,
+                                );
+                                self.free_register(val_reg);
+                                self.free_register(obj_reg);
+                            } else {
+                                let cur_reg = self.allocate_register();
+                                self.emit(Instruction::GetFieldSlot(cur_reg, obj_reg, slot_idx), 0);
+                                let val_reg = self.compile_expr(value)?;
+                                let res_reg = self.allocate_register();
+                                self.compile_binary_op(
+                                    *op,
+                                    res_reg,
+                                    cur_reg,
+                                    val_reg,
+                                    (target.span, value.span),
+                                )?;
+                                self.emit(Instruction::SetFieldSlot(obj_reg, slot_idx, res_reg), 0);
+                                self.free_register(res_reg);
+                                self.free_register(val_reg);
+                                self.free_register(cur_reg);
+                                self.free_register(obj_reg);
+                            }
+                        } else {
+                            let field_idx = self.add_string_constant(field);
+                            let cur_reg = self.allocate_register();
+                            self.emit(Instruction::GetField(cur_reg, obj_reg, field_idx), 0);
+                            let val_reg = self.compile_expr(value)?;
+                            let res_reg = self.allocate_register();
+                            self.compile_binary_op(
+                                *op,
+                                res_reg,
+                                cur_reg,
+                                val_reg,
+                                (target.span, value.span),
+                            )?;
+                            self.emit(Instruction::SetField(obj_reg, field_idx, res_reg), 0);
+                            self.free_register(res_reg);
+                            self.free_register(val_reg);
+                            self.free_register(cur_reg);
+                            self.free_register(obj_reg);
+                        }
                     }
 
                     ExprKind::Index { object, index } => {
@@ -939,6 +1006,60 @@ impl Compiler {
         }
     }
 
+    fn try_match_field_add_assign<'a>(
+        &self,
+        target: &'a Expr,
+        value: &'a Expr,
+    ) -> Option<(&'a Expr, u8, &'a Expr)> {
+        let ExprKind::FieldAccess {
+            object: tgt_obj,
+            field: tgt_field,
+        } = &target.kind
+        else {
+            return None;
+        };
+        let ExprKind::Identifier(tgt_var) = &tgt_obj.kind else {
+            return None;
+        };
+        let (slot_idx, field_tk) = self.resolve_struct_field_slot(tgt_obj, tgt_field)?;
+        let ExprKind::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } = &value.kind
+        else {
+            return None;
+        };
+        let is_same_field = |expr: &Expr| -> bool {
+            let mut cur = expr;
+            while let ExprKind::Paren(inner) = &cur.kind {
+                cur = inner;
+            }
+            matches!(
+                &cur.kind,
+                ExprKind::FieldAccess { object, field }
+                    if field == tgt_field
+                        && matches!(&object.kind, ExprKind::Identifier(name) if name == tgt_var)
+            )
+        };
+        let addend = if is_same_field(left) && Self::is_side_effect_free_expr(right) {
+            right.as_ref()
+        } else if is_same_field(right) && Self::is_side_effect_free_expr(left) {
+            left.as_ref()
+        } else {
+            return None;
+        };
+        let field_is_int = matches!(field_tk, TypeKind::Int)
+            || self.numeric_type(left.span) == Some(NumericType::Int);
+        let addend_is_int = self.numeric_type(addend.span) == Some(NumericType::Int)
+            || matches!(addend.kind, ExprKind::Literal(Literal::Integer(_)));
+        if field_is_int && addend_is_int {
+            Some((tgt_obj.as_ref(), slot_idx, addend))
+        } else {
+            None
+        }
+    }
+
     fn collect_hoistable_consts_in_expr(
         &self,
         expr: &Expr,
@@ -960,6 +1081,20 @@ impl Compiler {
                 let key = HoistedScalarConst::FloatBits(f.to_bits());
                 if seen.insert(key) {
                     out.push(key);
+                }
+            }
+            ExprKind::Literal(Literal::Bool(b)) => {
+                let key = HoistedScalarConst::Bool(*b);
+                if seen.insert(key) {
+                    out.push(key);
+                }
+            }
+            ExprKind::Identifier(name) => {
+                if let Some(func_idx) = self.resolve_direct_fn_ident(name) {
+                    let key = HoistedScalarConst::Function(func_idx);
+                    if seen.insert(key) {
+                        out.push(key);
+                    }
                 }
             }
             ExprKind::Binary { left, op, right } => {
@@ -988,7 +1123,14 @@ impl Compiler {
                 self.collect_hoistable_consts_in_expr(index, seen, out);
             }
             ExprKind::Call { callee, args, .. } => {
-                self.collect_hoistable_consts_in_expr(callee, seen, out);
+                if let Some(func_idx) = self.resolve_static_dispatch_fn(callee) {
+                    let key = HoistedScalarConst::Function(func_idx);
+                    if seen.insert(key) {
+                        out.push(key);
+                    }
+                } else {
+                    self.collect_hoistable_consts_in_expr(callee, seen, out);
+                }
                 for arg in args {
                     self.collect_hoistable_consts_in_expr(arg, seen, out);
                 }
@@ -1040,7 +1182,6 @@ impl Compiler {
             }
             ExprKind::Literal(_)
             | ExprKind::RegexLiteral { .. }
-            | ExprKind::Identifier(_)
             | ExprKind::Lambda { .. }
             | ExprKind::EffectBlock(_) => {}
         }
@@ -1065,6 +1206,14 @@ impl Compiler {
                 }
             }
             StmtKind::Assign { targets, values } => {
+                if targets.len() == 1
+                    && values.len() == 1
+                    && let Some((_, _, addend_expr)) =
+                        self.try_match_field_add_assign(&targets[0], &values[0])
+                {
+                    self.collect_hoistable_consts_in_expr(addend_expr, seen, out);
+                    return;
+                }
                 for target in targets {
                     self.collect_hoistable_consts_in_expr(target, seen, out);
                 }
@@ -1219,13 +1368,25 @@ impl Compiler {
                         continue;
                     }
                     let reg = self.next_local_slot();
-                    let const_idx = match candidate {
-                        HoistedScalarConst::Int(v) => self.add_int_const(v),
-                        HoistedScalarConst::FloatBits(bits) => self.add_constant(Value::Float(
-                            crate::number::LustFloat::from_bits(bits),
-                        )),
-                    };
-                    self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                    match candidate {
+                        HoistedScalarConst::Int(v) => {
+                            let const_idx = self.add_int_const(v);
+                            self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                        }
+                        HoistedScalarConst::FloatBits(bits) => {
+                            let const_idx = self.add_constant(Value::Float(
+                                crate::number::LustFloat::from_bits(bits),
+                            ));
+                            self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                        }
+                        HoistedScalarConst::Bool(b) => {
+                            self.emit(Instruction::LoadBool(reg, b), 0);
+                        }
+                        HoistedScalarConst::Function(func_idx) => {
+                            let const_idx = self.add_constant(Value::Function(func_idx));
+                            self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                        }
+                    }
                     if first_reg.is_none() {
                         first_reg = Some(reg);
                     }

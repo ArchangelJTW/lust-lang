@@ -280,6 +280,9 @@ pub fn validate_and_decode_array(
                 MirType::Int => Value::Int(raw),
                 MirType::Float => Value::Float(f64::from_bits(raw as u64)),
                 MirType::String => mir_ctx.get_handle(raw).unwrap_or_else(|| Value::string("")),
+                MirType::Struct(name) if name == "LuaValue" => {
+                    mir_ctx.get_handle(raw).unwrap_or(Value::Nil)
+                }
                 MirType::Struct(name) => {
                     if let Some(val @ Value::Struct(_)) = mir_ctx.get_handle(raw) {
                         val
@@ -287,6 +290,7 @@ pub fn validate_and_decode_array(
                         validate_and_decode_struct(mir_ctx, &[], raw, name, None)?
                     }
                 }
+                MirType::Unknown => mir_ctx.get_handle(raw).unwrap_or(Value::Int(raw)),
                 _ => unreachable!("validated array element type"),
             };
             elements.push(elem);
@@ -808,9 +812,29 @@ pub fn stage_struct_writebacks(
 }
 
 #[cfg(feature = "std")]
+#[derive(Default)]
+struct CraneliftDispatchSideCache {
+    last_used_seq: u64,
+    cranelift_gen: u64,
+    struct_gen: u64,
+    functions_len: usize,
+    functions_ptr: usize,
+    negative_probed: Vec<bool>,
+    trivial_leaf_compiled_gen: u64,
+    trivial_leaf_cache: Vec<Option<bool>>,
+    slow_resolve_count: u64,
+    trivial_leaf_scan_count: u64,
+}
+
+#[cfg(feature = "std")]
 thread_local! {
     static CRANELIFT_WRITEBACK_COMMIT_COUNT: core::cell::Cell<u64> =
         const { core::cell::Cell::new(0) };
+    static CRANELIFT_DISPATCH_SIDE_SEQ: core::cell::Cell<u64> =
+        const { core::cell::Cell::new(0) };
+    static CRANELIFT_DISPATCH_SIDE_CACHES: core::cell::RefCell<
+        hashbrown::HashMap<crate::bytecode::value::VmId, CraneliftDispatchSideCache>,
+    > = core::cell::RefCell::new(hashbrown::HashMap::new());
 }
 
 #[cfg(feature = "std")]
@@ -952,6 +976,9 @@ fn is_readonly_cranelift_builtin(callee: &str) -> bool {
             | "enum.tag"
             | "enum.payload"
             | "enum.payload_at"
+            | "__mir_unknown_is_int"
+            | "__mir_unknown_unwrap_int"
+            | "__mir_unknown_get_field"
     )
 }
 
@@ -1365,6 +1392,9 @@ fn is_host_callback_free_cranelift_builtin(callee: &str) -> bool {
             | "enum.alloc"
             | "enum.new2"
             | "enum.alloc2"
+            | "__mir_unknown_is_int"
+            | "__mir_unknown_unwrap_int"
+            | "__mir_unknown_get_field"
     )
 }
 
@@ -1730,6 +1760,12 @@ impl VM {
     }
 
     #[cfg(feature = "std")]
+    #[inline]
+    fn is_synthetic_scalar_enum_struct_name(name: &str) -> bool {
+        name.starts_with("__Enum_") && name.len() > "__Enum_".len()
+    }
+
+    #[cfg(feature = "std")]
     pub(crate) fn type_contains_unknown(ty: &MirType) -> bool {
         match ty {
             MirType::Unknown => true,
@@ -1779,7 +1815,11 @@ impl VM {
             MirType::Struct(_) => true,
             MirType::Map(k, v) => Self::is_cranelift_supported_type(k) && Self::is_cranelift_supported_type(v),
             MirType::Enum(name) => !name.is_empty(),
-            MirType::Function { .. } | MirType::Effect { .. } => false,
+            MirType::Function { params, return_type } => {
+                params.iter().all(Self::is_cranelift_supported_type)
+                    && Self::is_cranelift_supported_type(return_type)
+            }
+            MirType::Effect { .. } => false,
         }
     }
 
@@ -1812,7 +1852,13 @@ impl VM {
                 Self::is_cranelift_eligible_operand(op)
                     && Self::is_cranelift_supported_type(target_ty)
             }
-            Rvalue::Closure { .. } => false,
+            Rvalue::Closure { func_name, captures } => {
+                !func_name.is_empty()
+                    && captures.iter().all(|(_, op, ty)| {
+                        Self::is_cranelift_eligible_operand(op)
+                            && Self::is_cranelift_supported_type(ty)
+                    })
+            }
         }
     }
 
@@ -1837,7 +1883,7 @@ impl VM {
     }
 
     #[cfg(feature = "std")]
-    pub(crate) fn is_cranelift_supported_struct(&self, name: &str) -> bool {
+    pub fn is_cranelift_supported_struct(&self, name: &str) -> bool {
         let mut visiting = hashbrown::HashSet::new();
         self.is_cranelift_supported_struct_inner(name, &mut visiting)
     }
@@ -1851,8 +1897,11 @@ impl VM {
         if name.is_empty() || get_registered_struct_layout_by_name(name).is_some() {
             return false;
         }
+        if name == "LuaValue" {
+            return true;
+        }
         let Some(info) = self.struct_metadata.get(name) else {
-            return false;
+            return Self::is_synthetic_scalar_enum_struct_name(name);
         };
         let canonical = info.layout.name().to_string();
         if !visiting.insert(canonical.clone()) {
@@ -1910,6 +1959,10 @@ impl VM {
                 self.is_cranelift_supported_type_in_vm(k) && self.is_cranelift_supported_type_in_vm(v)
             }
             MirType::Enum(name) => !name.is_empty(),
+            MirType::Function { params, return_type } => {
+                params.iter().all(|p| self.is_cranelift_supported_type_in_vm(p))
+                    && self.is_cranelift_supported_type_in_vm(return_type)
+            }
             other => Self::is_cranelift_supported_type(other),
         }
     }
@@ -1930,10 +1983,11 @@ impl VM {
             },
             Place::Field(base, idx) => match Self::mir_place_type_in_vm(base, locals, struct_meta)? {
                 MirType::Tuple(elems) => elems.get(*idx).cloned(),
-                MirType::Struct(name) => struct_meta
-                    .and_then(|m| {
-                        let info = m.get(&name)?;
-                        if *idx < info.layout.field_names().len() {
+                MirType::Struct(name) => {
+                    if let Some(m) = struct_meta
+                        && let Some(info) = m.get(&name)
+                    {
+                        return if *idx < info.layout.field_names().len() {
                             Some(Self::resolve_struct_field_mir_type_in_map(
                                 &name,
                                 info.layout.field_type(*idx),
@@ -1941,8 +1995,14 @@ impl VM {
                             ))
                         } else {
                             None
-                        }
-                    }),
+                        };
+                    }
+                    if Self::is_synthetic_scalar_enum_struct_name(&name) && *idx < 5 {
+                        Some(MirType::Int)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             },
         }
@@ -1970,26 +2030,43 @@ impl VM {
 
     #[cfg(feature = "std")]
     fn check_refined_type(ty: &MirType, check_struct: &dyn Fn(&str) -> bool) -> bool {
-        if Self::type_contains_unknown(ty) || !Self::is_cranelift_supported_type(ty) {
+        if !Self::is_cranelift_supported_type(ty) {
             return false;
         }
         match ty {
+            MirType::Int
+            | MirType::Bool
+            | MirType::Unit
+            | MirType::Float
+            | MirType::String
+            | MirType::Unknown => true,
             MirType::Struct(name) => check_struct(name),
             MirType::Array(inner) => match &**inner {
                 MirType::Struct(name) => check_struct(name),
-                _ => true,
+                other => Self::is_cranelift_supported_primitive_elem_type(other),
             },
             MirType::Option(inner) => match &**inner {
-                MirType::Int | MirType::Bool | MirType::Float | MirType::String => true,
+                MirType::Int
+                | MirType::Bool
+                | MirType::Float
+                | MirType::String
+                | MirType::Unknown => true,
                 MirType::Struct(name) => check_struct(name),
                 _ => false,
             },
+            MirType::Tuple(elems) => elems.iter().all(|e| {
+                Self::is_cranelift_supported_primitive_elem_type(e) || matches!(e, MirType::Unknown)
+            }),
             MirType::Map(k, v) => {
                 Self::check_refined_type(k, check_struct)
                     && Self::check_refined_type(v, check_struct)
             }
             MirType::Enum(name) => !name.is_empty(),
-            _ => true,
+            MirType::Function { params, return_type } => {
+                params.iter().all(|p| Self::check_refined_type(p, check_struct))
+                    && Self::check_refined_type(return_type, check_struct)
+            }
+            MirType::Effect { .. } => false,
         }
     }
 
@@ -2041,26 +2118,29 @@ impl VM {
                             return false;
                         }
                         if let Some(meta) = struct_meta {
-                            let Some(info) = meta.get(&name) else {
-                                return false;
-                            };
-                            if *idx >= info.layout.field_names().len() {
-                                return false;
+                            if let Some(info) = meta.get(&name) {
+                                if *idx >= info.layout.field_names().len() {
+                                    return false;
+                                }
+                                let field_ty = Self::resolve_struct_field_mir_type_in_map(
+                                    &name,
+                                    info.layout.field_type(*idx),
+                                    meta,
+                                );
+                                Self::check_refined_type(&field_ty, check_struct)
+                                    && !matches!(
+                                        field_ty,
+                                        MirType::Array(_)
+                                            | MirType::Tuple(_)
+                                            | MirType::Struct(_)
+                                            | MirType::Function { .. }
+                                            | MirType::Unknown
+                                    )
+                            } else if Self::is_synthetic_scalar_enum_struct_name(&name) {
+                                *idx < 5
+                            } else {
+                                false
                             }
-                            let field_ty = Self::resolve_struct_field_mir_type_in_map(
-                                &name,
-                                info.layout.field_type(*idx),
-                                meta,
-                            );
-                            Self::check_refined_type(&field_ty, check_struct)
-                                && !matches!(
-                                    field_ty,
-                                    MirType::Array(_)
-                                        | MirType::Tuple(_)
-                                        | MirType::Struct(_)
-                                        | MirType::Function { .. }
-                                        | MirType::Unknown
-                                )
                         } else {
                             true
                         }
@@ -2228,7 +2308,9 @@ impl VM {
                                 match agg_ty {
                                     MirType::Array(elem_ty) => {
                                         let elem_ok = match &**elem_ty {
-                                            MirType::Struct(name) => check_struct(name),
+                                            MirType::Struct(name) => {
+                                                elems.is_empty() && check_struct(name)
+                                            }
                                             other => {
                                                 Self::is_cranelift_supported_primitive_elem_type(
                                                     other,
@@ -2280,7 +2362,20 @@ impl VM {
                                     _ => {}
                                 }
                             }
-                            Rvalue::Closure { .. } => return false,
+                            Rvalue::Closure { func_name, captures } => {
+                                if func_name.is_empty()
+                                    || !captures.iter().all(|(_, op, ty)| {
+                                        Self::check_refined_operand(
+                                            op,
+                                            &refined.locals,
+                                            struct_meta,
+                                            check_struct,
+                                        ) && check_type(ty)
+                                    })
+                                {
+                                    return false;
+                                }
+                            }
                         }
                     }
                     Statement::StorageLive(_, _)
@@ -2712,7 +2807,7 @@ impl VM {
     }
 
     #[cfg(feature = "std")]
-    pub(crate) fn is_cranelift_eligible_in_vm(&self, mir_fn: &MirFunction) -> bool {
+    pub fn is_cranelift_eligible_in_vm(&self, mir_fn: &MirFunction) -> bool {
         if !Self::is_cranelift_eligible_precheck(mir_fn) {
             return false;
         }
@@ -2737,7 +2832,7 @@ impl VM {
     }
 
     #[cfg(feature = "std")]
-    fn is_cranelift_builtin_callee(callee: &str) -> bool {
+    pub fn is_cranelift_builtin_callee(callee: &str) -> bool {
         matches!(
             callee,
             "print"
@@ -2776,16 +2871,25 @@ impl VM {
                 | "enum.alloc"
                 | "enum.new2"
                 | "enum.alloc2"
+                | "__mir_unknown_is_int"
+                | "__mir_unknown_unwrap_int"
+                | "__mir_unknown_get_field"
+                | "__mir_unknown_call_method"
+                | "queue.new"
+                | "queue.offer_int"
+                | "queue.take_int"
         )
     }
 
     #[cfg(feature = "std")]
     pub fn is_supported_deopt_recipe_type(&self, ty: &MirType) -> bool {
-        if Self::type_contains_unknown(ty) {
-            return false;
-        }
         match ty {
-            MirType::Int | MirType::Bool | MirType::Float | MirType::Unit | MirType::String => true,
+            MirType::Int
+            | MirType::Bool
+            | MirType::Float
+            | MirType::Unit
+            | MirType::String
+            | MirType::Unknown => true,
             MirType::Array(inner) => match &**inner {
                 MirType::Int | MirType::Bool | MirType::Float | MirType::String => true,
                 MirType::Struct(name) => self.is_cranelift_supported_struct(name),
@@ -2793,7 +2897,11 @@ impl VM {
             },
             MirType::Struct(name) => self.is_cranelift_supported_struct(name),
             MirType::Option(inner) => match &**inner {
-                MirType::Int | MirType::Bool | MirType::Float | MirType::String => true,
+                MirType::Int
+                | MirType::Bool
+                | MirType::Float
+                | MirType::String
+                | MirType::Unknown => true,
                 MirType::Struct(name) => self.is_cranelift_supported_struct(name),
                 _ => false,
             },
@@ -2802,6 +2910,10 @@ impl VM {
                     && self.is_cranelift_supported_type_in_vm(v)
             }
             MirType::Enum(name) => !name.is_empty(),
+            MirType::Function { params, return_type } => {
+                params.iter().all(|p| self.is_cranelift_supported_type_in_vm(p))
+                    && self.is_cranelift_supported_type_in_vm(return_type)
+            }
             _ => false,
         }
     }
@@ -3056,7 +3168,7 @@ impl VM {
                         .get(idx)
                         .map(|l| l.ty.clone())
                         .ok_or_else(|| format!("Local index {} out of bounds in '{}'", idx, func_name))?;
-                    if Self::type_contains_unknown(&ty) || !self.is_supported_deopt_recipe_type(&ty) {
+                    if !self.is_supported_deopt_recipe_type(&ty) {
                         return Err(format!(
                             "Unsupported deopt local {} type {:?} at site {} in '{}'",
                             idx, ty, b_idx, func_name
@@ -3092,7 +3204,7 @@ impl VM {
                     .get(idx)
                     .map(|l| l.ty.clone())
                     .ok_or_else(|| format!("Local index {} out of bounds in '{}'", idx, func_name))?;
-                if Self::type_contains_unknown(&ty) || !self.is_supported_deopt_recipe_type(&ty) {
+                if !self.is_supported_deopt_recipe_type(&ty) {
                     return Err(format!(
                         "Unsupported deopt local {} type {:?} at loop header {} in '{}'",
                         idx, ty, b_idx, func_name
@@ -3174,6 +3286,7 @@ impl VM {
         self.cranelift_fn_cache.clear();
         self.cranelift_compiled_struct_gen = 0;
         self.cranelift_generation = self.cranelift_generation.wrapping_add(1).max(1);
+        self.invalidate_cranelift_dispatch_side_cache();
     }
 
     /// Collects all VM function names referenced by non-Cranelift bytecode functions (indirect calls,
@@ -3340,7 +3453,7 @@ impl VM {
                     let ty = refined.locals.get(idx).map(|l| &l.ty).ok_or_else(|| {
                         format!("Local index {} out of bounds in '{}'", idx, func_name)
                     })?;
-                    if Self::type_contains_unknown(ty) || !self.is_supported_deopt_recipe_type(ty) {
+                    if !self.is_supported_deopt_recipe_type(ty) {
                         return Err(format!(
                             "Unsupported deopt local {} type {:?} at site {} in '{}'",
                             idx, ty, b_idx, func_name
@@ -3365,7 +3478,7 @@ impl VM {
                 let ty = refined.locals.get(idx).map(|l| &l.ty).ok_or_else(|| {
                     format!("Local index {} out of bounds in '{}'", idx, func_name)
                 })?;
-                if Self::type_contains_unknown(ty) || !self.is_supported_deopt_recipe_type(ty) {
+                if !self.is_supported_deopt_recipe_type(ty) {
                     return Err(format!(
                         "Unsupported deopt local {} type {:?} at loop header {} in '{}'",
                         idx, ty, b_idx, func_name
@@ -3377,6 +3490,8 @@ impl VM {
         if has_effect_site || has_loop_header {
             for local in &refined.locals {
                 if let MirType::Struct(struct_name) = &local.ty
+                    && struct_name != "LuaValue"
+                    && !Self::is_synthetic_scalar_enum_struct_name(struct_name)
                     && self.struct_metadata.get(struct_name).is_none()
                 {
                     return Err(format!(
@@ -3523,6 +3638,7 @@ impl VM {
                         };
                         if Self::is_cranelift_builtin_callee(callee)
                             || is_effect_or_handler_callee(callee)
+                            || Self::is_indirect_function_local_callee(mir_fn, callee)
                         {
                             return false;
                         }
@@ -3779,6 +3895,7 @@ impl VM {
                         };
                         if Self::is_cranelift_builtin_callee(callee)
                             || is_effect_or_handler_callee(callee)
+                            || Self::is_indirect_function_local_callee(mir_fn, callee)
                         {
                             return false;
                         }
@@ -4077,6 +4194,296 @@ impl VM {
             .map(|entry| entry.is_pure_scalar_abi)
     }
 
+    #[cfg(feature = "std")]
+    fn is_indirect_function_local_callee(mir_fn: &MirFunction, callee: &str) -> bool {
+        mir_fn.locals.iter().any(|l| {
+            l.name.as_deref() == Some(callee)
+                && matches!(l.ty, MirType::Function { .. } | MirType::Unknown)
+        })
+    }
+
+    /// Registers synthetic 3-slot (or max observed slot count) scalar `__Enum_*` layouts
+    /// into `self.struct_metadata` on demand whenever a registered MIR function references
+    /// an unregistered synthetic scalar enum (`W16-JIT-ENUM`).
+    #[cfg(feature = "std")]
+    fn ensure_synthetic_enum_struct_metadata(&mut self) {
+        use crate::ast::{Span, Type};
+        use crate::bytecode::value::FieldStorage;
+
+        let mut needed_slots: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+        let observe_type = |ty: &MirType, needed: &mut hashbrown::HashMap<String, usize>| {
+            let mut stack = vec![ty];
+            while let Some(cur) = stack.pop() {
+                match cur {
+                    MirType::Struct(name)
+                        if Self::is_synthetic_scalar_enum_struct_name(name)
+                            && !self.struct_metadata.contains_key(name) =>
+                    {
+                        needed.entry(name.clone()).or_insert(3);
+                    }
+                    MirType::Array(inner) | MirType::Option(inner) => stack.push(inner),
+                    MirType::Map(k, v) => {
+                        stack.push(k);
+                        stack.push(v);
+                    }
+                    MirType::Tuple(elems) => {
+                        for e in elems {
+                            stack.push(e);
+                        }
+                    }
+                    MirType::Function { params, return_type } => {
+                        for p in params {
+                            stack.push(p);
+                        }
+                        stack.push(return_type);
+                    }
+                    _ => {}
+                }
+            }
+        };
+
+        for f in self.mir_functions.values() {
+            observe_type(&f.signature.return_type, &mut needed_slots);
+            for l in &f.locals {
+                observe_type(&l.ty, &mut needed_slots);
+            }
+            for block in &f.blocks {
+                for stmt in &block.statements {
+                    if let Statement::Assign(_, Rvalue::Aggregate(MirType::Struct(name), elems), _) =
+                        stmt
+                        && Self::is_synthetic_scalar_enum_struct_name(name)
+                        && !self.struct_metadata.contains_key(name)
+                    {
+                        let slot_count = elems.len().clamp(3, 5);
+                        needed_slots
+                            .entry(name.clone())
+                            .and_modify(|n| *n = (*n).max(slot_count))
+                            .or_insert(slot_count);
+                    }
+                }
+            }
+        }
+
+        if needed_slots.is_empty() {
+            return;
+        }
+        let span = Span::dummy();
+        for (synth_name, slot_count) in needed_slots {
+            let mut field_names = Vec::with_capacity(slot_count);
+            field_names.push(Rc::new("__tag".to_string()));
+            for i in 1..slot_count {
+                field_names.push(Rc::new(format!("__f{}", i - 1)));
+            }
+            let storage = vec![FieldStorage::Strong; slot_count];
+            let field_types = vec![Type::new(TypeKind::Int, span); slot_count];
+            let defaults = vec![None; slot_count];
+            let layout = Rc::new(StructLayout::new(
+                synth_name.clone(),
+                field_names,
+                storage,
+                field_types,
+                defaults,
+            ));
+            self.struct_metadata
+                .insert(synth_name, crate::vm::RuntimeStructInfo { layout });
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn with_dispatch_side_cache<R>(&self, f: impl FnOnce(&mut CraneliftDispatchSideCache) -> R) -> R {
+        let vm_id = self.id;
+        let cur_cl_gen = self.cranelift_generation;
+        let cur_struct_gen = self.struct_metadata.generation();
+        let cur_compiled_gen = self.cranelift_compiled_generation;
+        let cur_fn_len = self.functions.len();
+        let cur_fn_ptr = self.functions.as_ptr() as usize;
+        let fn_cache_empty = self.cranelift_fn_cache.is_empty();
+        let seq = CRANELIFT_DISPATCH_SIDE_SEQ.with(|c| {
+            let next = c.get().wrapping_add(1).max(1);
+            c.set(next);
+            next
+        });
+        CRANELIFT_DISPATCH_SIDE_CACHES.with(|map_cell| {
+            let mut map = map_cell.borrow_mut();
+            if map.len() >= 256 && !map.contains_key(&vm_id) {
+                if let Some((&oldest_id, _)) = map.iter().min_by_key(|(_, v)| v.last_used_seq) {
+                    map.remove(&oldest_id);
+                }
+            }
+            let entry = map.entry(vm_id).or_default();
+            entry.last_used_seq = seq;
+            let structural_changed = entry.cranelift_gen != cur_cl_gen
+                || entry.struct_gen != cur_struct_gen
+                || entry.functions_len != cur_fn_len
+                || entry.functions_ptr != cur_fn_ptr;
+            if structural_changed || fn_cache_empty {
+                entry.cranelift_gen = cur_cl_gen;
+                entry.struct_gen = cur_struct_gen;
+                entry.functions_len = cur_fn_len;
+                entry.functions_ptr = cur_fn_ptr;
+                if entry.negative_probed.len() != cur_fn_len {
+                    entry.negative_probed.clear();
+                    entry.negative_probed.resize(cur_fn_len, false);
+                } else {
+                    entry.negative_probed.fill(false);
+                }
+            }
+            if structural_changed
+                || entry.trivial_leaf_compiled_gen != cur_compiled_gen
+                || entry.trivial_leaf_cache.len() != cur_fn_len
+            {
+                entry.trivial_leaf_compiled_gen = cur_compiled_gen;
+                entry.trivial_leaf_cache.clear();
+                entry.trivial_leaf_cache.resize(cur_fn_len, None);
+            }
+            f(entry)
+        })
+    }
+
+    #[cfg(feature = "std")]
+    fn invalidate_cranelift_dispatch_side_cache(&self) {
+        let vm_id = self.id;
+        CRANELIFT_DISPATCH_SIDE_CACHES.with(|map_cell| {
+            if let Ok(mut map) = map_cell.try_borrow_mut()
+                && let Some(entry) = map.get_mut(&vm_id)
+            {
+                entry.negative_probed.clear();
+                entry.trivial_leaf_cache.clear();
+                entry.cranelift_gen = u64::MAX;
+                entry.struct_gen = u64::MAX;
+                entry.trivial_leaf_compiled_gen = u64::MAX;
+            }
+        });
+    }
+
+    #[cfg(feature = "std")]
+    #[inline]
+    fn is_cranelift_negative_probed(&self, func_idx: usize) -> bool {
+        if self.cranelift_fn_cache.is_empty() {
+            return false;
+        }
+        self.with_dispatch_side_cache(|cache| {
+            cache.negative_probed.get(func_idx).copied().unwrap_or(false)
+        })
+    }
+
+    #[cfg(feature = "std")]
+    #[inline]
+    fn mark_cranelift_negative_probed(&self, func_idx: usize) {
+        self.with_dispatch_side_cache(|cache| {
+            if func_idx < cache.negative_probed.len() {
+                cache.negative_probed[func_idx] = true;
+            }
+        });
+    }
+
+    #[cfg(feature = "std")]
+    #[inline]
+    fn is_trivial_leaf_method_for_vm_subframe_cached(&self, func_idx: usize) -> bool {
+        if let Some(cached) = self.with_dispatch_side_cache(|cache| {
+            cache.trivial_leaf_cache.get(func_idx).copied().flatten()
+        }) {
+            return cached;
+        }
+        let is_trivial = self
+            .functions
+            .get(func_idx)
+            .is_some_and(Self::is_trivial_leaf_method_for_vm_subframe);
+        self.with_dispatch_side_cache(|cache| {
+            cache.trivial_leaf_scan_count += 1;
+            if func_idx < cache.trivial_leaf_cache.len() {
+                cache.trivial_leaf_cache[func_idx] = Some(is_trivial);
+            }
+        });
+        is_trivial
+    }
+
+    /// Read-only inspection helper returning the number of times
+    /// `resolve_cranelift_fn_entry_slow` was entered on this VM (`NG-W16-6`).
+    #[cfg(feature = "std")]
+    pub fn cranelift_slow_resolve_count(&self) -> u64 {
+        let vm_id = self.id;
+        CRANELIFT_DISPATCH_SIDE_CACHES.with(|map_cell| {
+            map_cell
+                .borrow()
+                .get(&vm_id)
+                .map_or(0, |cache| cache.slow_resolve_count)
+        })
+    }
+
+    /// Read-only inspection helper returning `self.cranelift_fn_cache.len()` (`NG-W16-6`).
+    #[cfg(feature = "std")]
+    pub fn cranelift_fn_cache_len(&self) -> usize {
+        self.cranelift_fn_cache.len()
+    }
+
+    /// Read-only inspection helper returning the number of instruction scans performed by
+    /// `is_trivial_leaf_method_for_vm_subframe` on this VM (`NG-W16-6`).
+    #[cfg(feature = "std")]
+    pub fn cranelift_trivial_leaf_scan_count(&self) -> u64 {
+        let vm_id = self.id;
+        CRANELIFT_DISPATCH_SIDE_CACHES.with(|map_cell| {
+            map_cell
+                .borrow()
+                .get(&vm_id)
+                .map_or(0, |cache| cache.trivial_leaf_scan_count)
+        })
+    }
+
+    /// Zero-allocation fast check for `'frame_fast` in-loop call guards (`NG-W16-4` / `NG-W16-6`):
+    /// returns `true` only if `func_idx` either has a valid compiled Cranelift native entry
+    /// (excluding trivial leaf methods) or is an unprobed eligible candidate awaiting compilation.
+    #[cfg(feature = "std")]
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn has_compiled_cranelift_entry_fast(&mut self, func_idx: usize) -> bool {
+        if self.backend != crate::vm::VmBackend::Cranelift || func_idx >= self.functions.len() {
+            return false;
+        }
+        if self.functions[func_idx].param_count > 6 {
+            return false;
+        }
+        let current_struct_gen = self.struct_metadata.generation();
+        if self.cranelift_compiled_generation == self.cranelift_generation
+            && self.cranelift_compiled_struct_gen == current_struct_gen
+            && self.mir_context_struct_gen == current_struct_gen
+            && func_idx < self.cranelift_fn_cache.len()
+        {
+            return match self.cranelift_fn_cache[func_idx].as_ref() {
+                Some(entry)
+                    if !entry.code_ptr.is_null()
+                        && entry.compiled_generation == self.cranelift_compiled_generation
+                        && entry.struct_metadata_generation == current_struct_gen =>
+                {
+                    !self.is_trivial_leaf_method_for_vm_subframe_cached(func_idx)
+                }
+                None => self.cranelift_jit.as_ref().is_some_and(|jit| {
+                    jit.is_deferred_dead_helper(&self.functions[func_idx].name)
+                        && !self.is_trivial_leaf_method_for_vm_subframe_cached(func_idx)
+                }),
+                _ => false,
+            };
+        }
+        if self.is_cranelift_negative_probed(func_idx) {
+            return false;
+        }
+        if !self.mir_functions.contains_key(self.functions[func_idx].name.as_str()) {
+            if self.cranelift_fn_cache.len() < self.functions.len() {
+                self.cranelift_fn_cache.resize(self.functions.len(), None);
+            }
+            self.mark_cranelift_negative_probed(func_idx);
+            return false;
+        }
+        !self.is_trivial_leaf_method_for_vm_subframe_cached(func_idx)
+    }
+
+    #[cfg(not(feature = "std"))]
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn has_compiled_cranelift_entry_fast(&mut self, _func_idx: usize) -> bool {
+        false
+    }
+
     /// Read-only inspection helper returning the total Cranelift native entry count.
     #[cfg(feature = "std")]
     pub fn cranelift_entry_count(&self) -> u64 {
@@ -4185,13 +4592,17 @@ impl VM {
     #[cfg(feature = "std")]
     fn compile_cranelift_internal(&mut self, requested_root: Option<&str>) -> Result<()> {
         let _guard = self.mir_context.enter();
+        self.ensure_synthetic_enum_struct_metadata();
         let current_struct_gen = self.struct_metadata.generation();
-        if self.cranelift_compiled_struct_gen != current_struct_gen
-            && (!self.cranelift_compiled.is_empty()
+        if self.cranelift_compiled_struct_gen != current_struct_gen {
+            if !self.cranelift_compiled.is_empty()
                 || !self.cranelift_recipes.is_empty()
-                || !self.cranelift_fn_cache.is_empty())
-        {
-            self.invalidate_cranelift_for_struct_change();
+                || self.cranelift_fn_cache.iter().any(Option::is_some)
+            {
+                self.invalidate_cranelift_for_struct_change();
+            } else {
+                self.cranelift_compiled_struct_gen = current_struct_gen;
+            }
         }
         self.sync_mir_context_struct_metadata();
 
@@ -4389,7 +4800,6 @@ impl VM {
                 if let Some((param_types, ret_type, local_types, sroa_recipes)) =
                     entry_meta_by_name.remove(&name)
                     && param_types.len() == self.functions[func_idx].param_count as usize
-                    && !Self::type_contains_unknown(&ret_type)
                     && self.is_cranelift_supported_type_in_vm(&ret_type)
                 {
                     let readonly_params = readonly_params_by_name
@@ -4427,6 +4837,26 @@ impl VM {
         self.cranelift_generation = next_gen;
         self.cranelift_compiled_generation = next_gen;
         self.cranelift_compiled_struct_gen = current_struct_gen;
+        // Precompute O(1) trivial-leaf classification for every compiled entry at compile time.
+        let compiled_trivial_flags: Vec<(usize, bool)> = self
+            .cranelift_fn_cache
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                slot.as_ref().and_then(|_| {
+                    self.functions
+                        .get(idx)
+                        .map(|f| (idx, Self::is_trivial_leaf_method_for_vm_subframe(f)))
+                })
+            })
+            .collect();
+        self.with_dispatch_side_cache(|cache| {
+            for (idx, is_trivial) in compiled_trivial_flags {
+                if idx < cache.trivial_leaf_cache.len() {
+                    cache.trivial_leaf_cache[idx] = Some(is_trivial);
+                }
+            }
+        });
         Ok(())
     }
 
@@ -4498,7 +4928,7 @@ impl VM {
 
         if self.call_stack.len() > 1
             && !has_spike_hook
-            && Self::is_trivial_leaf_method_for_vm_subframe(&self.functions[func_idx])
+            && self.is_trivial_leaf_method_for_vm_subframe_cached(func_idx)
         {
             return Ok(None);
         }
@@ -4536,6 +4966,8 @@ impl VM {
                     e
                 }
             }
+        } else if !has_spike_hook && self.is_cranelift_negative_probed(func_idx) {
+            return Ok(None);
         } else {
             let Some(e) = self.resolve_cranelift_fn_entry_slow(func_idx, param_count)? else {
                 return Ok(None);
@@ -4609,34 +5041,63 @@ impl VM {
         func_idx: usize,
         param_count: usize,
     ) -> Result<Option<Rc<crate::vm::CompiledFnEntry>>> {
+        self.with_dispatch_side_cache(|cache| {
+            cache.slow_resolve_count += 1;
+        });
+
+        #[cfg(feature = "test-deopt")]
+        let has_spike_hook = self.test_deopt_spike_hook.is_some();
+        #[cfg(not(feature = "test-deopt"))]
+        let has_spike_hook = false;
+
         let current_struct_gen = self.struct_metadata.generation();
-        if self.cranelift_compiled_struct_gen != current_struct_gen
-            && (!self.cranelift_compiled.is_empty()
+        if self.cranelift_compiled_struct_gen != current_struct_gen {
+            if !self.cranelift_compiled.is_empty()
                 || !self.cranelift_recipes.is_empty()
-                || !self.cranelift_fn_cache.is_empty())
-        {
-            self.invalidate_cranelift_for_struct_change();
+                || self.cranelift_fn_cache.iter().any(Option::is_some)
+            {
+                self.invalidate_cranelift_for_struct_change();
+            } else {
+                self.cranelift_compiled_struct_gen = current_struct_gen;
+            }
         }
 
-        let func_name = match self.functions.get(func_idx) {
-            Some(f) => f.name.clone(),
-            None => {
-                return Err(LustError::RuntimeError {
-                    message: format!("Function index {} not found in VM", func_idx),
-                });
-            }
-        };
+        if func_idx >= self.functions.len() {
+            return Err(LustError::RuntimeError {
+                message: format!("Function index {} not found in VM", func_idx),
+            });
+        }
+        if self.cranelift_fn_cache.len() < self.functions.len() {
+            self.cranelift_fn_cache.resize(self.functions.len(), None);
+        }
 
-        let is_eligible = match self.mir_functions.get(&func_name) {
+        let is_eligible = match self.mir_functions.get(self.functions[func_idx].name.as_str()) {
             Some(f) => {
                 self.cranelift_dispatch_refine_count += 1;
                 self.is_cranelift_eligible_in_vm(f)
             }
-            None => return Ok(None),
+            None => {
+                if !has_spike_hook {
+                    self.cranelift_fn_cache[func_idx] = None;
+                    if self.mir_functions.is_empty() {
+                        self.cranelift_compiled_generation = self.cranelift_generation;
+                        self.cranelift_compiled_struct_gen = current_struct_gen;
+                        self.sync_mir_context_struct_metadata();
+                    }
+                    self.mark_cranelift_negative_probed(func_idx);
+                }
+                return Ok(None);
+            }
         };
         if !is_eligible {
+            if !has_spike_hook {
+                self.cranelift_fn_cache[func_idx] = None;
+                self.mark_cranelift_negative_probed(func_idx);
+            }
             return Ok(None);
         }
+
+        let func_name = self.functions[func_idx].name.clone();
 
         // Compile reachable closure from `func_name` before entering MirContext invocation scope
         // and packing arguments (`NG-W14-7` demand-driven dead-helper DCE).
@@ -4644,7 +5105,21 @@ impl VM {
             || self.cranelift_compiled_generation != self.cranelift_generation
             || self.cranelift_compiled_struct_gen != self.struct_metadata.generation()
         {
-            self.compile_cranelift_internal(Some(&func_name))?;
+            if let Err(err) = self.compile_cranelift_internal(Some(&func_name)) {
+                if !has_spike_hook
+                    && err
+                        .to_string()
+                        .contains("Cranelift JIT module compilation failed:")
+                {
+                    if self.cranelift_fn_cache.len() < self.functions.len() {
+                        self.cranelift_fn_cache.resize(self.functions.len(), None);
+                    }
+                    self.cranelift_fn_cache[func_idx] = None;
+                    self.mark_cranelift_negative_probed(func_idx);
+                    return Ok(None);
+                }
+                return Err(err);
+            }
         }
 
         let post_struct_gen = self.struct_metadata.generation();
@@ -4662,6 +5137,12 @@ impl VM {
                     && entry.param_types.len() == param_count
             })
             .cloned();
+        if entry.is_none() && !has_spike_hook {
+            if self.cranelift_fn_cache.len() < self.functions.len() {
+                self.cranelift_fn_cache.resize(self.functions.len(), None);
+            }
+            self.mark_cranelift_negative_probed(func_idx);
+        }
         Ok(entry)
     }
 
@@ -5308,6 +5789,17 @@ impl VM {
                         RawArg::Int(h)
                     }
                     (Value::Enum(_), MirType::Enum(_) | MirType::Unknown) => {
+                        let h = self.mir_context.register_handle(val.clone());
+                        RawArg::Int(h)
+                    }
+                    (Value::Enum(_), MirType::Struct(name)) if name == "LuaValue" => {
+                        let h = self.mir_context.register_handle(val.clone());
+                        RawArg::Int(h)
+                    }
+                    (
+                        Value::Closure(_) | Value::Function(_) | Value::NativeFunction(_),
+                        MirType::Function { .. } | MirType::Unknown,
+                    ) => {
                         let h = self.mir_context.register_handle(val.clone());
                         RawArg::Int(h)
                     }
@@ -6027,6 +6519,9 @@ impl VM {
                 let elems = validate_and_decode_tuple(&self.mir_context, raw_int, elem_types)?;
                 Value::Tuple(Rc::new(elems))
             }
+            MirType::Struct(name) if name == "LuaValue" => {
+                self.mir_context.get_handle(raw_int).unwrap_or(Value::Nil)
+            }
             MirType::Struct(name) => {
                 let layout = self
                     .struct_metadata
@@ -6128,6 +6623,27 @@ impl VM {
                     self.mir_context.get_handle(raw_int).unwrap_or(Value::Nil)
                 }
             }
+            MirType::Function { .. } => match self.mir_context.get_handle(raw_int) {
+                Some(val @ (Value::Closure(_) | Value::Function(_) | Value::NativeFunction(_))) => {
+                    val
+                }
+                Some(other) => {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "Invalid Function handle {} in Cranelift return decoding: got {:?}",
+                            raw_int, other
+                        ),
+                    });
+                }
+                None => {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "Missing Function handle {} in Cranelift return decoding",
+                            raw_int
+                        ),
+                    });
+                }
+            },
             _ => unreachable!("validated supported return type"),
         };
 
@@ -6467,10 +6983,11 @@ impl VM {
                             | MirType::Bool
                             | MirType::Float
                             | MirType::String
+                            | MirType::Unknown
                             | MirType::Struct(_)
                     ) =>
                 {
-                    if matches!(&**inner, MirType::String | MirType::Struct(_))
+                    if matches!(&**inner, MirType::String | MirType::Struct(_) | MirType::Unknown)
                         && self
                             .mir_context
                             .get_active_allocation_record(raw_val as usize)
@@ -6496,6 +7013,17 @@ impl VM {
                         }
                     }
                 }
+                MirType::Struct(name) if name == "LuaValue" => match self.mir_context.get_handle(raw_val) {
+                    Some(val) => val,
+                    None => {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Deopt payload ({source_label}) missing LuaValue handle {} for local {}",
+                                raw_val, loc_idx
+                            ),
+                        });
+                    }
+                },
                 MirType::Struct(name) => {
                     if !self.is_cranelift_supported_struct(name) {
                         return Err(LustError::RuntimeError {
@@ -6505,22 +7033,21 @@ impl VM {
                             ),
                         });
                     }
-                    let layout = self
-                        .struct_metadata
-                        .get(name)
-                        .map(|info| &info.layout)
-                        .ok_or_else(|| LustError::RuntimeError {
+                    let layout_opt = self.struct_metadata.get(name).map(|info| &info.layout);
+                    if layout_opt.is_none() && !Self::is_synthetic_scalar_enum_struct_name(name) {
+                        return Err(LustError::RuntimeError {
                             message: format!(
                                 "Missing struct layout metadata for '{name}' during deopt reconstruction ({source_label})"
                             ),
-                        })?;
+                        });
+                    }
                     let mut visited_ptrs = hashbrown::HashSet::new();
                     let decoded_val = validate_and_decode_struct_inner(
                         &self.mir_context,
                         marshalled_structs,
                         raw_val,
                         name,
-                        Some(layout),
+                        layout_opt,
                         Some(self.struct_metadata.as_map()),
                         &mut visited_ptrs,
                         &mut materialized_fresh_structs,
@@ -6655,6 +7182,38 @@ impl VM {
                         }
                     }
                 }
+                MirType::Function { .. } => match self.mir_context.get_handle(raw_val) {
+                    Some(
+                        val @ (Value::Closure(_) | Value::Function(_) | Value::NativeFunction(_)),
+                    ) => val,
+                    Some(other) => {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Deopt payload ({source_label}) invalid handle {} for Function local {}: expected Function/Closure/NativeFunction, got {:?}",
+                                raw_val, loc_idx, other
+                            ),
+                        });
+                    }
+                    None => {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Deopt payload ({source_label}) missing Function handle {} for local {}",
+                                raw_val, loc_idx
+                            ),
+                        });
+                    }
+                },
+                MirType::Unknown => match self.mir_context.get_handle(raw_val) {
+                    Some(val) => val,
+                    None => {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Deopt payload ({source_label}) missing Unknown handle {} for local {}",
+                                raw_val, loc_idx
+                            ),
+                        });
+                    }
+                },
                 _ => {
                     return Err(LustError::RuntimeError {
                         message: format!(
@@ -6744,6 +7303,11 @@ impl VM {
             if func_idx < self.call_meta.len() {
                 self.call_meta[func_idx] = meta;
             }
+            self.with_dispatch_side_cache(|cache| {
+                if func_idx < cache.trivial_leaf_cache.len() {
+                    cache.trivial_leaf_cache[func_idx] = None;
+                }
+            });
             if let Some(jit) = self.cranelift_jit.as_mut() {
                 jit.mark_continuation_materialized(func_name);
             }
@@ -6775,6 +7339,74 @@ impl VM {
         }
 
         Ok(CraneliftOutcome::Fallback)
+    }
+
+    /// Test helper under `--features test-deopt` that exercises `restore_deopt_top_frame`
+    /// end-to-end for handle-backed `MirType::Function`, `MirType::Unknown`, and `LuaValue`
+    /// deopt slots, returning `(restored_ip, restored_regs)` while restoring the VM call stack.
+    #[cfg(all(feature = "std", feature = "test-deopt"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn test_restore_deopt_top_frame_for_handles(
+        &mut self,
+        func_name: &str,
+        compilation_generation: u64,
+        invocation_id: u64,
+        block_id: usize,
+        site_kind: DeoptSiteKind,
+        precise_pc: usize,
+        local_types: &[MirType],
+    ) -> Result<(usize, Vec<Value>)> {
+        for (idx, ty) in local_types.iter().enumerate() {
+            if !self.is_supported_deopt_recipe_type(ty) {
+                return Err(LustError::RuntimeError {
+                    message: format!(
+                        "Unsupported deopt local {} type {:?} in '{}'",
+                        idx, ty, func_name
+                    ),
+                });
+            }
+        }
+        self.cranelift_compiled_generation = compilation_generation;
+        self.cranelift_recipes.insert(
+            (func_name.to_string(), block_id, site_kind),
+            CompiledDeoptRecipe {
+                func_name: func_name.to_string(),
+                compilation_generation,
+                block_id,
+                site_kind,
+                precise_pc,
+                proven_locals: local_types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| (i, t.clone()))
+                    .collect(),
+            },
+        );
+        let reg_window = u16::try_from(local_types.len().max(16)).unwrap_or(u16::MAX);
+        let _frame_idx = self.push_call_frame(0, reg_window, None);
+        let frame_depth = self.call_stack.len();
+        let restore_res = self.restore_deopt_top_frame(
+            func_name,
+            frame_depth,
+            invocation_id,
+            local_types,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        match restore_res {
+            Ok(_) => {
+                let restored_ip = self.call_stack.last().map(|f| f.ip).unwrap_or(0);
+                let restored_regs = self.top_frame_registers()[..local_types.len()].to_vec();
+                let _ = self.pop_call_frame();
+                Ok((restored_ip, restored_regs))
+            }
+            Err(err) => {
+                let _ = self.pop_call_frame();
+                Err(err)
+            }
+        }
     }
 
     /// Executes the active call frame using the native Cranelift JIT compiler backend.
@@ -7430,5 +8062,31 @@ mod eligibility_walker_tests {
         assert_eq!(vm.call_stack.last().unwrap().ip, 7);
         assert_eq!(vm.top_frame_registers()[0], Value::Int(12345));
         assert_eq!(*caller_struct.fields.borrow(), vec![Value::Int(10), Value::Int(20)]);
+    }
+
+    #[test]
+    fn test_ng_w16_6_has_compiled_cranelift_entry_fast_negative_cache() {
+        let mut vm = VM::new();
+        vm.set_backend(crate::vm::VmBackend::Cranelift);
+        let (f_bad, p0, _) = make_base_fn("no_mir_fn");
+        let bc = crate::mir::vm_backend::MirToBytecodeCompiler::compile(&f_bad).expect("bc");
+        vm.load_functions(vec![bc]);
+
+        assert!(
+            !vm.has_compiled_cranelift_entry_fast(0),
+            "function with no MIR candidate must report false"
+        );
+        assert_eq!(
+            vm.cranelift_fn_cache_len(),
+            1,
+            "negative probe must size cranelift_fn_cache"
+        );
+        assert!(
+            vm.is_cranelift_negative_probed(0),
+            "negative probe bit must be set for func_idx 0"
+        );
+        // Repeated check hits negative cache in O(1)
+        assert!(!vm.has_compiled_cranelift_entry_fast(0));
+        let _ = p0;
     }
 }

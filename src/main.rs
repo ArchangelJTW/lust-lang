@@ -1620,6 +1620,13 @@ fn build_command(args: &[String]) {
     let mut link_dirs: Vec<PathBuf> = Vec::new();
     let mut allow_ffi = true;
     let mut link_crates: Vec<PathBuf> = Vec::new();
+    let mut thin_lto = false;
+    let mut pgo_generate: Option<PathBuf> = None;
+    let mut pgo_use: Option<PathBuf> = None;
+    let mut pgo_sample_use: Option<PathBuf> = None;
+    let aot_rt_rlib_override: Option<PathBuf> = env::var_os("LUST_AOT_RT_RLIB")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
     let mut json_diag = env::var("LUST_ERROR_FORMAT")
         .map(|v| v.eq_ignore_ascii_case("json"))
         .unwrap_or(false)
@@ -1902,6 +1909,53 @@ fn build_command(args: &[String]) {
             opt if opt.starts_with("--link-dir=") => {
                 let val = opt.strip_prefix("--link-dir=").unwrap();
                 link_dirs.push(PathBuf::from(val));
+            }
+            "--lto=thin" => {
+                thin_lto = true;
+            }
+            "--lto" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --lto requires a mode (thin)");
+                    process::exit(1);
+                };
+                if val.eq_ignore_ascii_case("thin") {
+                    thin_lto = true;
+                } else {
+                    eprintln!("Error: unknown --lto mode '{val}'. Supported: thin");
+                    process::exit(1);
+                }
+            }
+            "--pgo-generate" => {
+                pgo_generate = Some(env::temp_dir().join("lust_pgo_data"));
+            }
+            opt if opt.starts_with("--pgo-generate=") => {
+                let val = opt.strip_prefix("--pgo-generate=").unwrap();
+                pgo_generate = Some(PathBuf::from(val));
+            }
+            "--pgo-use" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --pgo-use requires a profdata path");
+                    process::exit(1);
+                };
+                pgo_use = Some(PathBuf::from(val));
+            }
+            opt if opt.starts_with("--pgo-use=") => {
+                let val = opt.strip_prefix("--pgo-use=").unwrap();
+                pgo_use = Some(PathBuf::from(val));
+            }
+            "--pgo-sample-use" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --pgo-sample-use requires a profile path");
+                    process::exit(1);
+                };
+                pgo_sample_use = Some(PathBuf::from(val));
+            }
+            opt if opt.starts_with("--pgo-sample-use=") => {
+                let val = opt.strip_prefix("--pgo-sample-use=").unwrap();
+                pgo_sample_use = Some(PathBuf::from(val));
             }
             opt if opt.starts_with('-') => {
                 eprintln!("Error: unknown option '{opt}'");
@@ -2326,11 +2380,15 @@ fn build_command(args: &[String]) {
             link_dirs: link_dirs.clone(),
             allow_ffi,
         };
-        let lto_thin = !linked_rust_crates.is_empty();
+        let lto_thin = thin_lto || !linked_rust_crates.is_empty();
         let rust_links = lust::codegen_zig::aot::compiler::RustLinkOptions {
             aot_links,
             linked_crates: linked_rust_crates,
             lto_thin,
+            pgo_generate: pgo_generate.clone(),
+            pgo_use: pgo_use.clone(),
+            pgo_sample_use: pgo_sample_use.clone(),
+            aot_rt_rlib_override: aot_rt_rlib_override.clone(),
         };
 
         match lust::codegen_zig::aot::AotCompiler::compile_module_rust_cross(
@@ -2699,7 +2757,7 @@ fn run_file_with_options(
             process::exit(1);
         }
     };
-    let (functions, mir_functions, trait_impls, init_funcs, struct_defs) = match compile_program(
+    let (functions, mir_functions, trait_impls, init_funcs, mut struct_defs) = match compile_program(
         filename,
         &config,
         #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
@@ -3203,7 +3261,8 @@ fn compile_program(
     let checked_array_indices = typechecker.take_checked_array_indices();
     let lambda_return_types = typechecker.take_lambda_return_types();
     let numeric_types = typechecker.take_numeric_types();
-    let struct_defs = typechecker.struct_definitions();
+    let mut struct_defs = typechecker.struct_definitions();
+    register_synthetic_enum_struct_defs(&mut struct_defs, &wrapped_items);
     let function_signatures = typechecker.function_signatures();
     let mut compiler = Compiler::new();
     compiler.set_option_coercions(option_coercions);
@@ -3237,6 +3296,94 @@ fn compile_program(
     }
 
     Ok((functions, mir_functions, trait_impls, init_funcs, struct_defs))
+}
+
+/// Synthesizes scalar `__Enum_<Name>` `StructDef` entries for every scalar `ItemKind::Enum`
+/// so `vm.register_structs(&struct_defs)` populates `vm.struct_metadata` for Cranelift JIT
+/// (`W16-JIT-ENUM`).
+fn register_synthetic_enum_struct_defs(
+    struct_defs: &mut lust::hashbrown::HashMap<String, lust::ast::StructDef>,
+    items: &[Item],
+) {
+    use lust::ast::{FieldOwnership, ItemKind, StructDef, StructField, Type, TypeKind, Visibility};
+
+    for item in items {
+        match &item.kind {
+            ItemKind::Enum(enum_def) => {
+                let synth_name = format!("__Enum_{}", enum_def.name);
+                if struct_defs.contains_key(&synth_name) {
+                    continue;
+                }
+                let mut slot_types: Vec<Option<TypeKind>> = Vec::new();
+                let mut is_scalar = true;
+                for variant in &enum_def.variants {
+                    if let Some(fields) = &variant.fields {
+                        for (idx, ty) in fields.iter().enumerate() {
+                            let scalar_kind = match &ty.kind {
+                                TypeKind::Int => TypeKind::Int,
+                                TypeKind::Float => TypeKind::Float,
+                                TypeKind::Bool => TypeKind::Bool,
+                                _ => {
+                                    is_scalar = false;
+                                    break;
+                                }
+                            };
+                            if slot_types.len() <= idx {
+                                slot_types.resize(idx + 1, None);
+                            }
+                            match &slot_types[idx] {
+                                None => slot_types[idx] = Some(scalar_kind),
+                                Some(prev) if prev == &scalar_kind => {}
+                                Some(_) => {
+                                    is_scalar = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !is_scalar {
+                        break;
+                    }
+                }
+                if !is_scalar {
+                    continue;
+                }
+                let mut fields = Vec::with_capacity(1 + slot_types.len());
+                fields.push(StructField {
+                    name: "__tag".to_string(),
+                    ty: Type::new(TypeKind::Int, Span::dummy()),
+                    visibility: Visibility::Public,
+                    ownership: FieldOwnership::Strong,
+                    weak_target: None,
+                });
+                for (i, slot) in slot_types.into_iter().enumerate() {
+                    let kind = slot.unwrap_or(TypeKind::Int);
+                    fields.push(StructField {
+                        name: format!("__f{i}"),
+                        ty: Type::new(kind, Span::dummy()),
+                        visibility: Visibility::Public,
+                        ownership: FieldOwnership::Strong,
+                        weak_target: None,
+                    });
+                }
+                struct_defs.insert(
+                    synth_name.clone(),
+                    StructDef {
+                        name: synth_name,
+                        type_params: Vec::new(),
+                        trait_bounds: Vec::new(),
+                        fields,
+                        visibility: Visibility::Public,
+                        doc: None,
+                    },
+                );
+            }
+            ItemKind::Module { items: sub, .. } => {
+                register_synthetic_enum_struct_defs(struct_defs, sub);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn print_error_with_context(source: &str, filename: &str, error: &lust::LustError, json_diag: bool) {

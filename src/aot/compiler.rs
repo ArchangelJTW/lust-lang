@@ -114,7 +114,7 @@ pub struct RustLinkedCrate {
     pub dependency_dirs: Vec<PathBuf>,
 }
 
-/// Extended Zero-FFI linking & ThinLTO options for Rust AOT compilation (`NG-W13-1C`).
+/// Extended Zero-FFI linking, ThinLTO & PGO options for Rust AOT compilation (`NG-W13-1C`, `NG-W16-2`).
 #[derive(Debug, Clone, Default)]
 pub struct RustLinkOptions {
     pub aot_links: AotLinkOptions,
@@ -122,6 +122,14 @@ pub struct RustLinkOptions {
     pub linked_crates: Vec<RustLinkedCrate>,
     /// Enable `-C lto=thin` in `rustc` (automatically enabled whenever `linked_crates` is non-empty).
     pub lto_thin: bool,
+    /// Optional `-C profile-generate=<dir>` output directory (`AOT-PGO-CLI`).
+    pub pgo_generate: Option<PathBuf>,
+    /// Optional `-C profile-use=<profdata>` path (`AOT-PGO-CLI`).
+    pub pgo_use: Option<PathBuf>,
+    /// Optional `-C profile-sample-use=<prof>` path (`AOT-PGO-CLI`).
+    pub pgo_sample_use: Option<PathBuf>,
+    /// Optional `liblust_aot_rt.rlib` override path (or `LUST_AOT_RT_RLIB` env var).
+    pub aot_rt_rlib_override: Option<PathBuf>,
 }
 
 /// Local Cargo path dependency added to a generated `--emit=rust-crate` package (`NG-W13-1C`).
@@ -982,12 +990,21 @@ fn lower_and_typecheck_source(source: &str) -> Result<(MirModule, Vec<Item>)> {
         // `TypeChecker::check_lust_perform` emits `TypeKind::Infer` (`'_'`) and
         // `TypeChecker::check_lust_resume` hardcodes `TypeKind::Unit` (`'unit'` / `'()'`)
         // instead of `BodyRet` (cf. `src/typechecker/expr_checker/operations.rs:548,571`).
-        // Still fail closed on all genuine type/effect errors (resume outside arm,
-        // mismatched arm return type, unsatisfied service requirements, etc.).
+        // Narrow suppression strictly to diagnostics whose span originates inside a
+        // `handle..with` block (or desugared `__lust_perform`/`__lust_resume` call site)
+        // so real user type errors outside `handle` are NEVER masked (`AOT-BUDGET-SOUND`).
         let is_genuine_effect_error = msg.contains("outside of an active effect handler arm")
             || msg.contains("incompatible with handle body return type")
             || msg.contains("Unsatisfied requirement");
+        let effect_spans = collect_effect_handle_line_ranges(&items);
+        let err_in_effect_span = match &e {
+            LustError::TypeErrorWithSpan { line, .. } => effect_spans
+                .iter()
+                .any(|(start_line, end_line)| *line >= *start_line && *line <= *end_line),
+            _ => false,
+        };
         let is_effect_infer_gap = !is_genuine_effect_error
+            && err_in_effect_span
             && ((items_contain_effect_handle(&items) && msg.contains("'_'"))
                 || (items_contain_nontail_effect_handle(&items)
                     && (msg.contains("'unit'") || msg.contains("'()'") || msg.contains("'_'"))));
@@ -1039,10 +1056,428 @@ fn register_ast_struct_layouts(module: &mut MirModule, items: &[Item]) {
     }
 }
 
+/// Collects inclusive `(start_line, end_line)` ranges for every `handle..with` (`__lust_handle`)
+/// expression in `items` so `lower_and_typecheck_source` only permits the known effect-inference
+/// typechecker gap inside actual `handle..with` spans (`AOT-BUDGET-SOUND`).
+fn collect_effect_handle_line_ranges(items: &[Item]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for item in items {
+        match &item.kind {
+            ItemKind::Function(f) => collect_effect_handle_ranges_in_stmts(&f.body, &mut ranges),
+            ItemKind::Impl(imp) => {
+                for m in &imp.methods {
+                    collect_effect_handle_ranges_in_stmts(&m.body, &mut ranges);
+                }
+            }
+            ItemKind::Script(stmts) => collect_effect_handle_ranges_in_stmts(stmts, &mut ranges),
+            ItemKind::Module { items: sub, .. } => {
+                ranges.extend(collect_effect_handle_line_ranges(sub));
+            }
+            _ => {}
+        }
+    }
+    ranges
+}
+
+fn expand_span_line_bounds(span: Span, min_line: &mut usize, max_line: &mut usize) {
+    if span.start_line > 0 {
+        *min_line = (*min_line).min(span.start_line);
+        *max_line = (*max_line).max(span.end_line.max(span.start_line));
+    }
+}
+
+fn collect_expr_line_bounds(expr: &crate::ast::Expr, min_line: &mut usize, max_line: &mut usize) {
+    expand_span_line_bounds(expr.span, min_line, max_line);
+    match &expr.kind {
+        crate::ast::ExprKind::Call { callee, args, .. } => {
+            collect_expr_line_bounds(callee, min_line, max_line);
+            for a in args {
+                collect_expr_line_bounds(a, min_line, max_line);
+            }
+        }
+        crate::ast::ExprKind::MethodCall { receiver, args, .. } => {
+            collect_expr_line_bounds(receiver, min_line, max_line);
+            for a in args {
+                collect_expr_line_bounds(a, min_line, max_line);
+            }
+        }
+        crate::ast::ExprKind::Binary { left, right, .. }
+        | crate::ast::ExprKind::Range {
+            start: left,
+            end: right,
+            ..
+        } => {
+            collect_expr_line_bounds(left, min_line, max_line);
+            collect_expr_line_bounds(right, min_line, max_line);
+        }
+        crate::ast::ExprKind::Unary { operand: inner, .. }
+        | crate::ast::ExprKind::FieldAccess { object: inner, .. }
+        | crate::ast::ExprKind::Paren(inner)
+        | crate::ast::ExprKind::Cast { expr: inner, .. }
+        | crate::ast::ExprKind::TypeCheck { expr: inner, .. }
+        | crate::ast::ExprKind::IsPattern { expr: inner, .. }
+        | crate::ast::ExprKind::Lambda { body: inner, .. } => {
+            collect_expr_line_bounds(inner, min_line, max_line);
+        }
+        crate::ast::ExprKind::Index { object, index } => {
+            collect_expr_line_bounds(object, min_line, max_line);
+            collect_expr_line_bounds(index, min_line, max_line);
+        }
+        crate::ast::ExprKind::Array(es)
+        | crate::ast::ExprKind::Tuple(es)
+        | crate::ast::ExprKind::EnumConstructor { args: es, .. }
+        | crate::ast::ExprKind::Return(es) => {
+            for e in es {
+                collect_expr_line_bounds(e, min_line, max_line);
+            }
+        }
+        crate::ast::ExprKind::Map(pairs) => {
+            for (k, v) in pairs {
+                collect_expr_line_bounds(k, min_line, max_line);
+                collect_expr_line_bounds(v, min_line, max_line);
+            }
+        }
+        crate::ast::ExprKind::StructLiteral { fields, .. } => {
+            for f in fields {
+                collect_expr_line_bounds(&f.value, min_line, max_line);
+            }
+        }
+        crate::ast::ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_expr_line_bounds(condition, min_line, max_line);
+            collect_expr_line_bounds(then_branch, min_line, max_line);
+            if let Some(eb) = else_branch {
+                collect_expr_line_bounds(eb, min_line, max_line);
+            }
+        }
+        crate::ast::ExprKind::Block(b) | crate::ast::ExprKind::EffectBlock(b) => {
+            for s in b {
+                collect_stmt_line_bounds(s, min_line, max_line);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_stmt_line_bounds(stmt: &crate::ast::Stmt, min_line: &mut usize, max_line: &mut usize) {
+    expand_span_line_bounds(stmt.span, min_line, max_line);
+    match &stmt.kind {
+        crate::ast::StmtKind::Local {
+            initializer: Some(es),
+            ..
+        }
+        | crate::ast::StmtKind::Return(es) => {
+            for e in es {
+                collect_expr_line_bounds(e, min_line, max_line);
+            }
+        }
+        crate::ast::StmtKind::Assign { targets, values } => {
+            for e in targets.iter().chain(values.iter()) {
+                collect_expr_line_bounds(e, min_line, max_line);
+            }
+        }
+        crate::ast::StmtKind::CompoundAssign { target, value, .. } => {
+            collect_expr_line_bounds(target, min_line, max_line);
+            collect_expr_line_bounds(value, min_line, max_line);
+        }
+        crate::ast::StmtKind::Expr(e) => collect_expr_line_bounds(e, min_line, max_line),
+        crate::ast::StmtKind::If {
+            condition,
+            then_block,
+            elseif_branches,
+            else_block,
+        } => {
+            collect_expr_line_bounds(condition, min_line, max_line);
+            for s in then_block {
+                collect_stmt_line_bounds(s, min_line, max_line);
+            }
+            for (c, b) in elseif_branches {
+                collect_expr_line_bounds(c, min_line, max_line);
+                for s in b {
+                    collect_stmt_line_bounds(s, min_line, max_line);
+                }
+            }
+            if let Some(b) = else_block {
+                for s in b {
+                    collect_stmt_line_bounds(s, min_line, max_line);
+                }
+            }
+        }
+        crate::ast::StmtKind::While { condition, body } => {
+            collect_expr_line_bounds(condition, min_line, max_line);
+            for s in body {
+                collect_stmt_line_bounds(s, min_line, max_line);
+            }
+        }
+        crate::ast::StmtKind::ForNumeric {
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            collect_expr_line_bounds(start, min_line, max_line);
+            collect_expr_line_bounds(end, min_line, max_line);
+            if let Some(st) = step {
+                collect_expr_line_bounds(st, min_line, max_line);
+            }
+            for s in body {
+                collect_stmt_line_bounds(s, min_line, max_line);
+            }
+        }
+        crate::ast::StmtKind::ForIn { iterator, body, .. } => {
+            collect_expr_line_bounds(iterator, min_line, max_line);
+            for s in body {
+                collect_stmt_line_bounds(s, min_line, max_line);
+            }
+        }
+        crate::ast::StmtKind::Block(b) | crate::ast::StmtKind::Scoped(b) => {
+            for s in b {
+                collect_stmt_line_bounds(s, min_line, max_line);
+            }
+        }
+        crate::ast::StmtKind::Defer(s) | crate::ast::StmtKind::ErrDefer(s) => {
+            collect_stmt_line_bounds(s, min_line, max_line);
+        }
+        _ => {}
+    }
+}
+
+fn collect_effect_handle_ranges_in_stmts(
+    stmts: &[crate::ast::Stmt],
+    out: &mut Vec<(usize, usize)>,
+) {
+    for stmt in stmts {
+        match &stmt.kind {
+            crate::ast::StmtKind::Local {
+                initializer: Some(es),
+                ..
+            }
+            | crate::ast::StmtKind::Return(es) => {
+                for e in es {
+                    collect_effect_handle_ranges_in_expr(e, out);
+                }
+            }
+            crate::ast::StmtKind::Assign { targets, values } => {
+                for e in targets.iter().chain(values.iter()) {
+                    collect_effect_handle_ranges_in_expr(e, out);
+                }
+            }
+            crate::ast::StmtKind::CompoundAssign { target, value, .. } => {
+                collect_effect_handle_ranges_in_expr(target, out);
+                collect_effect_handle_ranges_in_expr(value, out);
+            }
+            crate::ast::StmtKind::Expr(e) => collect_effect_handle_ranges_in_expr(e, out),
+            crate::ast::StmtKind::If {
+                condition,
+                then_block,
+                elseif_branches,
+                else_block,
+            } => {
+                collect_effect_handle_ranges_in_expr(condition, out);
+                collect_effect_handle_ranges_in_stmts(then_block, out);
+                for (c, b) in elseif_branches {
+                    collect_effect_handle_ranges_in_expr(c, out);
+                    collect_effect_handle_ranges_in_stmts(b, out);
+                }
+                if let Some(b) = else_block {
+                    collect_effect_handle_ranges_in_stmts(b, out);
+                }
+            }
+            crate::ast::StmtKind::While { condition, body } => {
+                collect_effect_handle_ranges_in_expr(condition, out);
+                collect_effect_handle_ranges_in_stmts(body, out);
+            }
+            crate::ast::StmtKind::ForNumeric {
+                start,
+                end,
+                step,
+                body,
+                ..
+            } => {
+                collect_effect_handle_ranges_in_expr(start, out);
+                collect_effect_handle_ranges_in_expr(end, out);
+                if let Some(st) = step {
+                    collect_effect_handle_ranges_in_expr(st, out);
+                }
+                collect_effect_handle_ranges_in_stmts(body, out);
+            }
+            crate::ast::StmtKind::ForIn { iterator, body, .. } => {
+                collect_effect_handle_ranges_in_expr(iterator, out);
+                collect_effect_handle_ranges_in_stmts(body, out);
+            }
+            crate::ast::StmtKind::Block(b) | crate::ast::StmtKind::Scoped(b) => {
+                collect_effect_handle_ranges_in_stmts(b, out);
+            }
+            crate::ast::StmtKind::Defer(s) | crate::ast::StmtKind::ErrDefer(s) => {
+                collect_effect_handle_ranges_in_stmts(std::slice::from_ref(s.as_ref()), out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_effect_handle_ranges_in_expr(expr: &crate::ast::Expr, out: &mut Vec<(usize, usize)>) {
+    if is_handle_call_expr(expr) {
+        let mut min_line = usize::MAX;
+        let mut max_line = 0usize;
+        collect_expr_line_bounds(expr, &mut min_line, &mut max_line);
+        if min_line <= max_line {
+            out.push((min_line, max_line));
+        }
+        return;
+    }
+    match &expr.kind {
+        crate::ast::ExprKind::Call { callee, args, .. } => {
+            if matches!(&callee.kind, crate::ast::ExprKind::Identifier(n) if n == "__lust_perform" || n == "perform" || n == "__lust_resume" || n == "resume")
+                && expr.span.start_line > 0
+            {
+                out.push((
+                    expr.span.start_line,
+                    expr.span.end_line.max(expr.span.start_line),
+                ));
+            }
+            collect_effect_handle_ranges_in_expr(callee, out);
+            for a in args {
+                collect_effect_handle_ranges_in_expr(a, out);
+            }
+        }
+        crate::ast::ExprKind::MethodCall { receiver, args, .. } => {
+            collect_effect_handle_ranges_in_expr(receiver, out);
+            for a in args {
+                collect_effect_handle_ranges_in_expr(a, out);
+            }
+        }
+        crate::ast::ExprKind::Binary { left, right, .. }
+        | crate::ast::ExprKind::Range {
+            start: left,
+            end: right,
+            ..
+        } => {
+            collect_effect_handle_ranges_in_expr(left, out);
+            collect_effect_handle_ranges_in_expr(right, out);
+        }
+        crate::ast::ExprKind::Unary { operand: inner, .. }
+        | crate::ast::ExprKind::FieldAccess { object: inner, .. }
+        | crate::ast::ExprKind::Paren(inner)
+        | crate::ast::ExprKind::Cast { expr: inner, .. }
+        | crate::ast::ExprKind::TypeCheck { expr: inner, .. }
+        | crate::ast::ExprKind::IsPattern { expr: inner, .. }
+        | crate::ast::ExprKind::Lambda { body: inner, .. } => {
+            collect_effect_handle_ranges_in_expr(inner, out);
+        }
+        crate::ast::ExprKind::Index { object, index } => {
+            collect_effect_handle_ranges_in_expr(object, out);
+            collect_effect_handle_ranges_in_expr(index, out);
+        }
+        crate::ast::ExprKind::Array(es)
+        | crate::ast::ExprKind::Tuple(es)
+        | crate::ast::ExprKind::EnumConstructor { args: es, .. }
+        | crate::ast::ExprKind::Return(es) => {
+            for e in es {
+                collect_effect_handle_ranges_in_expr(e, out);
+            }
+        }
+        crate::ast::ExprKind::Map(pairs) => {
+            for (k, v) in pairs {
+                collect_effect_handle_ranges_in_expr(k, out);
+                collect_effect_handle_ranges_in_expr(v, out);
+            }
+        }
+        crate::ast::ExprKind::StructLiteral { fields, .. } => {
+            for f in fields {
+                collect_effect_handle_ranges_in_expr(&f.value, out);
+            }
+        }
+        crate::ast::ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_effect_handle_ranges_in_expr(condition, out);
+            collect_effect_handle_ranges_in_expr(then_branch, out);
+            if let Some(eb) = else_branch {
+                collect_effect_handle_ranges_in_expr(eb, out);
+            }
+        }
+        crate::ast::ExprKind::Block(b) | crate::ast::ExprKind::EffectBlock(b) => {
+            collect_effect_handle_ranges_in_stmts(b, out);
+        }
+        _ => {}
+    }
+}
+
+#[derive(Default)]
+struct CpsModuleCtx {
+    helpers: std::collections::HashMap<String, FunctionDef>,
+    generated_fns: Vec<FunctionDef>,
+    loop_counter: usize,
+    current_fn_ret_ty: Option<Type>,
+    current_fn_param_tys: std::collections::HashMap<String, Type>,
+}
+
+thread_local! {
+    static CPS_MODULE_CTX: std::cell::RefCell<CpsModuleCtx> =
+        std::cell::RefCell::new(CpsModuleCtx::default());
+}
+
+fn collect_module_helpers(items: &[Item], out: &mut std::collections::HashMap<String, FunctionDef>) {
+    for item in items {
+        match &item.kind {
+            ItemKind::Function(f) => {
+                out.insert(f.name.clone(), f.clone());
+            }
+            ItemKind::Module { items: sub, .. } => {
+                collect_module_helpers(sub, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Pre-lowers Lust `EffectBlock` / `:provide(..)` / `.provide(..)` / `:run_sync()` / `.run_sync()`
 /// and implicit tail `handle..with` expressions into MIR-lowerable AST forms for Rust AOT
-/// (`NG-W13-1A`, `F-19`) without modifying `src/mir/ir.rs` or `src/mir/lowering/mod.rs`.
+/// (`NG-W13-1A`, `F-19`, `NG-W16-2`) without modifying `src/mir/ir.rs` or `src/mir/lowering/mod.rs`.
 fn desugar_effects_for_rust_aot(items: &[Item]) -> Vec<Item> {
+    let mut helpers = std::collections::HashMap::new();
+    collect_module_helpers(items, &mut helpers);
+    CPS_MODULE_CTX.with(|ctx| {
+        let mut c = ctx.borrow_mut();
+        c.helpers = helpers;
+        c.generated_fns.clear();
+        c.loop_counter = 0;
+        c.current_fn_ret_ty = None;
+        c.current_fn_param_tys.clear();
+    });
+
+    let mut out = desugar_items_effects_inner(items);
+
+    // Drain any module-level `__cps_loop_step_*` functions generated by non-tail loop CPS lowering,
+    // desugaring each one in turn until a fixed point is reached.
+    loop {
+        let pending: Vec<FunctionDef> = CPS_MODULE_CTX.with(|ctx| {
+            let mut c = ctx.borrow_mut();
+            std::mem::take(&mut c.generated_fns)
+        });
+        if pending.is_empty() {
+            break;
+        }
+        for gen_fn in pending {
+            let desugared = desugar_function_effects(&gen_fn);
+            out.push(Item {
+                kind: ItemKind::Function(desugared),
+                span: Span::dummy(),
+            });
+        }
+    }
+
+    out
+}
+
+fn desugar_items_effects_inner(items: &[Item]) -> Vec<Item> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let new_kind = match &item.kind {
@@ -1054,7 +1489,7 @@ fn desugar_effects_for_rust_aot(items: &[Item]) -> Vec<Item> {
             }
             ItemKind::Module { name, items: sub } => ItemKind::Module {
                 name: name.clone(),
-                items: desugar_effects_for_rust_aot(sub),
+                items: desugar_items_effects_inner(sub),
             },
             other => other.clone(),
         };
@@ -1068,6 +1503,17 @@ fn desugar_effects_for_rust_aot(items: &[Item]) -> Vec<Item> {
 
 fn desugar_function_effects(func: &FunctionDef) -> FunctionDef {
     use std::collections::HashSet;
+
+    let mut param_tys = std::collections::HashMap::new();
+    for p in &func.params {
+        param_tys.insert(p.name.clone(), p.ty.clone());
+    }
+    let prev_ctx = CPS_MODULE_CTX.with(|ctx| {
+        let mut c = ctx.borrow_mut();
+        let prev = (c.current_fn_ret_ty.clone(), std::mem::replace(&mut c.current_fn_param_tys, param_tys));
+        c.current_fn_ret_ty = func.return_type.clone();
+        prev
+    });
 
     let mut effect_vars: HashSet<String> = HashSet::new();
     for p in &func.params {
@@ -1087,6 +1533,12 @@ fn desugar_function_effects(func: &FunctionDef) -> FunctionDef {
         false,
         &mut 0usize,
     );
+
+    CPS_MODULE_CTX.with(|ctx| {
+        let mut c = ctx.borrow_mut();
+        c.current_fn_ret_ty = prev_ctx.0;
+        c.current_fn_param_tys = prev_ctx.1;
+    });
 
     // If a non-unit function ends with a bare `__lust_handle(...)` or `__lust_nontail_handle(...)`
     // expression statement (as in `function main(): int handle { ... } with { ... } end`),
@@ -2505,6 +2957,23 @@ fn desugar_nontail_handle(
         )],
     };
 
+    // NG-W16-2 (`AOT-CPS-LOOPS`):
+    // 1. Inline module-local helper calls that transitively perform a handled operation.
+    let body_stmts = inline_handled_helper_calls_in_stmts(&body_stmts, &handled_ops, nt_counter);
+    // 2. Lower `Defer` / `Scoped` blocks into explicit LIFO cleanup at block exit.
+    let body_stmts = lower_defers_and_scoped_in_stmts(&body_stmts, nt_counter);
+    // 3. Desugar `ForNumeric` / `ForIn` loops containing a handled perform into canonical `While`.
+    let body_stmts = desugar_for_loops_with_perform(&body_stmts, &handled_ops, nt_counter);
+    // 4. Lower `While` loops containing a handled perform into recursive `__cps_loop_step_*` calls.
+    let body_stmts = lower_while_loops_with_perform(
+        &body_stmts,
+        &handled_ops,
+        arms_array,
+        &local_ty_env,
+        nt_counter,
+        span,
+    );
+
     let split_stmts = split_body_stmts_for_effect_yield(
         &body_stmts,
         &handled_ops,
@@ -2543,6 +3012,919 @@ fn desugar_nontail_handle(
         },
         span,
     ))
+}
+
+fn inline_handled_helper_calls_in_stmts(
+    stmts: &[crate::ast::Stmt],
+    handled_ops: &std::collections::HashSet<String>,
+    nt_counter: &mut usize,
+) -> Vec<crate::ast::Stmt> {
+    let mut out = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        // Case A: `local x [: T] = helper(args...)`
+        if let crate::ast::StmtKind::Local {
+            bindings,
+            initializer: Some(inits),
+        } = &stmt.kind
+            && bindings.len() == 1
+            && inits.len() == 1
+            && let crate::ast::ExprKind::Call { callee, args, .. } = &inits[0].kind
+            && let crate::ast::ExprKind::Identifier(fn_name) = &callee.kind
+            && let Some(helper) = lookup_handled_helper(fn_name, handled_ops)
+        {
+            let inlined = build_inlined_helper_stmts(
+                &helper,
+                args,
+                Some(bindings.clone()),
+                stmt.span,
+                nt_counter,
+            );
+            let recursed = inline_handled_helper_calls_in_stmts(&inlined, handled_ops, nt_counter);
+            out.extend(recursed);
+            continue;
+        }
+        // Case B: bare `helper(args...)`
+        if let crate::ast::StmtKind::Expr(e) = &stmt.kind
+            && let crate::ast::ExprKind::Call { callee, args, .. } = &e.kind
+            && let crate::ast::ExprKind::Identifier(fn_name) = &callee.kind
+            && let Some(helper) = lookup_handled_helper(fn_name, handled_ops)
+        {
+            let inlined = build_inlined_helper_stmts(&helper, args, None, stmt.span, nt_counter);
+            let recursed = inline_handled_helper_calls_in_stmts(&inlined, handled_ops, nt_counter);
+            out.extend(recursed);
+            continue;
+        }
+        // Recurse into compound statements
+        let new_stmt = match &stmt.kind {
+            crate::ast::StmtKind::While { condition, body } => crate::ast::Stmt::new(
+                crate::ast::StmtKind::While {
+                    condition: condition.clone(),
+                    body: inline_handled_helper_calls_in_stmts(body, handled_ops, nt_counter),
+                },
+                stmt.span,
+            ),
+            crate::ast::StmtKind::ForNumeric {
+                variable,
+                start,
+                end,
+                step,
+                body,
+            } => crate::ast::Stmt::new(
+                crate::ast::StmtKind::ForNumeric {
+                    variable: variable.clone(),
+                    start: start.clone(),
+                    end: end.clone(),
+                    step: step.clone(),
+                    body: inline_handled_helper_calls_in_stmts(body, handled_ops, nt_counter),
+                },
+                stmt.span,
+            ),
+            crate::ast::StmtKind::ForIn {
+                variables,
+                iterator,
+                body,
+            } => crate::ast::Stmt::new(
+                crate::ast::StmtKind::ForIn {
+                    variables: variables.clone(),
+                    iterator: iterator.clone(),
+                    body: inline_handled_helper_calls_in_stmts(body, handled_ops, nt_counter),
+                },
+                stmt.span,
+            ),
+            crate::ast::StmtKind::Scoped(b) => crate::ast::Stmt::new(
+                crate::ast::StmtKind::Scoped(inline_handled_helper_calls_in_stmts(
+                    b,
+                    handled_ops,
+                    nt_counter,
+                )),
+                stmt.span,
+            ),
+            crate::ast::StmtKind::Block(b) => crate::ast::Stmt::new(
+                crate::ast::StmtKind::Block(inline_handled_helper_calls_in_stmts(
+                    b,
+                    handled_ops,
+                    nt_counter,
+                )),
+                stmt.span,
+            ),
+            crate::ast::StmtKind::If {
+                condition,
+                then_block,
+                elseif_branches,
+                else_block,
+            } => crate::ast::Stmt::new(
+                crate::ast::StmtKind::If {
+                    condition: condition.clone(),
+                    then_block: inline_handled_helper_calls_in_stmts(
+                        then_block,
+                        handled_ops,
+                        nt_counter,
+                    ),
+                    elseif_branches: elseif_branches
+                        .iter()
+                        .map(|(c, b)| {
+                            (
+                                c.clone(),
+                                inline_handled_helper_calls_in_stmts(b, handled_ops, nt_counter),
+                            )
+                        })
+                        .collect(),
+                    else_block: else_block
+                        .as_ref()
+                        .map(|b| inline_handled_helper_calls_in_stmts(b, handled_ops, nt_counter)),
+                },
+                stmt.span,
+            ),
+            _ => stmt.clone(),
+        };
+        out.push(new_stmt);
+    }
+    out
+}
+
+fn lookup_handled_helper(
+    fn_name: &str,
+    handled_ops: &std::collections::HashSet<String>,
+) -> Option<FunctionDef> {
+    CPS_MODULE_CTX.with(|ctx| {
+        let c = ctx.borrow();
+        let helper = c.helpers.get(fn_name)?;
+        if helper
+            .body
+            .iter()
+            .any(|s| stmt_contains_handled_perform(s, handled_ops))
+        {
+            Some(helper.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn build_inlined_helper_stmts(
+    helper: &FunctionDef,
+    args: &[crate::ast::Expr],
+    target_bindings: Option<Vec<crate::ast::LocalBinding>>,
+    span: Span,
+    nt_counter: &mut usize,
+) -> Vec<crate::ast::Stmt> {
+    let id = *nt_counter;
+    *nt_counter += 1;
+    let mut rename_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut out = Vec::new();
+
+    for (idx, param) in helper.params.iter().enumerate() {
+        let fresh = format!("__inl_{id}_{}", param.name);
+        rename_map.insert(param.name.clone(), fresh.clone());
+        let arg_expr = args
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| make_unit_expr(span));
+        out.push(crate::ast::Stmt::new(
+            crate::ast::StmtKind::Local {
+                bindings: vec![crate::ast::LocalBinding {
+                    name: fresh,
+                    type_annotation: Some(param.ty.clone()),
+                    span,
+                }],
+                initializer: Some(vec![arg_expr]),
+            },
+            span,
+        ));
+    }
+
+    // Alpha-rename top-level locals inside helper body to avoid shadowing collisions
+    for s in &helper.body {
+        if let crate::ast::StmtKind::Local { bindings, .. } = &s.kind {
+            for b in bindings {
+                let fresh = format!("__inl_{id}_{}", b.name);
+                rename_map.insert(b.name.clone(), fresh);
+            }
+        }
+    }
+
+    let body_len = helper.body.len();
+    for (idx, s) in helper.body.iter().enumerate() {
+        let renamed = rename_idents_in_stmt(s, &rename_map);
+        let is_last = idx + 1 == body_len;
+        if is_last && let crate::ast::StmtKind::Return(vals) = &renamed.kind {
+            if let Some(bindings) = &target_bindings {
+                out.push(crate::ast::Stmt::new(
+                    crate::ast::StmtKind::Local {
+                        bindings: bindings.clone(),
+                        initializer: Some(vals.clone()),
+                    },
+                    span,
+                ));
+            } else if let Some(first) = vals.first() {
+                out.push(crate::ast::Stmt::new(
+                    crate::ast::StmtKind::Expr(first.clone()),
+                    span,
+                ));
+            }
+            continue;
+        }
+        out.push(renamed);
+    }
+    out
+}
+
+fn rename_idents_in_stmt(
+    stmt: &crate::ast::Stmt,
+    map: &std::collections::HashMap<String, String>,
+) -> crate::ast::Stmt {
+    let kind = match &stmt.kind {
+        crate::ast::StmtKind::Local {
+            bindings,
+            initializer,
+        } => crate::ast::StmtKind::Local {
+            bindings: bindings
+                .iter()
+                .map(|b| crate::ast::LocalBinding {
+                    name: map.get(&b.name).cloned().unwrap_or_else(|| b.name.clone()),
+                    type_annotation: b.type_annotation.clone(),
+                    span: b.span,
+                })
+                .collect(),
+            initializer: initializer
+                .as_ref()
+                .map(|es| es.iter().map(|e| rename_idents_in_expr(e, map)).collect()),
+        },
+        crate::ast::StmtKind::Assign { targets, values } => crate::ast::StmtKind::Assign {
+            targets: targets.iter().map(|e| rename_idents_in_expr(e, map)).collect(),
+            values: values.iter().map(|e| rename_idents_in_expr(e, map)).collect(),
+        },
+        crate::ast::StmtKind::CompoundAssign { target, op, value } => {
+            crate::ast::StmtKind::CompoundAssign {
+                target: rename_idents_in_expr(target, map),
+                op: *op,
+                value: rename_idents_in_expr(value, map),
+            }
+        }
+        crate::ast::StmtKind::Expr(e) => {
+            crate::ast::StmtKind::Expr(rename_idents_in_expr(e, map))
+        }
+        crate::ast::StmtKind::Return(es) => {
+            crate::ast::StmtKind::Return(es.iter().map(|e| rename_idents_in_expr(e, map)).collect())
+        }
+        crate::ast::StmtKind::If {
+            condition,
+            then_block,
+            elseif_branches,
+            else_block,
+        } => crate::ast::StmtKind::If {
+            condition: rename_idents_in_expr(condition, map),
+            then_block: then_block
+                .iter()
+                .map(|s| rename_idents_in_stmt(s, map))
+                .collect(),
+            elseif_branches: elseif_branches
+                .iter()
+                .map(|(c, b)| {
+                    (
+                        rename_idents_in_expr(c, map),
+                        b.iter().map(|s| rename_idents_in_stmt(s, map)).collect(),
+                    )
+                })
+                .collect(),
+            else_block: else_block
+                .as_ref()
+                .map(|b| b.iter().map(|s| rename_idents_in_stmt(s, map)).collect()),
+        },
+        crate::ast::StmtKind::While { condition, body } => crate::ast::StmtKind::While {
+            condition: rename_idents_in_expr(condition, map),
+            body: body.iter().map(|s| rename_idents_in_stmt(s, map)).collect(),
+        },
+        crate::ast::StmtKind::Block(b) => {
+            crate::ast::StmtKind::Block(b.iter().map(|s| rename_idents_in_stmt(s, map)).collect())
+        }
+        crate::ast::StmtKind::Scoped(b) => {
+            crate::ast::StmtKind::Scoped(b.iter().map(|s| rename_idents_in_stmt(s, map)).collect())
+        }
+        crate::ast::StmtKind::Defer(s) => {
+            crate::ast::StmtKind::Defer(Box::new(rename_idents_in_stmt(s, map)))
+        }
+        crate::ast::StmtKind::ErrDefer(s) => {
+            crate::ast::StmtKind::ErrDefer(Box::new(rename_idents_in_stmt(s, map)))
+        }
+        other => other.clone(),
+    };
+    crate::ast::Stmt::new(kind, stmt.span)
+}
+
+fn rename_idents_in_expr(
+    expr: &crate::ast::Expr,
+    map: &std::collections::HashMap<String, String>,
+) -> crate::ast::Expr {
+    let kind = match &expr.kind {
+        crate::ast::ExprKind::Identifier(name) => crate::ast::ExprKind::Identifier(
+            map.get(name).cloned().unwrap_or_else(|| name.clone()),
+        ),
+        crate::ast::ExprKind::Call {
+            callee,
+            type_args,
+            args,
+        } => crate::ast::ExprKind::Call {
+            callee: Box::new(rename_idents_in_expr(callee, map)),
+            type_args: type_args.clone(),
+            args: args.iter().map(|a| rename_idents_in_expr(a, map)).collect(),
+        },
+        crate::ast::ExprKind::MethodCall {
+            receiver,
+            method,
+            type_args,
+            args,
+        } => crate::ast::ExprKind::MethodCall {
+            receiver: Box::new(rename_idents_in_expr(receiver, map)),
+            method: method.clone(),
+            type_args: type_args.clone(),
+            args: args.iter().map(|a| rename_idents_in_expr(a, map)).collect(),
+        },
+        crate::ast::ExprKind::Binary { left, op, right } => crate::ast::ExprKind::Binary {
+            left: Box::new(rename_idents_in_expr(left, map)),
+            op: *op,
+            right: Box::new(rename_idents_in_expr(right, map)),
+        },
+        crate::ast::ExprKind::Unary { op, operand } => crate::ast::ExprKind::Unary {
+            op: *op,
+            operand: Box::new(rename_idents_in_expr(operand, map)),
+        },
+        crate::ast::ExprKind::Paren(inner) => {
+            crate::ast::ExprKind::Paren(Box::new(rename_idents_in_expr(inner, map)))
+        }
+        crate::ast::ExprKind::Array(es) => {
+            crate::ast::ExprKind::Array(es.iter().map(|e| rename_idents_in_expr(e, map)).collect())
+        }
+        crate::ast::ExprKind::Tuple(es) => {
+            crate::ast::ExprKind::Tuple(es.iter().map(|e| rename_idents_in_expr(e, map)).collect())
+        }
+        crate::ast::ExprKind::Index { object, index } => crate::ast::ExprKind::Index {
+            object: Box::new(rename_idents_in_expr(object, map)),
+            index: Box::new(rename_idents_in_expr(index, map)),
+        },
+        crate::ast::ExprKind::FieldAccess { object, field } => crate::ast::ExprKind::FieldAccess {
+            object: Box::new(rename_idents_in_expr(object, map)),
+            field: field.clone(),
+        },
+        crate::ast::ExprKind::Cast {
+            expr: inner,
+            target_type,
+        } => crate::ast::ExprKind::Cast {
+            expr: Box::new(rename_idents_in_expr(inner, map)),
+            target_type: target_type.clone(),
+        },
+        other => other.clone(),
+    };
+    crate::ast::Expr::new(kind, expr.span)
+}
+
+fn lower_defers_and_scoped_in_stmts(
+    stmts: &[crate::ast::Stmt],
+    nt_counter: &mut usize,
+) -> Vec<crate::ast::Stmt> {
+    let mut main_stmts: Vec<crate::ast::Stmt> = Vec::with_capacity(stmts.len());
+    let mut deferred: Vec<crate::ast::Stmt> = Vec::new();
+
+    for stmt in stmts {
+        match &stmt.kind {
+            crate::ast::StmtKind::Defer(inner) => {
+                deferred.push((**inner).clone());
+            }
+            crate::ast::StmtKind::Scoped(inner) => {
+                let lowered = lower_defers_and_scoped_in_stmts(inner, nt_counter);
+                main_stmts.extend(lowered);
+            }
+            _ => {
+                main_stmts.push(stmt.clone());
+            }
+        }
+    }
+
+    if deferred.is_empty() {
+        return main_stmts;
+    }
+
+    // If the block ends with an expression or return value, evaluate and bind it before
+    // running deferred cleanup statements in LIFO order.
+    let tail_is_return = matches!(
+        main_stmts.last().map(|s| &s.kind),
+        Some(crate::ast::StmtKind::Return(_))
+    );
+    let tail_val: Option<(crate::ast::Expr, Span)> = match main_stmts.last().map(|s| &s.kind) {
+        Some(crate::ast::StmtKind::Expr(e)) => {
+            let span = main_stmts.last().map(|s| s.span).unwrap_or_else(Span::dummy);
+            let expr = e.clone();
+            main_stmts.pop();
+            Some((expr, span))
+        }
+        Some(crate::ast::StmtKind::Return(vals)) if vals.len() == 1 => {
+            let span = main_stmts.last().map(|s| s.span).unwrap_or_else(Span::dummy);
+            let expr = vals[0].clone();
+            main_stmts.pop();
+            Some((expr, span))
+        }
+        _ => None,
+    };
+
+    if let Some((expr, span)) = tail_val {
+        let id = *nt_counter;
+        *nt_counter += 1;
+        let ret_var = format!("__nt_defer_ret_{id}");
+        main_stmts.push(crate::ast::Stmt::new(
+            crate::ast::StmtKind::Local {
+                bindings: vec![crate::ast::LocalBinding {
+                    name: ret_var.clone(),
+                    type_annotation: None,
+                    span,
+                }],
+                initializer: Some(vec![expr]),
+            },
+            span,
+        ));
+        for d in deferred.into_iter().rev() {
+            main_stmts.push(d);
+        }
+        let ret_ident = crate::ast::Expr::new(crate::ast::ExprKind::Identifier(ret_var), span);
+        if tail_is_return {
+            main_stmts.push(crate::ast::Stmt::new(
+                crate::ast::StmtKind::Return(vec![ret_ident]),
+                span,
+            ));
+        } else {
+            main_stmts.push(crate::ast::Stmt::new(
+                crate::ast::StmtKind::Expr(ret_ident),
+                span,
+            ));
+        }
+    } else {
+        for d in deferred.into_iter().rev() {
+            main_stmts.push(d);
+        }
+    }
+
+    main_stmts
+}
+
+fn desugar_for_loops_with_perform(
+    stmts: &[crate::ast::Stmt],
+    handled_ops: &std::collections::HashSet<String>,
+    nt_counter: &mut usize,
+) -> Vec<crate::ast::Stmt> {
+    let mut out = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        if let crate::ast::StmtKind::ForNumeric {
+            variable,
+            start,
+            end,
+            step,
+            body,
+        } = &stmt.kind
+            && stmt_contains_handled_perform(stmt, handled_ops)
+        {
+            let span = stmt.span;
+            let id = *nt_counter;
+            *nt_counter += 1;
+            let idx_name = format!("__nt_for_i_{id}");
+            let end_name = format!("__nt_for_end_{id}");
+            let step_name = format!("__nt_for_step_{id}");
+            let int_ty = Type::new(TypeKind::Int, span);
+
+            let step_expr = step.clone().unwrap_or_else(|| {
+                crate::ast::Expr::new(
+                    crate::ast::ExprKind::Literal(crate::ast::Literal::Integer(1)),
+                    span,
+                )
+            });
+            let is_negative_step = matches!(
+                &step_expr.kind,
+                crate::ast::ExprKind::Unary {
+                    op: crate::ast::UnaryOp::Neg,
+                    ..
+                }
+            );
+            let cmp_op = if is_negative_step {
+                crate::ast::BinaryOp::Ge
+            } else {
+                crate::ast::BinaryOp::Le
+            };
+
+            out.push(crate::ast::Stmt::new(
+                crate::ast::StmtKind::Local {
+                    bindings: vec![crate::ast::LocalBinding {
+                        name: idx_name.clone(),
+                        type_annotation: Some(int_ty.clone()),
+                        span,
+                    }],
+                    initializer: Some(vec![start.clone()]),
+                },
+                span,
+            ));
+            out.push(crate::ast::Stmt::new(
+                crate::ast::StmtKind::Local {
+                    bindings: vec![crate::ast::LocalBinding {
+                        name: end_name.clone(),
+                        type_annotation: Some(int_ty.clone()),
+                        span,
+                    }],
+                    initializer: Some(vec![end.clone()]),
+                },
+                span,
+            ));
+            out.push(crate::ast::Stmt::new(
+                crate::ast::StmtKind::Local {
+                    bindings: vec![crate::ast::LocalBinding {
+                        name: step_name.clone(),
+                        type_annotation: Some(int_ty.clone()),
+                        span,
+                    }],
+                    initializer: Some(vec![step_expr]),
+                },
+                span,
+            ));
+
+            let mut while_body = Vec::with_capacity(body.len() + 2);
+            while_body.push(crate::ast::Stmt::new(
+                crate::ast::StmtKind::Local {
+                    bindings: vec![crate::ast::LocalBinding {
+                        name: variable.clone(),
+                        type_annotation: Some(int_ty),
+                        span,
+                    }],
+                    initializer: Some(vec![crate::ast::Expr::new(
+                        crate::ast::ExprKind::Identifier(idx_name.clone()),
+                        span,
+                    )]),
+                },
+                span,
+            ));
+            while_body.extend(desugar_for_loops_with_perform(body, handled_ops, nt_counter));
+            while_body.push(crate::ast::Stmt::new(
+                crate::ast::StmtKind::Assign {
+                    targets: vec![crate::ast::Expr::new(
+                        crate::ast::ExprKind::Identifier(idx_name.clone()),
+                        span,
+                    )],
+                    values: vec![crate::ast::Expr::new(
+                        crate::ast::ExprKind::Binary {
+                            left: Box::new(crate::ast::Expr::new(
+                                crate::ast::ExprKind::Identifier(idx_name.clone()),
+                                span,
+                            )),
+                            op: crate::ast::BinaryOp::Add,
+                            right: Box::new(crate::ast::Expr::new(
+                                crate::ast::ExprKind::Identifier(step_name),
+                                span,
+                            )),
+                        },
+                        span,
+                    )],
+                },
+                span,
+            ));
+
+            let cond = crate::ast::Expr::new(
+                crate::ast::ExprKind::Binary {
+                    left: Box::new(crate::ast::Expr::new(
+                        crate::ast::ExprKind::Identifier(idx_name),
+                        span,
+                    )),
+                    op: cmp_op,
+                    right: Box::new(crate::ast::Expr::new(
+                        crate::ast::ExprKind::Identifier(end_name),
+                        span,
+                    )),
+                },
+                span,
+            );
+            out.push(crate::ast::Stmt::new(
+                crate::ast::StmtKind::While {
+                    condition: cond,
+                    body: while_body,
+                },
+                span,
+            ));
+            continue;
+        }
+        out.push(stmt.clone());
+    }
+    out
+}
+
+fn lower_while_loops_with_perform(
+    stmts: &[crate::ast::Stmt],
+    handled_ops: &std::collections::HashSet<String>,
+    orig_arms_array: &crate::ast::Expr,
+    local_ty_env: &std::collections::HashMap<String, Type>,
+    _nt_counter: &mut usize,
+    fallback_span: Span,
+) -> Vec<crate::ast::Stmt> {
+    let Some(while_idx) = stmts.iter().position(|s| {
+        matches!(&s.kind, crate::ast::StmtKind::While { .. })
+            && stmt_contains_handled_perform(s, handled_ops)
+    }) else {
+        return stmts.to_vec();
+    };
+
+    let prefix = &stmts[..while_idx];
+    let target = &stmts[while_idx];
+    let rest = &stmts[while_idx + 1..];
+
+    let crate::ast::StmtKind::While { condition, body } = &target.kind else {
+        return stmts.to_vec();
+    };
+
+    // Collect known variable types from enclosing function params, local_ty_env, and prefix locals
+    let mut known_types: std::collections::HashMap<String, Type> =
+        CPS_MODULE_CTX.with(|ctx| ctx.borrow().current_fn_param_tys.clone());
+    for (k, v) in local_ty_env {
+        known_types.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    for s in prefix {
+        if let crate::ast::StmtKind::Local {
+            bindings,
+            initializer,
+        } = &s.kind
+        {
+            for (idx, b) in bindings.iter().enumerate() {
+                if let Some(ty) = &b.type_annotation {
+                    known_types.insert(b.name.clone(), ty.clone());
+                } else if let Some(inits) = initializer
+                    && let Some(init_e) = inits.get(idx)
+                {
+                    let inferred = infer_simple_ast_expr_type(init_e, &known_types)
+                        .unwrap_or_else(|| Type::new(TypeKind::Int, b.span));
+                    known_types.insert(b.name.clone(), inferred);
+                } else {
+                    known_types.insert(b.name.clone(), Type::new(TypeKind::Int, b.span));
+                }
+            }
+        }
+    }
+
+    // Collect all identifiers referenced in condition, body, and rest that are in known_types
+    let mut referenced = std::collections::BTreeSet::new();
+    collect_referenced_idents_in_expr(condition, &mut referenced);
+    for s in body {
+        collect_referenced_idents_in_stmt(s, &mut referenced);
+    }
+    for s in rest {
+        collect_referenced_idents_in_stmt(s, &mut referenced);
+    }
+    let live_vars: Vec<(String, Type)> = referenced
+        .into_iter()
+        .filter_map(|name| known_types.get(&name).cloned().map(|ty| (name, ty)))
+        .collect();
+
+    let (step_fn_name, ret_ty) = CPS_MODULE_CTX.with(|ctx| {
+        let mut c = ctx.borrow_mut();
+        let lid = c.loop_counter;
+        c.loop_counter += 1;
+        let rty = c
+            .current_fn_ret_ty
+            .clone()
+            .unwrap_or_else(|| Type::new(TypeKind::Int, fallback_span));
+        (format!("__cps_loop_step_{lid}"), rty)
+    });
+
+    let span = target.span;
+    let live_arg_exprs: Vec<crate::ast::Expr> = live_vars
+        .iter()
+        .map(|(n, _)| crate::ast::Expr::new(crate::ast::ExprKind::Identifier(n.clone()), span))
+        .collect();
+
+    let recursive_call = crate::ast::Expr::new(
+        crate::ast::ExprKind::Call {
+            callee: Box::new(crate::ast::Expr::new(
+                crate::ast::ExprKind::Identifier(step_fn_name.clone()),
+                span,
+            )),
+            type_args: None,
+            args: live_arg_exprs.clone(),
+        },
+        span,
+    );
+
+    let mut iter_body = body.clone();
+    iter_body.push(crate::ast::Stmt::new(
+        crate::ast::StmtKind::Return(vec![recursive_call.clone()]),
+        span,
+    ));
+
+    let iter_thunk = crate::ast::Expr::new(
+        crate::ast::ExprKind::Lambda {
+            params: Vec::new(),
+            return_type: None,
+            body: Box::new(crate::ast::Expr::new(
+                crate::ast::ExprKind::Block(iter_body),
+                span,
+            )),
+        },
+        span,
+    );
+    let iter_handle = crate::ast::Expr::new(
+        crate::ast::ExprKind::Call {
+            callee: Box::new(crate::ast::Expr::new(
+                crate::ast::ExprKind::Identifier("__lust_handle".to_string()),
+                span,
+            )),
+            type_args: None,
+            args: vec![iter_thunk, orig_arms_array.clone()],
+        },
+        span,
+    );
+
+    let else_block = if rest
+        .iter()
+        .any(|s| stmt_contains_handled_perform(s, handled_ops))
+    {
+        let rest_thunk = crate::ast::Expr::new(
+            crate::ast::ExprKind::Lambda {
+                params: Vec::new(),
+                return_type: None,
+                body: Box::new(crate::ast::Expr::new(
+                    crate::ast::ExprKind::Block(rest.to_vec()),
+                    span,
+                )),
+            },
+            span,
+        );
+        let rest_handle = crate::ast::Expr::new(
+            crate::ast::ExprKind::Call {
+                callee: Box::new(crate::ast::Expr::new(
+                    crate::ast::ExprKind::Identifier("__lust_handle".to_string()),
+                    span,
+                )),
+                type_args: None,
+                args: vec![rest_thunk, orig_arms_array.clone()],
+            },
+            span,
+        );
+        vec![crate::ast::Stmt::new(
+            crate::ast::StmtKind::Return(vec![rest_handle]),
+            span,
+        )]
+    } else {
+        let mut eb = rest.to_vec();
+        if let Some(last) = eb.last_mut()
+            && let crate::ast::StmtKind::Expr(e) = &last.kind
+        {
+            let e_owned = e.clone();
+            last.kind = crate::ast::StmtKind::Return(vec![e_owned]);
+        }
+        eb
+    };
+
+    let step_fn_body = vec![crate::ast::Stmt::new(
+        crate::ast::StmtKind::If {
+            condition: condition.clone(),
+            then_block: vec![crate::ast::Stmt::new(
+                crate::ast::StmtKind::Return(vec![iter_handle]),
+                span,
+            )],
+            elseif_branches: Vec::new(),
+            else_block: Some(else_block),
+        },
+        span,
+    )];
+
+    let step_fn = FunctionDef {
+        name: step_fn_name,
+        type_params: Vec::new(),
+        trait_bounds: Vec::new(),
+        params: live_vars
+            .iter()
+            .map(|(n, ty)| crate::ast::FunctionParam {
+                name: n.clone(),
+                ty: ty.clone(),
+                is_self: false,
+            })
+            .collect(),
+        return_type: Some(ret_ty),
+        body: step_fn_body,
+        is_method: false,
+        visibility: crate::ast::Visibility::Private,
+        doc: None,
+        effects: None,
+    };
+
+    CPS_MODULE_CTX.with(|ctx| {
+        ctx.borrow_mut().generated_fns.push(step_fn);
+    });
+
+    let mut out = prefix.to_vec();
+    out.push(crate::ast::Stmt::new(
+        crate::ast::StmtKind::Return(vec![recursive_call]),
+        span,
+    ));
+    out
+}
+
+fn collect_referenced_idents_in_stmt(
+    stmt: &crate::ast::Stmt,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    match &stmt.kind {
+        crate::ast::StmtKind::Local {
+            initializer: Some(es),
+            ..
+        }
+        | crate::ast::StmtKind::Return(es) => {
+            for e in es {
+                collect_referenced_idents_in_expr(e, out);
+            }
+        }
+        crate::ast::StmtKind::Assign { targets, values } => {
+            for e in targets.iter().chain(values.iter()) {
+                collect_referenced_idents_in_expr(e, out);
+            }
+        }
+        crate::ast::StmtKind::CompoundAssign { target, value, .. } => {
+            collect_referenced_idents_in_expr(target, out);
+            collect_referenced_idents_in_expr(value, out);
+        }
+        crate::ast::StmtKind::Expr(e) => collect_referenced_idents_in_expr(e, out),
+        crate::ast::StmtKind::If {
+            condition,
+            then_block,
+            elseif_branches,
+            else_block,
+        } => {
+            collect_referenced_idents_in_expr(condition, out);
+            for s in then_block {
+                collect_referenced_idents_in_stmt(s, out);
+            }
+            for (c, b) in elseif_branches {
+                collect_referenced_idents_in_expr(c, out);
+                for s in b {
+                    collect_referenced_idents_in_stmt(s, out);
+                }
+            }
+            if let Some(b) = else_block {
+                for s in b {
+                    collect_referenced_idents_in_stmt(s, out);
+                }
+            }
+        }
+        crate::ast::StmtKind::While { condition, body } => {
+            collect_referenced_idents_in_expr(condition, out);
+            for s in body {
+                collect_referenced_idents_in_stmt(s, out);
+            }
+        }
+        crate::ast::StmtKind::Block(b) | crate::ast::StmtKind::Scoped(b) => {
+            for s in b {
+                collect_referenced_idents_in_stmt(s, out);
+            }
+        }
+        crate::ast::StmtKind::Defer(s) | crate::ast::StmtKind::ErrDefer(s) => {
+            collect_referenced_idents_in_stmt(s, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_referenced_idents_in_expr(
+    expr: &crate::ast::Expr,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    match &expr.kind {
+        crate::ast::ExprKind::Identifier(name) => {
+            out.insert(name.clone());
+        }
+        crate::ast::ExprKind::Call { callee, args, .. } => {
+            collect_referenced_idents_in_expr(callee, out);
+            for a in args {
+                collect_referenced_idents_in_expr(a, out);
+            }
+        }
+        crate::ast::ExprKind::MethodCall { receiver, args, .. } => {
+            collect_referenced_idents_in_expr(receiver, out);
+            for a in args {
+                collect_referenced_idents_in_expr(a, out);
+            }
+        }
+        crate::ast::ExprKind::Binary { left, right, .. } => {
+            collect_referenced_idents_in_expr(left, out);
+            collect_referenced_idents_in_expr(right, out);
+        }
+        crate::ast::ExprKind::Unary { operand: inner, .. }
+        | crate::ast::ExprKind::Paren(inner)
+        | crate::ast::ExprKind::FieldAccess { object: inner, .. }
+        | crate::ast::ExprKind::Cast { expr: inner, .. } => {
+            collect_referenced_idents_in_expr(inner, out);
+        }
+        crate::ast::ExprKind::Array(es) | crate::ast::ExprKind::Tuple(es) => {
+            for e in es {
+                collect_referenced_idents_in_expr(e, out);
+            }
+        }
+        crate::ast::ExprKind::Index { object, index } => {
+            collect_referenced_idents_in_expr(object, out);
+            collect_referenced_idents_in_expr(index, out);
+        }
+        _ => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3123,8 +4505,39 @@ fn stmt_contains_handled_perform(
                     b.iter().any(|s| stmt_contains_handled_perform(s, handled_ops))
                 })
         }
-        crate::ast::StmtKind::Block(b) => {
+        crate::ast::StmtKind::While { condition, body } => {
+            expr_contains_handled_perform(condition, handled_ops)
+                || body
+                    .iter()
+                    .any(|s| stmt_contains_handled_perform(s, handled_ops))
+        }
+        crate::ast::StmtKind::ForNumeric {
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            expr_contains_handled_perform(start, handled_ops)
+                || expr_contains_handled_perform(end, handled_ops)
+                || step
+                    .as_ref()
+                    .is_some_and(|st| expr_contains_handled_perform(st, handled_ops))
+                || body
+                    .iter()
+                    .any(|s| stmt_contains_handled_perform(s, handled_ops))
+        }
+        crate::ast::StmtKind::ForIn { iterator, body, .. } => {
+            expr_contains_handled_perform(iterator, handled_ops)
+                || body
+                    .iter()
+                    .any(|s| stmt_contains_handled_perform(s, handled_ops))
+        }
+        crate::ast::StmtKind::Block(b) | crate::ast::StmtKind::Scoped(b) => {
             b.iter().any(|s| stmt_contains_handled_perform(s, handled_ops))
+        }
+        crate::ast::StmtKind::Defer(s) | crate::ast::StmtKind::ErrDefer(s) => {
+            stmt_contains_handled_perform(s, handled_ops)
         }
         _ => false,
     }
@@ -4249,8 +5662,7 @@ fn compile_rust_source(
 ) -> Result<PathBuf> {
     let rust_links = RustLinkOptions {
         aot_links: links.clone(),
-        linked_crates: Vec::new(),
-        lto_thin: false,
+        ..RustLinkOptions::default()
     };
     compile_rust_source_with_rlibs(rust_source, output_bin, opts, &rust_links)
 }
@@ -4289,7 +5701,24 @@ fn compile_rust_source_with_rlibs(
         }
     }
 
-    let rlib_path = ensure_cached_aot_rt_rlib(opts)?;
+    let rlib_path = if let Some(override_path) = links
+        .aot_rt_rlib_override
+        .clone()
+        .or_else(|| {
+            std::env::var_os("LUST_AOT_RT_RLIB")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        }) {
+        if !override_path.exists() {
+            return Err(LustError::Unknown(format!(
+                "LUST_AOT_RT_RLIB override not found at '{}'",
+                override_path.display()
+            )));
+        }
+        override_path
+    } else {
+        ensure_cached_aot_rt_rlib(opts)?
+    };
     let rustc = find_rustc();
     let opt_level = release_mode_to_opt_level(&opts.aot.release_mode);
 
@@ -4314,6 +5743,17 @@ fn compile_rust_source_with_rlibs(
 
     if links.lto_thin || !links.linked_crates.is_empty() {
         cmd.arg("-C").arg("lto=thin");
+    }
+    if let Some(pgo_gen_dir) = &links.pgo_generate {
+        let _ = fs::create_dir_all(pgo_gen_dir);
+        cmd.arg(format!("-Cprofile-generate={}", pgo_gen_dir.display()));
+    }
+    if let Some(pgo_use_path) = &links.pgo_use {
+        cmd.arg(format!("-Cprofile-use={}", pgo_use_path.display()));
+        cmd.arg("-Cllvm-args=-pgo-warn-missing-function");
+    }
+    if let Some(pgo_sample_path) = &links.pgo_sample_use {
+        cmd.arg(format!("-Cprofile-sample-use={}", pgo_sample_path.display()));
     }
     if opt_level == "0" {
         cmd.arg("-C").arg("debuginfo=2");

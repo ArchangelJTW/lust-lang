@@ -6,6 +6,7 @@
 //! - [`StaticSlabAllocator`]: fixed-size `UnsafeCell<[u8; N]>` bump slab for `no_std` embedded targets
 
 use crate::alloc_crate::alloc::Global;
+use crate::alloc_crate::rc::Rc;
 use crate::alloc_crate::vec::Vec;
 use core::alloc::{AllocError, Allocator, Layout};
 use core::cell::{Cell, RefCell, UnsafeCell};
@@ -35,12 +36,27 @@ impl fmt::Display for BudgetAllocError {
 
 impl core::error::Error for BudgetAllocError {}
 
-/// Single-threaded (`!Send + !Sync`) budgeting allocator backed by [`Global`].
+/// Shared single-threaded cumulative budget ledger backing [`LustBudgetAlloc::share`].
 #[derive(Debug)]
+struct BudgetLedger {
+    used_bytes: Cell<usize>,
+    limit_bytes: Cell<usize>,
+    peak_bytes: Cell<usize>,
+}
+
+/// Single-threaded (`!Send + !Sync`) budgeting allocator backed by [`Global`].
+///
+/// Unshared instances track counters inline in `Cell<usize>` with zero heap overhead
+/// (supporting `const fn` construction in `AotCtx`). Calling [`LustBudgetAlloc::share`]
+/// lazily promotes the counters into a shared `Rc<BudgetLedger>` so clones across effect
+/// handlers, continuations, scope finalizers, spawned tasks, and closures charge and
+/// refund the exact same cumulative budget ledger.
 pub struct LustBudgetAlloc {
     used_bytes: Cell<usize>,
     limit_bytes: Cell<usize>,
     peak_bytes: Cell<usize>,
+    is_shared: Cell<bool>,
+    shared: RefCell<Option<Rc<BudgetLedger>>>,
     _not_send_sync: PhantomData<*const ()>,
 }
 
@@ -56,37 +72,78 @@ impl LustBudgetAlloc {
             used_bytes: Cell::new(0),
             limit_bytes: Cell::new(limit_bytes),
             peak_bytes: Cell::new(0),
+            is_shared: Cell::new(false),
+            shared: RefCell::new(None),
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    /// Creates a new [`LustBudgetAlloc`] handle sharing the exact same cumulative
+    /// `used_bytes`, `peak_bytes`, and `limit_bytes` ledger as `self`.
+    #[inline]
+    pub fn share(&self) -> Self {
+        if self.is_shared.get() {
+            if let Ok(guard) = self.shared.try_borrow() {
+                if let Some(ledger) = guard.as_ref() {
+                    return Self::from_ledger(Rc::clone(ledger));
+                }
+            }
+        }
+        self.promote_and_share()
+    }
+
+    #[cold]
+    fn promote_and_share(&self) -> Self {
+        if let Ok(mut slot) = self.shared.try_borrow_mut() {
+            let ledger = match slot.as_ref() {
+                Some(existing) => Rc::clone(existing),
+                None => {
+                    let created = Rc::new(BudgetLedger {
+                        used_bytes: Cell::new(self.used_bytes.get()),
+                        limit_bytes: Cell::new(self.limit_bytes.get()),
+                        peak_bytes: Cell::new(self.peak_bytes.get()),
+                    });
+                    *slot = Some(Rc::clone(&created));
+                    self.is_shared.set(true);
+                    created
+                }
+            };
+            return Self::from_ledger(ledger);
+        }
+        // Fail-closed fallback if re-entrantly borrowed (unreachable in normal flow;
+        // preserves panic-freedom without ever handing out uncounted budget).
+        let current_limit = self.limit_bytes.get();
+        Self {
+            used_bytes: Cell::new(current_limit),
+            limit_bytes: Cell::new(0),
+            peak_bytes: Cell::new(self.peak_bytes.get()),
+            is_shared: Cell::new(false),
+            shared: RefCell::new(None),
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn from_ledger(ledger: Rc<BudgetLedger>) -> Self {
+        Self {
+            used_bytes: Cell::new(0),
+            limit_bytes: Cell::new(0),
+            peak_bytes: Cell::new(0),
+            is_shared: Cell::new(true),
+            shared: RefCell::new(Some(ledger)),
             _not_send_sync: PhantomData,
         }
     }
 
     #[inline(always)]
-    pub fn used_bytes(&self) -> usize {
-        self.used_bytes.get()
-    }
-
-    #[inline(always)]
-    pub fn peak_bytes(&self) -> usize {
-        self.peak_bytes.get()
-    }
-
-    #[inline(always)]
-    pub fn limit_bytes(&self) -> usize {
-        self.limit_bytes.get()
-    }
-
-    #[inline(always)]
-    pub fn set_limit_bytes(&self, limit: usize) {
-        self.limit_bytes.set(limit);
-    }
-
-    #[inline(always)]
-    pub fn try_charge(&self, delta: usize) -> Result<(), BudgetAllocError> {
-        if delta == 0 {
-            return Ok(());
-        }
-        let cur = self.used_bytes.get();
-        let limit = self.limit_bytes.get();
+    fn charge_cells(
+        used_cell: &Cell<usize>,
+        limit_cell: &Cell<usize>,
+        peak_cell: &Cell<usize>,
+        delta: usize,
+    ) -> Result<(), BudgetAllocError> {
+        let cur = used_cell.get();
+        let limit = limit_cell.get();
         let next = cur.checked_add(delta).ok_or(BudgetAllocError {
             limit,
             requested: usize::MAX,
@@ -97,17 +154,123 @@ impl LustBudgetAlloc {
                 requested: next,
             });
         }
-        self.used_bytes.set(next);
-        if next > self.peak_bytes.get() {
-            self.peak_bytes.set(next);
+        used_cell.set(next);
+        if next > peak_cell.get() {
+            peak_cell.set(next);
         }
         Ok(())
     }
 
     #[inline(always)]
+    pub fn used_bytes(&self) -> usize {
+        if !self.is_shared.get() {
+            return self.used_bytes.get();
+        }
+        if let Ok(guard) = self.shared.try_borrow() {
+            if let Some(ledger) = guard.as_ref() {
+                return ledger.used_bytes.get();
+            }
+        }
+        self.used_bytes.get()
+    }
+
+    #[inline(always)]
+    pub fn peak_bytes(&self) -> usize {
+        if !self.is_shared.get() {
+            return self.peak_bytes.get();
+        }
+        if let Ok(guard) = self.shared.try_borrow() {
+            if let Some(ledger) = guard.as_ref() {
+                return ledger.peak_bytes.get();
+            }
+        }
+        self.peak_bytes.get()
+    }
+
+    #[inline(always)]
+    pub fn limit_bytes(&self) -> usize {
+        if !self.is_shared.get() {
+            return self.limit_bytes.get();
+        }
+        if let Ok(guard) = self.shared.try_borrow() {
+            if let Some(ledger) = guard.as_ref() {
+                return ledger.limit_bytes.get();
+            }
+        }
+        self.limit_bytes.get()
+    }
+
+    #[inline(always)]
+    pub fn set_limit_bytes(&self, limit: usize) {
+        if !self.is_shared.get() {
+            self.limit_bytes.set(limit);
+            return;
+        }
+        if let Ok(guard) = self.shared.try_borrow() {
+            if let Some(ledger) = guard.as_ref() {
+                ledger.limit_bytes.set(limit);
+                return;
+            }
+        }
+        self.limit_bytes.set(limit);
+    }
+
+    #[inline(always)]
+    pub fn try_charge(&self, delta: usize) -> Result<(), BudgetAllocError> {
+        if delta == 0 {
+            return Ok(());
+        }
+        if !self.is_shared.get() {
+            return Self::charge_cells(&self.used_bytes, &self.limit_bytes, &self.peak_bytes, delta);
+        }
+        if let Ok(guard) = self.shared.try_borrow() {
+            if let Some(ledger) = guard.as_ref() {
+                return Self::charge_cells(
+                    &ledger.used_bytes,
+                    &ledger.limit_bytes,
+                    &ledger.peak_bytes,
+                    delta,
+                );
+            }
+        }
+        Self::charge_cells(&self.used_bytes, &self.limit_bytes, &self.peak_bytes, delta)
+    }
+
+    #[inline(always)]
     pub fn refund(&self, delta: usize) {
+        if !self.is_shared.get() {
+            self.used_bytes
+                .set(self.used_bytes.get().saturating_sub(delta));
+            return;
+        }
+        if let Ok(guard) = self.shared.try_borrow() {
+            if let Some(ledger) = guard.as_ref() {
+                ledger
+                    .used_bytes
+                    .set(ledger.used_bytes.get().saturating_sub(delta));
+                return;
+            }
+        }
         self.used_bytes
             .set(self.used_bytes.get().saturating_sub(delta));
+    }
+}
+
+impl Clone for LustBudgetAlloc {
+    #[inline]
+    fn clone(&self) -> Self {
+        self.share()
+    }
+}
+
+impl fmt::Debug for LustBudgetAlloc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LustBudgetAlloc")
+            .field("used_bytes", &self.used_bytes())
+            .field("limit_bytes", &self.limit_bytes())
+            .field("peak_bytes", &self.peak_bytes())
+            .field("shared", &self.is_shared.get())
+            .finish()
     }
 }
 

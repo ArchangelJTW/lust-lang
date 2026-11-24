@@ -1,9 +1,15 @@
 use super::instruction::PackedInstruction;
-use super::{EnumObject, Instruction, OpCode, StructLayout, Value};
+use super::{EnumObject, Instruction, LustMap, OpCode, StructLayout, Value};
 use crate::ast::TypeKind;
 use crate::bytecode::value::Name;
 use crate::typechecker::FunctionSignature;
-use alloc::{boxed::Box, format, rc::Rc, string::String, vec::Vec};
+use alloc::{
+    boxed::Box,
+    format,
+    rc::{Rc, Weak},
+    string::String,
+    vec::Vec,
+};
 use core::cell::RefCell;
 use hashbrown::HashMap;
 
@@ -40,6 +46,12 @@ pub enum ChunkIcSlot {
     GlobalSlot {
         generation: u64,
         slot_idx: u32,
+    },
+    ModuleMapNative {
+        map_ptr: usize,
+        map_weak: Weak<RefCell<LustMap>>,
+        generation: u64,
+        value: Value,
     },
 }
 
@@ -131,6 +143,41 @@ impl ChunkIcSlot {
         };
         *target_func_idx = resolved;
         entries.insert(receiver, resolved);
+    }
+
+    #[inline(always)]
+    pub fn probe_module_map_native(
+        &self,
+        map: &Rc<RefCell<LustMap>>,
+        cur_generation: u64,
+    ) -> Option<Value> {
+        if let Self::ModuleMapNative {
+            map_ptr,
+            map_weak: _,
+            generation,
+            value,
+        } = self
+            && *map_ptr == Rc::as_ptr(map) as usize
+            && *generation == cur_generation
+        {
+            return Some(value.fast_clone());
+        }
+        None
+    }
+
+    #[inline]
+    pub fn insert_module_map_native(
+        &mut self,
+        map: &Rc<RefCell<LustMap>>,
+        generation: u64,
+        value: Value,
+    ) {
+        *self = Self::ModuleMapNative {
+            map_ptr: Rc::as_ptr(map) as usize,
+            map_weak: Rc::downgrade(map),
+            generation,
+            value,
+        };
     }
 }
 

@@ -125,8 +125,9 @@ fn prepare_mir_module_for_rust_aot_with_extern_rets(
         apply_extern_callee_return_types(&mut opt_module, extern_ret_types);
     }
 
-    // 1. Run MirOptimizer while preserving `cleanup_blocks` (DCE only walks from `entry`,
-    //    and inlining a cleanup-bearing function would lose its `cleanup_blocks`).
+    // 1. Run MirOptimizer while preserving `cleanup_blocks` and closure/effect lifting invariants
+    //    (`AOT-BUDGET-SOUND`: selectively run module-level inlining on all eligible functions
+    //    even when sibling functions contain `cleanup_blocks` or `Rvalue::Closure`).
     let has_cleanups = opt_module
         .functions
         .iter()
@@ -143,16 +144,54 @@ fn prepare_mir_module_for_rust_aot_with_extern_rets(
         // Tier 1-3 fast path (100% identical to NG-W12-4A for all 10 benchmarks)
         MirOptimizer::optimize_module(&mut opt_module);
     } else {
-        // Detach cleanup subgraphs before per-function optimization, then re-attach with
-        // remapped BlockIds so DCE never drops `is_cleanup == true` blocks.
-        let mut saved_cleanups: Vec<Vec<(MirCleanupKind, Vec<BasicBlock>)>> =
-            Vec::with_capacity(opt_module.functions.len());
-        for func in &mut opt_module.functions {
-            saved_cleanups.push(extract_cleanup_subgraphs(func));
+        // Partition functions into module-inlining-eligible vs closure/cleanup-bearing.
+        let eligible_indices: Vec<usize> = opt_module
+            .functions
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, f)| {
+                if fn_is_eligible_for_selective_module_opt(f) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let eligible_set: HashSet<usize> = eligible_indices.iter().copied().collect();
+
+        if eligible_indices.len() >= 2 {
+            let mut sub_mod = MirModule {
+                name: opt_module.name.clone(),
+                functions: eligible_indices
+                    .iter()
+                    .map(|&idx| opt_module.functions[idx].clone())
+                    .collect(),
+                struct_layouts: opt_module.struct_layouts.clone(),
+                struct_ops: opt_module.struct_ops.clone(),
+                enum_defs: opt_module.enum_defs.clone(),
+            };
+            MirOptimizer::optimize_module(&mut sub_mod);
+            for (sub_i, &orig_idx) in eligible_indices.iter().enumerate() {
+                opt_module.functions[orig_idx] = sub_mod.functions[sub_i].clone();
+            }
+        } else {
+            for &idx in &eligible_indices {
+                MirOptimizer::optimize_function(&mut opt_module.functions[idx]);
+            }
+        }
+
+        // Detach cleanup subgraphs before per-function optimization on remaining functions,
+        // then re-attach with remapped BlockIds so DCE never drops `is_cleanup == true` blocks.
+        let mut saved_cleanups: Vec<(usize, Vec<(MirCleanupKind, Vec<BasicBlock>)>)> = Vec::new();
+        for (idx, func) in opt_module.functions.iter_mut().enumerate() {
+            if eligible_set.contains(&idx) {
+                continue;
+            }
+            saved_cleanups.push((idx, extract_cleanup_subgraphs(func)));
             MirOptimizer::optimize_function(func);
         }
-        for (func, cleanups) in opt_module.functions.iter_mut().zip(saved_cleanups) {
-            reattach_cleanup_subgraphs(func, cleanups);
+        for (idx, cleanups) in saved_cleanups {
+            reattach_cleanup_subgraphs(&mut opt_module.functions[idx], cleanups);
         }
     }
 
@@ -235,6 +274,36 @@ fn prepare_mir_module_for_rust_aot_with_extern_rets(
         })
         .collect();
 
+    let pre_refine_explicit_option_locals: Vec<HashSet<LocalId>> = opt_module
+        .functions
+        .iter()
+        .map(|f| {
+            f.locals
+                .iter()
+                .filter_map(|d| matches!(d.ty, MirType::Option(_)).then_some(d.id))
+                .collect()
+        })
+        .collect();
+    let pre_refine_unknown_map_kv: Vec<(HashSet<LocalId>, HashSet<LocalId>)> = opt_module
+        .functions
+        .iter()
+        .map(|f| {
+            let mut unk_k = HashSet::new();
+            let mut unk_v = HashSet::new();
+            for d in &f.locals {
+                if let MirType::Map(k, v) = &d.ty {
+                    if **k == MirType::Unknown {
+                        unk_k.insert(d.id);
+                    }
+                    if **v == MirType::Unknown {
+                        unk_v.insert(d.id);
+                    }
+                }
+            }
+            (unk_k, unk_v)
+        })
+        .collect();
+
     for func in &mut opt_module.functions {
         apply_module_callee_return_types(func, &callee_rets);
         *func = refine_mir_function_with_layouts(func, &struct_layouts);
@@ -272,7 +341,11 @@ fn prepare_mir_module_for_rust_aot_with_extern_rets(
     normalize_builtin_luavalue_types(&mut opt_module);
 
     // 3b. Tier 4 type refinement for Map<K, V>, Enum, Closure, and dynamic AotValue locals
-    refine_tier4_types(&mut opt_module);
+    refine_tier4_types(
+        &mut opt_module,
+        &pre_refine_explicit_option_locals,
+        &pre_refine_unknown_map_kv,
+    );
 
     // 4. Run EscapeAnalysis across the refined module
     EscapeAnalysis::run_on_module(&mut opt_module);
@@ -350,6 +423,48 @@ fn normalize_builtin_luavalue_types(module: &mut MirModule) {
             }
         }
     }
+}
+
+fn fn_is_eligible_for_selective_module_opt(func: &MirFunction) -> bool {
+    if !func.cleanup_blocks.is_empty() {
+        return false;
+    }
+    let name = &func.signature.name;
+    if name.contains("__lambda_")
+        || name.starts_with("__lust_")
+        || name.contains("__nontail_")
+    {
+        return false;
+    }
+    for block in &func.blocks {
+        for stmt in &block.statements {
+            if matches!(stmt, Statement::Assign(_, Rvalue::Closure { .. }, _)) {
+                return false;
+            }
+        }
+        if let Some(Terminator::Call { callee, .. }) = &block.terminator
+            && matches!(
+                callee.as_str(),
+                "__lust_handle"
+                    | "__lust_nontail_handle"
+                    | "__lust_yield_op"
+                    | "__lust_yield_completed"
+                    | "__lust_perform"
+                    | "perform"
+                    | "__lust_resume"
+                    | "resume"
+                    | "__lust_nontail_resume"
+                    | "__lust_provide"
+                    | "__lust_scoped"
+                    | "__lust_scope_finalizer"
+                    | "__lust_scope_spawn"
+                    | "__lust_run_sync"
+            )
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn extract_cleanup_subgraphs(func: &mut MirFunction) -> Vec<(MirCleanupKind, Vec<BasicBlock>)> {
@@ -469,7 +584,11 @@ fn remap_terminator_blocks(term: &mut Terminator, remap: &HashMap<BlockId, Block
 
 /// Refines Tier 4 MIR types (`Map<K, V>`, `Enum`, `Closure`, `Array<Unknown>`, `map.*` calls)
 /// after Cranelift's general lattice refiner.
-fn refine_tier4_types(module: &mut MirModule) {
+fn refine_tier4_types(
+    module: &mut MirModule,
+    pre_refine_explicit_option_locals: &[HashSet<LocalId>],
+    pre_refine_unknown_map_kv: &[(HashSet<LocalId>, HashSet<LocalId>)],
+) {
     let enum_names: HashSet<String> = module.enum_defs.iter().map(|e| e.name.clone()).collect();
     let enum_defs_map: HashMap<String, MirEnumDef> = module
         .enum_defs
@@ -553,7 +672,7 @@ fn refine_tier4_types(module: &mut MirModule) {
         .map(|f| (f.signature.name.clone(), f.signature.return_type.clone()))
         .collect();
 
-    for func in &mut module.functions {
+    for (fn_idx, func) in module.functions.iter_mut().enumerate() {
         // 2a-effect. Propagate concrete return types for `__lust_handle`, `__lust_provide`, `__lust_run_sync`.
         refine_effect_handle_and_provide_types_in_fn(func, &module_fn_rets);
 
@@ -747,7 +866,15 @@ fn refine_tier4_types(module: &mut MirModule) {
         for idx in 0..func.locals.len() {
             let loc = LocalId(idx);
             if let MirType::Map(k, v) = func.locals[idx].ty.clone() {
-                let final_k = if *k == MirType::Unknown && !map_key_conflict.contains(&loc) {
+                let unk_k = pre_refine_unknown_map_kv
+                    .get(fn_idx)
+                    .is_some_and(|(ks, _)| ks.contains(&loc));
+                let unk_v = pre_refine_unknown_map_kv
+                    .get(fn_idx)
+                    .is_some_and(|(_, vs)| vs.contains(&loc));
+                let final_k = if unk_k && map_key_conflict.contains(&loc) {
+                    MirType::Unknown
+                } else if *k == MirType::Unknown && !map_key_conflict.contains(&loc) {
                     map_key_ev
                         .get(&loc)
                         .and_then(|o| o.clone())
@@ -755,7 +882,9 @@ fn refine_tier4_types(module: &mut MirModule) {
                 } else {
                     *k
                 };
-                let final_v = if *v == MirType::Unknown && !map_val_conflict.contains(&loc) {
+                let final_v = if unk_v && map_val_conflict.contains(&loc) {
+                    MirType::Unknown
+                } else if *v == MirType::Unknown && !map_val_conflict.contains(&loc) {
                     map_val_ev
                         .get(&loc)
                         .and_then(|o| o.clone())
@@ -833,9 +962,12 @@ fn refine_tier4_types(module: &mut MirModule) {
                     "map.get" | "table.get" if !args.is_empty() => {
                         if let MirType::Map(_, v_ty) = operand_mir_type(&args[0], func) {
                             // `AstLowering` lowers `map.get(m, k):unwrap()` directly to `map.get`,
-                            // while `refine_mir_function_with_layouts` forces `Enum("Option")`.
-                            // Keep Option only if destination is explicitly `MirType::Option(_)`.
-                            if !matches!(func.locals[dst.0].ty, MirType::Option(_)) {
+                            // while `refine_mir_function_with_layouts` forces `Option(v_ty)`/`Enum("Option")`.
+                            // Keep Option only if destination was ALREADY `MirType::Option(_)` pre-refinement.
+                            let was_explicit_opt = pre_refine_explicit_option_locals
+                                .get(fn_idx)
+                                .is_some_and(|s| s.contains(dst));
+                            if !was_explicit_opt {
                                 func.locals[dst.0].ty = (*v_ty).clone();
                                 map_get_val_types.insert(*dst, (*v_ty).clone());
                             }
@@ -928,11 +1060,47 @@ fn refine_tier4_types(module: &mut MirModule) {
                         func.locals[dst.0].ty = MirType::Bool;
                         call_dst_propagated.insert(*dst, MirType::Bool);
                     }
-                    "__mir_unknown_get_field"
-                    | "__mir_unknown_call_method"
-                    | "Queue"
-                    | "sync.Queue"
-                    | "@std/sync.Queue" => {
+                    "__mir_unknown_get_field" => {
+                        let mut refined = MirType::Unknown;
+                        if args.len() >= 2
+                            && let MirType::Struct(sname) = operand_mir_type(&args[0], func)
+                            && let Operand::Constant(MirConstant::String(fname)) = &args[1]
+                            && let Some(layout) = module
+                                .struct_layouts
+                                .iter()
+                                .find(|l| l.type_name == sname)
+                            && let Some(fdesc) = layout.fields.iter().find(|f| f.name == *fname)
+                        {
+                            refined = match fdesc.tag {
+                                CanonicalTypeTag::Bool => MirType::Bool,
+                                CanonicalTypeTag::Int64
+                                | CanonicalTypeTag::UInt64
+                                | CanonicalTypeTag::DateTimeUtc => MirType::Int,
+                                CanonicalTypeTag::Float64 => MirType::Float,
+                                CanonicalTypeTag::StringSlice | CanonicalTypeTag::BinarySlice => {
+                                    MirType::String
+                                }
+                                _ => MirType::Unknown,
+                            };
+                        }
+                        func.locals[dst.0].ty = refined.clone();
+                        call_dst_propagated.insert(*dst, refined);
+                    }
+                    "__mir_unknown_call_method" => {
+                        let mut refined = MirType::Unknown;
+                        if args.len() >= 2
+                            && let MirType::Struct(sname) = operand_mir_type(&args[0], func)
+                            && let Operand::Constant(MirConstant::String(mname)) = &args[1]
+                        {
+                            let full = format!("{sname}:{mname}");
+                            if let Some(rt) = module_fn_rets.get(&full) {
+                                refined = rt.clone();
+                            }
+                        }
+                        func.locals[dst.0].ty = refined.clone();
+                        call_dst_propagated.insert(*dst, refined);
+                    }
+                    "Queue" | "sync.Queue" | "@std/sync.Queue" => {
                         func.locals[dst.0].ty = MirType::Unknown;
                         call_dst_propagated.insert(*dst, MirType::Unknown);
                     }
@@ -1044,10 +1212,13 @@ fn refine_tier4_types(module: &mut MirModule) {
                         _,
                     ) = stmt
                         && let Some(v_ty) = map_get_val_types.get(src)
-                        && matches!(
+                        && (matches!(
                             func.locals[dst.0].ty,
                             MirType::Unknown | MirType::Enum(_)
-                        )
+                        ) || (matches!(func.locals[dst.0].ty, MirType::Option(_))
+                            && !pre_refine_explicit_option_locals
+                                .get(fn_idx)
+                                .is_some_and(|s| s.contains(dst))))
                     {
                         func.locals[dst.0].ty = v_ty.clone();
                     }
@@ -2032,6 +2203,7 @@ struct StructMeta {
     has_exact_repr_c_layout: bool,
     has_schema_decoders: bool,
     is_cyclic: bool,
+    is_mutated_cyclic: bool,
     needs_arena_lt: bool,
     is_copy: bool,
     derives_default: bool,
@@ -2125,6 +2297,8 @@ struct ModuleEmitContext<'m> {
     structs: BTreeMap<String, StructMeta>,
     /// Deterministic `1..=N` struct runtime type IDs for `AotValue::Struct` packing/dispatch (`NG-W15-1`).
     struct_type_ids: BTreeMap<String, u32>,
+    /// Struct names actually referenced by `.decode` / `__lust_mir_struct_decode_binary:` (transitively closed).
+    schema_decoded_structs: HashSet<String>,
     enums: BTreeMap<String, EnumMeta>,
     fn_metas: HashMap<String, FnMeta>,
     /// Lifted body thunks of non-tail `handle..with` returning `EffectYield<OpArg, ResumeVal, BodyRet>` (`NG-W13-1B`).
@@ -2149,7 +2323,9 @@ impl<'m> ModuleEmitContext<'m> {
             struct_type_ids.insert(sname.clone(), (idx + 1) as u32);
         }
         let enums = analyze_enums(module, &structs);
-        let module_uses_arena = structs.values().any(|s| s.is_cyclic);
+        let module_uses_arena = structs
+            .values()
+            .any(|s| s.is_cyclic && !s.is_mutated_cyclic);
 
         let readonly_params = compute_readonly_params(module);
         let gas_active = opts.gas_metering != GasMetering::None;
@@ -2787,6 +2963,37 @@ impl<'m> ModuleEmitContext<'m> {
             );
         }
 
+        let mut schema_decoded_structs: HashSet<String> = HashSet::new();
+        for func in &module.functions {
+            for block in &func.blocks {
+                if let Some(Terminator::Call { callee, .. }) = &block.terminator {
+                    if let Some(sn) = parse_mir_struct_decode_callee(callee)
+                        .or_else(|| callee.strip_prefix("__lust_mir_struct_decode_binary:"))
+                    {
+                        schema_decoded_structs.insert(sn.to_string());
+                    }
+                }
+            }
+        }
+        loop {
+            let mut changed = false;
+            let cur: Vec<String> = schema_decoded_structs.iter().cloned().collect();
+            for sn in cur {
+                if let Some(meta) = structs.get(&sn) {
+                    for sf in &meta.schema_fields {
+                        if let Some(nested) = &sf.nested_struct_name
+                            && schema_decoded_structs.insert(nested.clone())
+                        {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
         Self {
             module,
             opts,
@@ -2794,6 +3001,7 @@ impl<'m> ModuleEmitContext<'m> {
             ast_meta,
             structs,
             struct_type_ids,
+            schema_decoded_structs,
             enums,
             fn_metas,
             nontail_body_metas,
@@ -2920,7 +3128,7 @@ impl<'m> ModuleEmitContext<'m> {
                 MirType::Struct(name) => self
                     .structs
                     .get(name)
-                    .is_some_and(|s| s.is_cyclic || s.needs_arena_lt),
+                    .is_some_and(|s| (s.is_cyclic && !s.is_mutated_cyclic) || s.needs_arena_lt),
                 other => self.type_needs_lifetime(other),
             },
             MirType::Tuple(elems) => elems.iter().any(|e| self.type_needs_lifetime(e)),
@@ -2936,8 +3144,14 @@ impl<'m> ModuleEmitContext<'m> {
         }
     }
 
-    fn struct_is_cyclic(&self, name: &str) -> bool {
-        self.structs.get(name).is_some_and(|s| s.is_cyclic)
+    fn struct_is_arena_cyclic(&self, name: &str) -> bool {
+        self.structs
+            .get(name)
+            .is_some_and(|s| s.is_cyclic && !s.is_mutated_cyclic)
+    }
+
+    fn struct_is_rc_cyclic(&self, name: &str) -> bool {
+        self.structs.get(name).is_some_and(|s| s.is_mutated_cyclic)
     }
 
     fn rust_map_key_type(&self, k: &MirType) -> String {
@@ -2986,7 +3200,7 @@ impl<'m> ModuleEmitContext<'m> {
                 }
             }
             MirType::Option(inner) => match inner.as_ref() {
-                MirType::Struct(name) if self.struct_is_cyclic(name) => {
+                MirType::Struct(name) if self.struct_is_arena_cyclic(name) => {
                     let sname = rust_struct_name(name);
                     format!(
                         "Option<alloc::boxed::Box<{sname}<{lt}>, &{lt} lust_aot_rt::LustChunkArena<{lt}>>>"
@@ -3296,6 +3510,32 @@ fn analyze_structs(module: &MirModule) -> BTreeMap<String, StructMeta> {
         is_cyclic.insert(sname.clone(), cyclic);
     }
 
+    // Detect cyclic structs whose fields are mutated anywhere in the module (`AOT-BUDGET-SOUND`).
+    // Pure immutable recursive trees (e.g. `tree.lust`) remain arena-allocated (`LustChunkArena`),
+    // while mutated cyclic structs (e.g. `Cell` in `NG-08`) use `Rc<RefCell<...>>` to preserve
+    // reference aliasing identity and immediately reclaim memory when cycles are broken.
+    let mut mutated_structs: HashSet<String> = HashSet::new();
+    for func in &module.functions {
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if let Statement::Assign(Place::Field(base, _), _, _) = stmt
+                    && let MirType::Struct(sn) = place_type_raw(base, func)
+                {
+                    mutated_structs.insert(sn);
+                }
+            }
+        }
+    }
+    let mut is_mutated_cyclic: HashMap<String, bool> = HashMap::new();
+    for sname in raw_fields.keys() {
+        let mc = is_cyclic[sname] && mutated_structs.contains(sname);
+        is_mutated_cyclic.insert(sname.clone(), mc);
+    }
+    let mut is_arena_cyclic: HashMap<String, bool> = HashMap::new();
+    for sname in raw_fields.keys() {
+        is_arena_cyclic.insert(sname.clone(), is_cyclic[sname] && !is_mutated_cyclic[sname]);
+    }
+
     // Fixed-point for needs_arena_lt, is_copy, derives_default
     let mut needs_arena_lt: HashMap<String, bool> = HashMap::new();
     let mut is_copy: HashMap<String, bool> = HashMap::new();
@@ -3303,7 +3543,7 @@ fn analyze_structs(module: &MirModule) -> BTreeMap<String, StructMeta> {
 
     for (sname, fields) in &raw_fields {
         let has_arr = fields.iter().any(|(_, t)| type_contains_array(t));
-        needs_arena_lt.insert(sname.clone(), is_cyclic[sname] || has_arr);
+        needs_arena_lt.insert(sname.clone(), is_arena_cyclic[sname] || has_arr);
         is_copy.insert(sname.clone(), !is_cyclic[sname] && !has_arr);
         derives_default.insert(sname.clone(), !has_arr);
     }
@@ -3315,7 +3555,7 @@ fn analyze_structs(module: &MirModule) -> BTreeMap<String, StructMeta> {
             let mut cur_copy = is_copy[sname];
             let mut cur_def = derives_default[sname];
             for (_, fty) in fields {
-                if field_needs_lt(fty, &needs_arena_lt, &is_cyclic) && !cur_lt {
+                if field_needs_lt(fty, &needs_arena_lt, &is_arena_cyclic) && !cur_lt {
                     cur_lt = true;
                 }
                 if !field_is_copy(fty, &is_copy, &is_cyclic) && cur_copy {
@@ -3438,6 +3678,7 @@ fn analyze_structs(module: &MirModule) -> BTreeMap<String, StructMeta> {
                 has_exact_repr_c_layout: exact_repr_c[&name],
                 has_schema_decoders: has_schema_decoders[&name],
                 is_cyclic: is_cyclic[&name],
+                is_mutated_cyclic: is_mutated_cyclic[&name],
                 needs_arena_lt: needs_arena_lt[&name],
                 is_copy: is_copy[&name],
                 derives_default: derives_default[&name],
@@ -3609,7 +3850,7 @@ fn enum_field_needs_lt(
         MirType::Option(inner) => match inner.as_ref() {
             MirType::Struct(s) => structs
                 .get(s)
-                .is_some_and(|m| m.is_cyclic || m.needs_arena_lt),
+                .is_some_and(|m| (m.is_cyclic && !m.is_mutated_cyclic) || m.needs_arena_lt),
             other => enum_field_needs_lt(other, structs, enum_lt),
         },
         MirType::Tuple(elems) => elems
@@ -3672,7 +3913,7 @@ fn type_needs_lt_raw(
         MirType::Option(inner) => match inner.as_ref() {
             MirType::Struct(s) => structs
                 .get(s)
-                .is_some_and(|m| m.is_cyclic || m.needs_arena_lt),
+                .is_some_and(|m| (m.is_cyclic && !m.is_mutated_cyclic) || m.needs_arena_lt),
             other => type_needs_lt_raw(other, structs, enums),
         },
         MirType::Tuple(elems) => elems
@@ -4161,7 +4402,10 @@ fn compute_fn_param_modes(
             }
             MirType::Struct(sname) => {
                 let is_copy = structs.get(sname).is_some_and(|s| s.is_copy);
-                if is_ro {
+                let is_rc_cyclic = structs.get(sname).is_some_and(|s| s.is_mutated_cyclic);
+                if is_rc_cyclic {
+                    ParamMode::ByValue
+                } else if is_ro {
                     if is_copy {
                         ParamMode::ByValue
                     } else {
@@ -4311,9 +4555,16 @@ fn scan_function_local_requirements(
         }
         if let MirType::Struct(sname) = &decl.ty
             && let Some(meta) = structs.get(sname)
-            && meta.fields.iter().any(|(_, t)| type_contains_array(t))
         {
-            req.needs_alloc = true;
+            if meta.fields.iter().any(|(_, t)| type_contains_array(t)) {
+                req.needs_alloc = true;
+            }
+            if meta.is_mutated_cyclic {
+                req.can_fail = true;
+                if opts.max_memory_bytes.is_some() {
+                    req.needs_alloc = true;
+                }
+            }
         }
         if let MirType::Enum(ename) = &decl.ty
             && let Some(emeta) = enums.get(ename)
@@ -4436,7 +4687,7 @@ fn scan_function_local_requirements(
                                 if lf
                                     .locals
                                     .iter()
-                                    .any(|l| matches!(&l.ty, MirType::Struct(sn) if structs.get(sn).is_some_and(|s| s.is_cyclic)))
+                                    .any(|l| matches!(&l.ty, MirType::Struct(sn) if structs.get(sn).is_some_and(|s| s.is_cyclic && !s.is_mutated_cyclic)))
                                 {
                                     req.needs_arena = true;
                                 }
@@ -4444,7 +4695,9 @@ fn scan_function_local_requirements(
                         }
                         Rvalue::Cast(op, MirType::Option(inner)) => {
                             if let MirType::Struct(sname) = inner.as_ref()
-                                && structs.get(sname).is_some_and(|s| s.is_cyclic)
+                                && structs
+                                    .get(sname)
+                                    .is_some_and(|s| s.is_cyclic && !s.is_mutated_cyclic)
                                 && !matches!(op, Operand::Constant(MirConstant::Int(0)))
                             {
                                 req.needs_arena = true;
@@ -4548,7 +4801,10 @@ fn scan_function_local_requirements(
                                 req.needs_ctx = true;
                                 req.needs_alloc = true;
                                 req.can_fail = true;
-                                if structs.values().any(|s| s.is_cyclic) {
+                                if structs
+                                    .values()
+                                    .any(|s| s.is_cyclic && !s.is_mutated_cyclic)
+                                {
                                     req.needs_arena = true;
                                 }
                             }
@@ -4731,6 +4987,65 @@ fn emit_struct_definitions(out: &mut String, ctx: &ModuleEmitContext<'_>) {
         if ctx.interop.emit_as_include_module {
             out.push_str(INCLUDE_ALLOW_ATTR);
         }
+        if meta.is_mutated_cyclic {
+            let lt_decl = if meta.needs_arena_lt { "<'a>" } else { "" };
+            let data_name = format!("{sname}_Data");
+            let has_budget = ctx.opts.max_memory_bytes.is_some();
+            out.push_str("#[derive(Debug)]\n");
+            let _ = writeln!(out, "pub struct {data_name}{lt_decl} {{");
+            for (i, sf) in meta.schema_fields.iter().enumerate() {
+                let rust_ty = ctx.rust_schema_field_type(sf, "'a");
+                let _ = writeln!(out, "    pub field_{i}: {rust_ty}, // {}", sf.name);
+            }
+            if has_budget {
+                out.push_str("    pub __charged: usize,\n");
+                out.push_str("    pub __budget: lust_aot_rt::LustBudgetAlloc,\n");
+            }
+            out.push_str("}\n");
+            if has_budget {
+                let _ = writeln!(out, "impl{lt_decl} Drop for {data_name}{lt_decl} {{");
+                out.push_str("    #[inline]\n");
+                out.push_str("    fn drop(&mut self) {\n");
+                out.push_str("        if self.__charged > 0 {\n");
+                out.push_str("            self.__budget.refund(self.__charged);\n");
+                out.push_str("        }\n");
+                out.push_str("    }\n");
+                out.push_str("}\n");
+            }
+            out.push_str("#[derive(Clone, Debug)]\n");
+            let _ = writeln!(
+                out,
+                "pub struct {sname}{lt_decl}(pub alloc::rc::Rc<core::cell::RefCell<{data_name}{lt_decl}>>);"
+            );
+            let _ = writeln!(out, "impl{lt_decl} Default for {sname}{lt_decl} {{");
+            out.push_str("    #[inline]\n");
+            out.push_str("    fn default() -> Self {\n");
+            let mut def_inits: Vec<String> = Vec::with_capacity(meta.schema_fields.len() + 2);
+            for (i, sf) in meta.schema_fields.iter().enumerate() {
+                def_inits.push(format!(
+                    "field_{i}: {}",
+                    ctx.rust_schema_field_default_expr(sf)
+                ));
+            }
+            if has_budget {
+                def_inits.push("__charged: 0".to_string());
+                def_inits.push("__budget: lust_aot_rt::LustBudgetAlloc::unbounded()".to_string());
+            }
+            let _ = writeln!(
+                out,
+                "        Self(alloc::rc::Rc::new(core::cell::RefCell::new({data_name} {{ {} }})))",
+                def_inits.join(", ")
+            );
+            out.push_str("    }\n");
+            out.push_str("}\n");
+            let _ = writeln!(out, "impl{lt_decl} PartialEq for {sname}{lt_decl} {{");
+            out.push_str("    #[inline]\n");
+            out.push_str("    fn eq(&self, other: &Self) -> bool {\n");
+            out.push_str("        alloc::rc::Rc::ptr_eq(&self.0, &other.0)\n");
+            out.push_str("    }\n");
+            out.push_str("}\n\n");
+            continue;
+        }
         if !meta.is_cyclic {
             out.push_str("#[repr(C)]\n");
         }
@@ -4789,7 +5104,11 @@ fn emit_struct_definitions(out: &mut String, ctx: &ModuleEmitContext<'_>) {
             );
         }
 
-        if meta.has_schema_decoders {
+        if meta.has_schema_decoders
+            && (ctx.opts.is_library
+                || ctx.interop.export_public_api
+                || ctx.schema_decoded_structs.contains(&meta.name))
+        {
             emit_schema_decoders(out, meta);
         }
     }
@@ -5970,16 +6289,14 @@ fn emit_service_method_delegation(
     }
     if fmeta.needs_alloc {
         if fmeta.needs_ctx {
-            out.push_str(
-                "        let __svc_alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__ctx.budget_alloc.limit_bytes());\n",
-            );
+            out.push_str("        let __svc_alloc = __ctx.budget_alloc.share();\n");
             args.push("&__svc_alloc".to_string());
         } else {
             args.push("&__ctx.budget_alloc".to_string());
         }
     }
     if fmeta.needs_arena {
-        out.push_str("        let __svc_arena_alloc = lust_aot_rt::LustBudgetAlloc::unbounded();\n");
+        out.push_str("        let __svc_arena_alloc = __ctx.budget_alloc.share();\n");
         out.push_str(
             "        let __svc_arena = lust_aot_rt::LustChunkArena::new(&__svc_arena_alloc);\n",
         );
@@ -6562,15 +6879,29 @@ fn emit_suite_v2_runtime_helpers(
     }
 
     if need_sub {
-        let _ = writeln!(out, "{allow_attr}#[inline]");
+        let _ = writeln!(out, "{allow_attr}#[inline(always)]");
         out.push_str(
             r#"fn __lust_aot_string_sub(s: &str, start: i64, end: Option<i64>) -> alloc::string::String {
     let bytes = s.as_bytes();
     let (lo, hi) = __lust_aot_normalize_range(start, end, bytes.len());
-    let slice = &bytes[lo..hi];
-    match core::str::from_utf8(slice) {
-        Ok(valid) => alloc::string::String::from(valid),
-        Err(_) => alloc::string::String::from_utf8_lossy(slice).into_owned(),
+    if let Some(valid) = s.get(lo..hi) {
+        alloc::string::String::from(valid)
+    } else {
+        alloc::string::String::from_utf8_lossy(&bytes[lo..hi]).into_owned()
+    }
+}
+
+"#,
+        );
+        let _ = writeln!(out, "{allow_attr}#[inline(always)]");
+        out.push_str(
+            r#"fn __lust_aot_string_sub_cow<'s>(s: &'s str, start: i64, end: Option<i64>) -> alloc::borrow::Cow<'s, str> {
+    let bytes = s.as_bytes();
+    let (lo, hi) = __lust_aot_normalize_range(start, end, bytes.len());
+    if let Some(valid) = s.get(lo..hi) {
+        alloc::borrow::Cow::Borrowed(valid)
+    } else {
+        alloc::string::String::from_utf8_lossy(&bytes[lo..hi])
     }
 }
 
@@ -6631,7 +6962,7 @@ fn emit_suite_v2_runtime_helpers(
     sep: &str,
     alloc: &'a lust_aot_rt::LustBudgetAlloc,
 ) -> alloc::vec::Vec<alloc::string::String, &'a lust_aot_rt::LustBudgetAlloc> {
-    let mut out = alloc::vec::Vec::new_in(alloc);
+    let mut out = alloc::vec::Vec::with_capacity_in(4, alloc);
     if sep.is_empty() {
         for ch in s.chars() {
             let mut cs = alloc::string::String::new();
@@ -6641,6 +6972,154 @@ fn emit_suite_v2_runtime_helpers(
     } else {
         for part in s.split(sep) {
             out.push(alloc::string::String::from(part));
+        }
+    }
+    out
+}
+
+"#,
+        );
+        let _ = writeln!(out, "{allow_attr}");
+        out.push_str(
+            r#"struct __LustSplitSpans<'a> {
+    inline_len: usize,
+    inline_spans: [(u32, u32); 4],
+    overflow: Option<alloc::vec::Vec<(u32, u32), &'a lust_aot_rt::LustBudgetAlloc>>,
+}
+
+impl<'a> __LustSplitSpans<'a> {
+    #[inline(always)]
+    fn new_in(_alloc: &'a lust_aot_rt::LustBudgetAlloc) -> Self {
+        Self {
+            inline_len: 0,
+            inline_spans: [(0, 0); 4],
+            overflow: None,
+        }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        match &self.overflow {
+            Some(v) => v.len(),
+            None => self.inline_len,
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, idx: usize) -> Option<(usize, usize)> {
+        match &self.overflow {
+            Some(v) => v.get(idx).map(|&(a, b)| (a as usize, b as usize)),
+            None => {
+                if idx < self.inline_len {
+                    let (a, b) = self.inline_spans[idx];
+                    Some((a as usize, b as usize))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_cold(&mut self, lo: u32, hi: u32, alloc: &'a lust_aot_rt::LustBudgetAlloc) {
+        let pair = (lo, hi);
+        if let Some(v) = &mut self.overflow {
+            v.push(pair);
+            return;
+        }
+        let mut v = alloc::vec::Vec::with_capacity_in(8, alloc);
+        v.extend_from_slice(&self.inline_spans[..self.inline_len]);
+        v.push(pair);
+        self.inline_len = 0;
+        self.overflow = Some(v);
+    }
+
+    #[inline(always)]
+    fn push(&mut self, lo: usize, hi: usize, alloc: &'a lust_aot_rt::LustBudgetAlloc) {
+        if self.overflow.is_none() && self.inline_len < 4 {
+            self.inline_spans[self.inline_len] = (lo as u32, hi as u32);
+            self.inline_len += 1;
+        } else {
+            self.push_cold(lo as u32, hi as u32, alloc);
+        }
+    }
+}
+
+#[inline(always)]
+fn __lust_aot_string_split_pair_byte<'s>(
+    s: &'s str,
+    delim: u8,
+) -> (Option<&'s str>, Option<&'s str>) {
+    let mut it = s.split(delim as char);
+    (it.next(), it.next())
+}
+
+#[inline(always)]
+fn __lust_aot_string_split_pair<'s>(
+    s: &'s str,
+    sep: &str,
+) -> (Option<&'s str>, Option<&'s str>) {
+    if sep.is_empty() {
+        let mut chars = s.chars();
+        let Some(c0) = chars.next() else {
+            return (None, None);
+        };
+        let n0 = c0.len_utf8();
+        let p0 = &s[..n0];
+        let p1 = chars.next().map(|c1| &s[n0..n0 + c1.len_utf8()]);
+        (Some(p0), p1)
+    } else {
+        let mut it = s.split(sep);
+        (it.next(), it.next())
+    }
+}
+
+#[inline(always)]
+fn __lust_aot_string_split_spans_byte<'a>(
+    s: &str,
+    delim: u8,
+    alloc: &'a lust_aot_rt::LustBudgetAlloc,
+) -> __LustSplitSpans<'a> {
+    let bytes = s.as_bytes();
+    let mut out = __LustSplitSpans::new_in(alloc);
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == delim {
+            out.push(start, i, alloc);
+            start = i + 1;
+        }
+        i += 1;
+    }
+    out.push(start, bytes.len(), alloc);
+    out
+}
+
+#[inline]
+fn __lust_aot_string_split_spans<'a>(
+    s: &str,
+    sep: &str,
+    alloc: &'a lust_aot_rt::LustBudgetAlloc,
+) -> __LustSplitSpans<'a> {
+    let sep_bytes = sep.as_bytes();
+    if sep_bytes.len() == 1 && sep_bytes[0] < 128 {
+        return __lust_aot_string_split_spans_byte(s, sep_bytes[0], alloc);
+    }
+    let mut out = __LustSplitSpans::new_in(alloc);
+    if sep_bytes.is_empty() {
+        let mut pos = 0usize;
+        for ch in s.chars() {
+            let next = pos + ch.len_utf8();
+            out.push(pos, next, alloc);
+            pos = next;
+        }
+    } else {
+        let mut start = 0usize;
+        for part in s.split(sep) {
+            let end = start + part.len();
+            out.push(start, end, alloc);
+            start = end + sep.len();
         }
     }
     out
@@ -6947,50 +7426,61 @@ fn __lust_pat_exec(
     let (anchored, toks, cap_count) = __lust_pat_compile(pattern.as_bytes())?;
     let hay = src.as_bytes();
     let repl_bytes = repl.as_bytes();
+    let repl_has_pct = repl_bytes.contains(&b'%');
     let mut out = alloc::string::String::with_capacity(src.len());
     let mut caps = alloc::vec![(0usize, 0usize); cap_count];
     let mut pos = 0usize;
+    let mut span_start = 0usize;
     let mut count = 0_i64;
     while pos <= hay.len() {
         if count >= max_repl {
-            if let Ok(rest) = core::str::from_utf8(&hay[pos..]) {
-                out.push_str(rest);
-            }
             break;
         }
         if let Some(end) = __lust_pat_exec(hay, pos, &toks, 0, &mut caps) {
+            if pos > span_start {
+                if let Some(seg) = src.get(span_start..pos) {
+                    out.push_str(seg);
+                } else if let Ok(seg) = core::str::from_utf8(&hay[span_start..pos]) {
+                    out.push_str(seg);
+                }
+            }
             count += 1;
-            let mut ri = 0usize;
-            while ri < repl_bytes.len() {
-                if repl_bytes[ri] == b'%' && ri + 1 < repl_bytes.len() {
-                    let next = repl_bytes[ri + 1];
-                    if next == b'%' {
-                        out.push('%');
-                    } else if next == b'0' {
-                        if let Ok(seg) = core::str::from_utf8(&hay[pos..end]) {
-                            out.push_str(seg);
-                        }
-                    } else if next.is_ascii_digit() {
-                        let cidx = (next - b'1') as usize;
-                        if let Some(&(cs, ce)) = caps.get(cidx)
-                            && cs <= ce
-                            && ce <= hay.len()
-                            && let Ok(seg) = core::str::from_utf8(&hay[cs..ce])
-                        {
-                            out.push_str(seg);
-                        }
-                    } else {
-                        out.push(next as char);
-                    }
-                    ri += 2;
-                } else {
-                    if let Ok(seg) = core::str::from_utf8(&repl_bytes[ri..]) {
-                        if let Some(ch) = seg.chars().next() {
-                            out.push(ch);
-                            ri += ch.len_utf8();
+            if !repl_has_pct {
+                out.push_str(repl);
+            } else {
+                let mut ri = 0usize;
+                while ri < repl_bytes.len() {
+                    if repl_bytes[ri] == b'%' && ri + 1 < repl_bytes.len() {
+                        let next = repl_bytes[ri + 1];
+                        if next == b'%' {
+                            out.push('%');
+                        } else if next == b'0' {
+                            if let Some(seg) = src.get(pos..end) {
+                                out.push_str(seg);
+                            } else if let Ok(seg) = core::str::from_utf8(&hay[pos..end]) {
+                                out.push_str(seg);
+                            }
+                        } else if next.is_ascii_digit() {
+                            let cidx = (next - b'1') as usize;
+                            if let Some(&(cs, ce)) = caps.get(cidx)
+                                && cs <= ce
+                                && ce <= hay.len()
+                            {
+                                if let Some(seg) = src.get(cs..ce) {
+                                    out.push_str(seg);
+                                } else if let Ok(seg) = core::str::from_utf8(&hay[cs..ce]) {
+                                    out.push_str(seg);
+                                }
+                            }
                         } else {
-                            ri += 1;
+                            out.push(next as char);
                         }
+                        ri += 2;
+                    } else if let Some(seg) = repl.get(ri..)
+                        && let Some(ch) = seg.chars().next()
+                    {
+                        out.push(ch);
+                        ri += ch.len_utf8();
                     } else {
                         ri += 1;
                     }
@@ -6998,49 +7488,45 @@ fn __lust_pat_exec(
             }
             if end > pos {
                 pos = end;
-            } else {
-                if pos < hay.len() {
-                    if let Ok(seg) = core::str::from_utf8(&hay[pos..]) {
-                        if let Some(ch) = seg.chars().next() {
-                            out.push(ch);
-                            pos += ch.len_utf8();
-                        } else {
-                            pos += 1;
-                        }
-                    } else {
-                        pos += 1;
-                    }
+                span_start = pos;
+            } else if pos < hay.len() {
+                span_start = pos;
+                if let Some(seg) = src.get(pos..)
+                    && let Some(ch) = seg.chars().next()
+                {
+                    pos += ch.len_utf8();
                 } else {
-                    break;
+                    pos += 1;
                 }
+            } else {
+                span_start = hay.len();
+                break;
             }
             if anchored {
-                if let Ok(rest) = core::str::from_utf8(&hay[pos..]) {
-                    out.push_str(rest);
-                }
                 break;
             }
         } else {
             if anchored {
-                if let Ok(rest) = core::str::from_utf8(&hay[pos..]) {
-                    out.push_str(rest);
-                }
                 break;
             }
             if pos < hay.len() {
-                if let Ok(seg) = core::str::from_utf8(&hay[pos..]) {
-                    if let Some(ch) = seg.chars().next() {
-                        out.push(ch);
-                        pos += ch.len_utf8();
-                    } else {
-                        pos += 1;
-                    }
+                if let Some(seg) = src.get(pos..)
+                    && let Some(ch) = seg.chars().next()
+                {
+                    pos += ch.len_utf8();
                 } else {
                     pos += 1;
                 }
             } else {
                 break;
             }
+        }
+    }
+    if span_start < hay.len() {
+        if let Some(rest) = src.get(span_start..) {
+            out.push_str(rest);
+        } else if let Ok(rest) = core::str::from_utf8(&hay[span_start..]) {
+            out.push_str(rest);
         }
     }
     Ok((out, count))
@@ -7185,6 +7671,44 @@ fn __lust_pat_exec(
 
 "#,
         );
+    }
+
+    if need_unknown_field || need_unknown_method {
+        let copy_structs: Vec<(&String, &StructMeta)> = ctx
+            .structs
+            .iter()
+            .filter(|(_, m)| m.is_copy && !m.is_cyclic && !m.needs_arena_lt)
+            .collect();
+        if !copy_structs.is_empty() {
+            let _ = writeln!(out, "{allow_attr}#[derive(Clone, Copy, Debug)]");
+            out.push_str("enum __LustDynStruct {\n");
+            for (sname, _) in &copy_structs {
+                let vident = sanitize_ident(sname);
+                let rname = rust_struct_name(sname);
+                let _ = writeln!(out, "    {vident}({rname}),");
+            }
+            out.push_str("}\n");
+            let _ = writeln!(out, "{allow_attr}impl __LustDynStruct {{");
+            out.push_str("    #[inline(always)]\n");
+            out.push_str("    fn get_field(&self, field: &str) -> Result<lust_aot_rt::AotValue, lust_aot_rt::AotError> {\n");
+            out.push_str("        match (self, field) {\n");
+            for (sname, meta) in &copy_structs {
+                let vident = sanitize_ident(sname);
+                for (fi, (fname, fty)) in meta.fields.iter().enumerate() {
+                    let packed = coerce_rust_to_aot_value(&format!("__s.field_{fi}"), fty, ctx);
+                    let _ = writeln!(
+                        out,
+                        "            (Self::{vident}(__s), {fname:?}) => Ok({packed}),"
+                    );
+                }
+            }
+            out.push_str(
+                "            _ => Err(lust_aot_rt::AotError::UserError(alloc::format!(\"unknown field '{}' on dynamic struct\", field))),\n",
+            );
+            out.push_str("        }\n");
+            out.push_str("    }\n");
+            out.push_str("}\n\n");
+        }
     }
 
     if need_unknown_field {
@@ -7605,7 +8129,11 @@ fn emit_public_api_wrappers(out: &mut String, module: &MirModule, ctx: &ModuleEm
                 }
             }
             if meta.needs_alloc || meta.needs_arena {
-                let _ = writeln!(out, "    let __alloc = {alloc_expr};");
+                if meta.needs_ctx {
+                    out.push_str("    let __alloc = __ctx.budget_alloc.share();\n");
+                } else {
+                    let _ = writeln!(out, "    let __alloc = {alloc_expr};");
+                }
             }
             if meta.needs_arena {
                 out.push_str("    let __arena = lust_aot_rt::LustChunkArena::new(&__alloc);\n");
@@ -7649,7 +8177,11 @@ fn emit_public_api_wrappers(out: &mut String, module: &MirModule, ctx: &ModuleEm
                 }
             }
             if meta.needs_alloc || meta.needs_arena {
-                let _ = writeln!(out, "    let __alloc = {alloc_expr};");
+                if meta.needs_ctx {
+                    out.push_str("    let __alloc = __ctx.budget_alloc.share();\n");
+                } else {
+                    let _ = writeln!(out, "    let __alloc = {alloc_expr};");
+                }
             }
             if meta.needs_arena {
                 out.push_str("    let __arena = lust_aot_rt::LustChunkArena::new(&__alloc);\n");
@@ -7683,9 +8215,7 @@ fn emit_public_api_wrappers(out: &mut String, module: &MirModule, ctx: &ModuleEm
                     ctx_call_args.push("__ctx".to_string());
                 }
                 if meta.needs_alloc || meta.needs_arena {
-                    out.push_str(
-                        "    let __alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__ctx.budget_alloc.limit_bytes());\n",
-                    );
+                    out.push_str("    let __alloc = __ctx.budget_alloc.share();\n");
                 }
                 if meta.needs_alloc {
                     ctx_call_args.push("&__alloc".to_string());
@@ -7767,7 +8297,11 @@ fn emit_entrypoint(out: &mut String, module: &MirModule, ctx: &ModuleEmitContext
             }
         }
         if meta.needs_alloc || meta.needs_arena || ctx.module_uses_arena {
-            let _ = writeln!(out, "    let __alloc = {alloc_expr};");
+            if meta.needs_ctx {
+                let _ = writeln!(out, "    let __alloc = __ctx.budget_alloc.share();");
+            } else {
+                let _ = writeln!(out, "    let __alloc = {alloc_expr};");
+            }
         }
         if meta.needs_arena {
             let _ = writeln!(
@@ -7856,7 +8390,11 @@ fn emit_entrypoint(out: &mut String, module: &MirModule, ctx: &ModuleEmitContext
     }
 
     if meta.needs_alloc || meta.needs_arena || ctx.module_uses_arena {
-        let _ = writeln!(out, "    let __alloc = {alloc_expr};");
+        if meta.needs_ctx {
+            let _ = writeln!(out, "    let __alloc = __ctx.budget_alloc.share();");
+        } else {
+            let _ = writeln!(out, "    let __alloc = {alloc_expr};");
+        }
     }
     if meta.needs_arena {
         let _ = writeln!(
@@ -7973,6 +8511,49 @@ struct FnEmitter<'a, 'm> {
     scope_callback_plans: HashMap<BlockId, (String, Vec<(String, Operand, MirType)>)>,
     /// Destination locals of `__lust_yield_op` / `__lust_yield_completed` (returned directly, omitted from decls).
     yield_return_locals: HashSet<LocalId>,
+    /// Pre-batched loop-header gas weights for `GasMetering::LoopChunked` (`AOT-BUDGET-SOUND`).
+    loop_chunked_header_gas: HashMap<BlockId, i64>,
+    /// Pre-batched single-block gas weights for non-loop blocks under `GasMetering::LoopChunked`.
+    block_chunked_gas: HashMap<(BlockId, usize), i64>,
+    /// Non-aliased, non-escaping `Map<K, V>` locals lowered directly to unboxed `AotRawMap<K, V>` (`AOT-MAP-HASH`).
+    direct_raw_map_locals: HashSet<LocalId>,
+    /// Non-escaping `@std/sync.{Queue}` locals lowered directly to unboxed `AotQueue<i64>` (`AOT-DEVIRT`).
+    unboxed_queue_locals: HashSet<LocalId>,
+    /// Local method handles (`local offer = q.offer`) bound to an unboxed `AotQueue<i64>` (`AOT-DEVIRT`).
+    unboxed_queue_methods: HashMap<LocalId, (LocalId, &'static str)>,
+    /// Unboxed `AotQueue::take()` calls whose `Unknown` temp is directly consumed by an `Int` local (`call_bb -> int_dst`).
+    unboxed_queue_take_redirect: HashMap<BlockId, LocalId>,
+    /// Read-only `MirType::String` bindings in `IfArrayGetOk` lowered to zero-clone `&str` (`AOT-SSO-REGEX`).
+    borrowed_array_str_locals: HashSet<LocalId>,
+    /// Non-escaping `string.split` `Array<string>` locals backed by zero-alloc span buffer `__LustSplitSpans<'a>` -> source `&str` operand (`AOT-SSO-REGEX`).
+    small_str_array_locals: HashMap<LocalId, Operand>,
+    /// `string.split` locals ONLY read at const indices 0/1 (never `len`), lowered to `Copy` `(Option<&str>, Option<&str>)` (`AOT-SSO-REGEX`).
+    split_pair_locals: HashSet<LocalId>,
+    /// `WhileLoop`s iterating `0..array.len(split(s, sep))` fused directly to `for elem in s.split(sep)` (`AOT-SSO-REGEX`).
+    split_iter_loops: HashMap<BlockId, (Operand, String, LocalId)>,
+    /// Single-def constant integer locals (`LocalId -> i64`) for const index resolution.
+    const_int_locals: HashMap<LocalId, i64>,
+    /// Read-only `MirType::String` locals assigned only from non-mutated strings, stored as `&str` (`AOT-SSO-REGEX`).
+    borrowed_select_str_locals: HashSet<LocalId>,
+    /// Non-escaping `string.sub` locals backed by `alloc::borrow::Cow<'_, str>` (0 allocs on valid UTF-8, `AOT-SSO-REGEX`).
+    cow_str_locals: HashSet<LocalId>,
+    /// Direct `AotRawMap` read-modify-write fusion: `get_bb -> (set_bb, map_loc, key_op, val_dst)` (`AOT-MAP-HASH`).
+    map_rmw_get_plans: HashMap<BlockId, (BlockId, LocalId, Operand, LocalId)>,
+    /// Companion `set_bb -> map_loc` skipped into `*__rmw_slot = val` (`AOT-MAP-HASH`).
+    map_rmw_set_plans: HashMap<BlockId, LocalId>,
+    /// 1-byte `string.sub(s, i, i)` locals only compared against 1-byte ASCII literals, lowered to `Option<u8>` (`AOT-SSO-REGEX`).
+    byte_sub_locals: HashSet<LocalId>,
+    /// `string.gsub` `Array<string>` locals only read at index `0`, lowered directly to `String` (`AOT-SSO-REGEX`).
+    gsub_first_only_locals: HashSet<LocalId>,
+    /// Chained `MirBinaryOp::Concat` + `tostring` expressions fused into a single `String` allocation (`AOT-SSO-REGEX`).
+    fused_concat_chains: HashMap<(BlockId, usize), Vec<ConcatPiece>>,
+}
+
+#[derive(Debug, Clone)]
+enum ConcatPiece {
+    Str(Operand),
+    Int(Operand),
+    Float(Operand),
 }
 
 #[derive(Debug, Clone)]
@@ -8261,6 +8842,24 @@ fn emit_function(
         scoped_plans: HashMap::new(),
         scope_callback_plans: HashMap::new(),
         yield_return_locals: HashSet::new(),
+        loop_chunked_header_gas: HashMap::new(),
+        block_chunked_gas: HashMap::new(),
+        direct_raw_map_locals: HashSet::new(),
+        unboxed_queue_locals: HashSet::new(),
+        unboxed_queue_methods: HashMap::new(),
+        unboxed_queue_take_redirect: HashMap::new(),
+        borrowed_array_str_locals: HashSet::new(),
+        small_str_array_locals: HashMap::new(),
+        split_pair_locals: HashSet::new(),
+        split_iter_loops: HashMap::new(),
+        const_int_locals: HashMap::new(),
+        borrowed_select_str_locals: HashSet::new(),
+        cow_str_locals: HashSet::new(),
+        map_rmw_get_plans: HashMap::new(),
+        map_rmw_set_plans: HashMap::new(),
+        byte_sub_locals: HashSet::new(),
+        gsub_first_only_locals: HashSet::new(),
+        fused_concat_chains: HashMap::new(),
     };
 
     // Pre-passes on the structured function
@@ -8269,8 +8868,18 @@ fn emit_function(
     fe.analyze_effect_performs();
     fe.analyze_effect_provides();
     fe.analyze_single_def_aliases();
+    fe.analyze_direct_raw_maps();
+    fe.analyze_map_rmw_fusion(&tree);
+    fe.analyze_unboxed_queues();
     fe.analyze_tostring_concat_fusion();
+    fe.analyze_chained_concat_fusion();
+    fe.analyze_borrowed_select_str_locals();
+    fe.analyze_cow_sub_str_locals();
+    fe.analyze_single_byte_sub_locals();
     fe.analyze_structured_folds(&tree);
+    fe.analyze_small_str_split_arrays(&tree);
+    fe.analyze_gsub_first_only_locals(&tree);
+    fe.analyze_loop_chunked_gas(&tree);
     fe.analyze_inlined_defer_strips();
 
     // Emit function signature
@@ -8540,6 +9149,66 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
 
         for decl in &self.func.locals {
             if param_set.contains(&decl.id) || self.omitted_locals.contains(&decl.id) {
+                continue;
+            }
+            if self.unboxed_queue_locals.contains(&decl.id) {
+                let _ = writeln!(
+                    self.out,
+                    "    let mut _{}: lust_aot_rt::AotQueue<i64> = lust_aot_rt::AotQueue::new();",
+                    decl.id.0
+                );
+                continue;
+            }
+            if self.byte_sub_locals.contains(&decl.id) {
+                let _ = writeln!(self.out, "    let mut _{}: Option<u8> = None;", decl.id.0);
+                continue;
+            }
+            if self.gsub_first_only_locals.contains(&decl.id) {
+                let _ = writeln!(
+                    self.out,
+                    "    let mut _{}: alloc::string::String = alloc::string::String::new();",
+                    decl.id.0
+                );
+                continue;
+            }
+            if self.borrowed_select_str_locals.contains(&decl.id) {
+                let _ = writeln!(self.out, "    let mut _{}: &str = \"\";", decl.id.0);
+                continue;
+            }
+            if self.cow_str_locals.contains(&decl.id) {
+                let _ = writeln!(
+                    self.out,
+                    "    let mut _{}: alloc::borrow::Cow<'_, str> = alloc::borrow::Cow::Borrowed(\"\");",
+                    decl.id.0
+                );
+                continue;
+            }
+            if self.split_pair_locals.contains(&decl.id) {
+                let _ = writeln!(
+                    self.out,
+                    "    let mut _{}: (Option<&str>, Option<&str>) = (None, None);",
+                    decl.id.0
+                );
+                continue;
+            }
+            if self.small_str_array_locals.contains_key(&decl.id) {
+                let _ = writeln!(
+                    self.out,
+                    "    let mut _{}: __LustSplitSpans<'a> = __LustSplitSpans::new_in(__alloc);",
+                    decl.id.0
+                );
+                continue;
+            }
+            if self.direct_raw_map_locals.contains(&decl.id)
+                && let MirType::Map(k, v) = &decl.ty
+            {
+                let rk = self.ctx.rust_map_key_type(k);
+                let rv = self.ctx.rust_type(v, "'a");
+                let _ = writeln!(
+                    self.out,
+                    "    let mut _{}: lust_aot_rt::AotRawMap<{rk}, {rv}> = lust_aot_rt::AotRawMap::new();",
+                    decl.id.0
+                );
                 continue;
             }
             let rty = self.ctx.rust_type(&decl.ty, "'a");
@@ -9345,18 +10014,25 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             if def_counts.get(&dst).copied().unwrap_or(0) != 1 {
                 continue;
             }
+            let ty = &self.func.locals[dst.0].ty;
+            let is_ref_semantic = matches!(
+                ty,
+                MirType::Array(_) | MirType::Struct(_) | MirType::String
+            );
+            if !is_ref_semantic {
+                continue;
+            }
             let src_defs = def_counts.get(&src).copied().unwrap_or(0);
             let src_is_stable = if param_set.contains(&src) {
                 src_defs == 0
+            } else if matches!(ty, MirType::String) {
+                // Strings are immutable values; `is_src_mutated_while_dst_live` below guards
+                // against `src` being reassigned before the last read of `dst`.
+                true
             } else {
                 src_defs == 1
             };
             if !src_is_stable {
-                continue;
-            }
-            let ty = &self.func.locals[dst.0].ty;
-            let is_ref_semantic = matches!(ty, MirType::Array(_) | MirType::Struct(_));
-            if !is_ref_semantic {
                 continue;
             }
             // Match `detect_aliased_container_locals` (`NG-W15-1`): fold named locals even when
@@ -9383,6 +10059,2210 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             self.alias_map.insert(dst, src);
             self.skip_stmts.insert((bb, sidx));
             self.omitted_locals.insert(dst);
+        }
+    }
+
+    /// Pre-pass (`AOT-MAP-HASH`): identifies non-aliased, non-escaping `Map<K, V>` locals that
+    /// can be stored directly as `lust_aot_rt::AotRawMap<K, V>` (bypassing `Rc<RefCell>`).
+    fn analyze_direct_raw_maps(&mut self) {
+        let param_set: HashSet<LocalId> = self.func.params.iter().copied().collect();
+        let mut candidates: HashSet<LocalId> = HashSet::new();
+        for decl in &self.func.locals {
+            let loc = decl.id;
+            if matches!(decl.ty, MirType::Map(_, _))
+                && !param_set.contains(&loc)
+                && loc != self.func.return_local
+                && !self.omitted_locals.contains(&loc)
+                && self.local_storage(loc) == LocalStorage::Direct
+            {
+                candidates.insert(loc);
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+
+        // Track pure init-temp copies `dst = Copy/Move(src)` between Map locals so we can keep
+        // both direct when `src` is a single-use `map.new` init temp, and disqualify genuine aliases.
+        let mut disqual: HashSet<LocalId> = HashSet::new();
+        let mut init_copy_edges: Vec<(LocalId, LocalId, BlockId, usize)> = Vec::new();
+        for block in &self.func.blocks {
+            if block.is_cleanup {
+                // Any map touched inside a cleanup closure must stay `AotMap` (`Rc<RefCell>`).
+                let mut used = HashSet::new();
+                collect_block_used_locals(block, &mut used);
+                for u in used {
+                    disqual.insert(u);
+                }
+                continue;
+            }
+            for (sidx, stmt) in block.statements.iter().enumerate() {
+                if let Statement::Assign(place, rval, _) = stmt {
+                    match rval {
+                        Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))) => {
+                            if let Place::Local(dst) = place
+                                && candidates.contains(dst)
+                                && candidates.contains(src)
+                            {
+                                if self.is_pure_init_temp(*src) {
+                                    init_copy_edges.push((*dst, *src, block.id, sidx));
+                                } else {
+                                    disqual.insert(*dst);
+                                    disqual.insert(*src);
+                                }
+                                continue;
+                            }
+                            if candidates.contains(src) {
+                                disqual.insert(*src);
+                            }
+                        }
+                        Rvalue::UnaryOp(MirUnaryOp::Len, op) => {
+                            if let Some(l) = operand_exact_local(op)
+                                && candidates.contains(&l)
+                            {
+                                // Allowed on AotRawMap!
+                                continue;
+                            }
+                        }
+                        _ => {
+                            let mut tmp = HashSet::new();
+                            rval.collect_uses(&mut tmp);
+                            for id in tmp {
+                                let l = LocalId(id);
+                                if candidates.contains(&l) {
+                                    disqual.insert(l);
+                                }
+                            }
+                        }
+                    }
+                    if let Place::Index(base, _) = place {
+                        // Indexed write `m[k] = v` is allowed on AotRawMap!
+                        if let Place::Local(bl) = base.as_ref()
+                            && candidates.contains(bl)
+                        {
+                            continue;
+                        }
+                    }
+                    if !matches!(place, Place::Local(_)) {
+                        let rl = place.root_local();
+                        if candidates.contains(&rl) {
+                            disqual.insert(rl);
+                        }
+                    }
+                }
+            }
+            if let Some(term) = &block.terminator {
+                match term {
+                    Terminator::Call {
+                        callee,
+                        args,
+                        destination,
+                        ..
+                    } => {
+                        let is_direct_map_builtin = matches!(
+                            callee.as_str(),
+                            "map.new"
+                                | "map.set"
+                                | "table.set"
+                                | "map.get"
+                                | "table.get"
+                                | "map.get_unwrap"
+                                | "map.get_unwrap_or"
+                                | "map.has"
+                                | "map.len"
+                                | "map.is_empty"
+                                | "map.delete"
+                                | "map.remove"
+                                | "map.clear"
+                                | "map.keys"
+                                | "map.values"
+                                | "array.len"
+                                | "table.len"
+                        );
+                        if !is_direct_map_builtin {
+                            if let Place::Local(dst) = destination
+                                && candidates.contains(dst)
+                            {
+                                disqual.insert(*dst);
+                            }
+                            for a in args {
+                                let mut tmp = HashSet::new();
+                                a.collect_uses(&mut tmp);
+                                for id in tmp {
+                                    if candidates.contains(&LocalId(id)) {
+                                        disqual.insert(LocalId(id));
+                                    }
+                                }
+                            }
+                        } else {
+                            // In map builtins, only args[0] may be a direct raw map; any map passed as key/value disqualifies.
+                            for a in args.iter().skip(1) {
+                                let mut tmp = HashSet::new();
+                                a.collect_uses(&mut tmp);
+                                for id in tmp {
+                                    if candidates.contains(&LocalId(id)) {
+                                        disqual.insert(LocalId(id));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Terminator::Return(Some(op), _) | Terminator::Raise(op, _) => {
+                        let mut tmp = HashSet::new();
+                        op.collect_uses(&mut tmp);
+                        for id in tmp {
+                            if candidates.contains(&LocalId(id)) {
+                                disqual.insert(LocalId(id));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Propagate disqualification across init-copy edges so both ends agree on AotRawMap vs AotMap.
+        loop {
+            let mut changed = false;
+            for &(dst, src, _, _) in &init_copy_edges {
+                if disqual.contains(&dst) && disqual.insert(src) {
+                    changed = true;
+                }
+                if disqual.contains(&src) && disqual.insert(dst) {
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        for loc in candidates {
+            if !disqual.contains(&loc) {
+                self.direct_raw_map_locals.insert(loc);
+            }
+        }
+    }
+
+    /// Pre-pass (`AOT-MAP-HASH`): fuses sibling `map.get(m, k)` + `map.set(m, k, new_v)` on a
+    /// direct `AotRawMap<K, V>` (where `V` is `Copy`) within the same `StructuredNode::Seq`
+    /// into a single `AotRawMap::get_mut(k)` lookup (cutting hashing & probing in half on `NG-01`/`NG-02`).
+    fn analyze_map_rmw_fusion(&mut self, node: &StructuredNode) {
+        if self.direct_raw_map_locals.is_empty() {
+            return;
+        }
+        match node {
+            StructuredNode::Seq(items) => {
+                // First recurse into children
+                for item in items {
+                    self.analyze_map_rmw_fusion(item);
+                }
+                // Scan consecutive `BasicBlock` items in this `Seq` for `get` ... `set` pairs on the same `(map, key)`
+                let mut i = 0usize;
+                while i < items.len() {
+                    if let StructuredNode::BasicBlock(get_bb) = items[i]
+                        && let Some(Terminator::Call {
+                            callee,
+                            args,
+                            destination: Place::Local(val_dst),
+                            error: None,
+                            ..
+                        }) = &self.func.blocks[get_bb.0].terminator
+                        && matches!(callee.as_str(), "map.get" | "table.get" | "map.get_unwrap")
+                        && args.len() >= 2
+                        && let Some(m_raw) = operand_exact_local(&args[0])
+                        && let Some(k_raw) = operand_exact_local(&args[1])
+                    {
+                        let m_loc = self.resolve_local(m_raw);
+                        let k_loc = self.resolve_local(k_raw);
+                        let dst_ty = &self.func.locals[val_dst.0].ty;
+                        if self.direct_raw_map_locals.contains(&m_loc)
+                            && !matches!(dst_ty, MirType::Option(_))
+                            && self.ctx.is_copy_type(dst_ty)
+                            && self.local_storage(*val_dst) == LocalStorage::Direct
+                        {
+                            // Look ahead up to 4 sibling `BasicBlock`s with no other calls and no writes to `m_loc` or `k_loc`
+                            let mut j = i + 1;
+                            while j < items.len() && j <= i + 4 {
+                                let StructuredNode::BasicBlock(cand_bb) = items[j] else {
+                                    break;
+                                };
+                                let blk = &self.func.blocks[cand_bb.0];
+                                // Ensure `cand_bb` statements don't touch `m_loc` or write `k_loc`
+                                let mut conflict = false;
+                                for stmt in &blk.statements {
+                                    if let Statement::Assign(place, rval, _) = stmt {
+                                        let rl = self.resolve_local(place.root_local());
+                                        if rl == m_loc || rl == k_loc {
+                                            conflict = true;
+                                            break;
+                                        }
+                                        let mut tmp = HashSet::new();
+                                        rval.collect_uses(&mut tmp);
+                                        if tmp.iter().any(|&id| self.resolve_local(LocalId(id)) == m_loc) {
+                                            conflict = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if conflict {
+                                    break;
+                                }
+                                if let Some(Terminator::Call {
+                                    callee: sc,
+                                    args: sargs,
+                                    error: None,
+                                    ..
+                                }) = &blk.terminator
+                                {
+                                    if matches!(sc.as_str(), "map.set" | "table.set")
+                                        && sargs.len() >= 3
+                                        && operand_exact_local(&sargs[0])
+                                            .is_some_and(|l| self.resolve_local(l) == m_loc)
+                                        && operand_exact_local(&sargs[1])
+                                            .is_some_and(|l| self.resolve_local(l) == k_loc)
+                                    {
+                                        self.map_rmw_get_plans.insert(
+                                            get_bb,
+                                            (cand_bb, m_loc, args[1].clone(), *val_dst),
+                                        );
+                                        self.map_rmw_set_plans.insert(cand_bb, m_loc);
+                                        i = j;
+                                    }
+                                    break;
+                                }
+                                j += 1;
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            StructuredNode::If {
+                then_branch,
+                else_branch,
+                ..
+            }
+            | StructuredNode::IfArrayGetOk {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.analyze_map_rmw_fusion(then_branch);
+                if let Some(eb) = else_branch {
+                    self.analyze_map_rmw_fusion(eb);
+                }
+            }
+            StructuredNode::Switch { cases, default, .. } => {
+                for (_, c) in cases {
+                    self.analyze_map_rmw_fusion(c);
+                }
+                self.analyze_map_rmw_fusion(default);
+            }
+            StructuredNode::WhileLoop { body, .. }
+            | StructuredNode::Loop { body, .. }
+            | StructuredNode::LabeledBlock { body, .. } => {
+                self.analyze_map_rmw_fusion(body);
+            }
+            _ => {}
+        }
+    }
+
+    /// Pre-pass (`AOT-DEVIRT`): lowers non-escaping `@std/sync.{Queue}` locals (and their local
+    /// `offer`/`take`/`len`/`close` method bindings, as in `BENCH-NG-12`) to unboxed `AotQueue<i64>`.
+    fn analyze_unboxed_queues(&mut self) {
+        let param_set: HashSet<LocalId> = self.func.params.iter().copied().collect();
+        let mut queue_inits: Vec<(BlockId, LocalId)> = Vec::new();
+        for block in &self.func.blocks {
+            if block.is_cleanup {
+                continue;
+            }
+            if let Some(Terminator::Call {
+                callee,
+                destination: Place::Local(dst),
+                ..
+            }) = &block.terminator
+                && matches!(callee.as_str(), "Queue" | "sync.Queue" | "@std/sync.Queue")
+                && !param_set.contains(dst)
+                && *dst != self.func.return_local
+                && self.local_storage(*dst) == LocalStorage::Direct
+            {
+                queue_inits.push((block.id, *dst));
+            }
+        }
+        if queue_inits.is_empty() {
+            return;
+        }
+
+        // Collect single-def copy chains `dst = Copy/Move(src)`
+        let mut copy_from: HashMap<LocalId, (BlockId, usize, LocalId)> = HashMap::new();
+        for block in &self.func.blocks {
+            if block.is_cleanup {
+                continue;
+            }
+            for (sidx, stmt) in block.statements.iter().enumerate() {
+                if let Statement::Assign(
+                    Place::Local(dst),
+                    Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))),
+                    _,
+                ) = stmt
+                    && self.local_def_counts.get(dst).copied().unwrap_or(0) == 1
+                {
+                    copy_from.insert(*dst, (block.id, sidx, *src));
+                }
+            }
+        }
+
+        for (_init_bb, q_init) in queue_inits {
+            // Find any single-def alias of `q_init` (e.g. `_2 = _1`)
+            let mut q_aliases: Vec<(LocalId, BlockId, usize)> = Vec::new();
+            let mut q_group: HashSet<LocalId> = HashSet::new();
+            q_group.insert(q_init);
+            for (&dst, &(bb, sidx, src)) in &copy_from {
+                if src == q_init && !param_set.contains(&dst) && dst != self.func.return_local {
+                    q_aliases.push((dst, bb, sidx));
+                    q_group.insert(dst);
+                }
+            }
+
+            // Collect method-handle extractions `_h = __mir_unknown_get_field(q, "offer"|"take"|...)`
+            let mut method_raw: HashMap<LocalId, (BlockId, &'static str)> = HashMap::new();
+            let mut method_handles: HashMap<LocalId, &'static str> = HashMap::new();
+            let mut method_copy_skips: Vec<(LocalId, BlockId, usize)> = Vec::new();
+            let mut valid = true;
+
+            for block in &self.func.blocks {
+                if block.is_cleanup {
+                    let mut used = HashSet::new();
+                    collect_block_used_locals(block, &mut used);
+                    if used.iter().any(|u| q_group.contains(u)) {
+                        valid = false;
+                        break;
+                    }
+                    continue;
+                }
+                if let Some(Terminator::Call {
+                    callee,
+                    args,
+                    destination: Place::Local(dst),
+                    ..
+                }) = &block.terminator
+                    && callee == "__mir_unknown_get_field"
+                    && args.len() >= 2
+                    && let Some(recv) = operand_exact_local(&args[0])
+                    && q_group.contains(&recv)
+                {
+                    let mname: Option<&'static str> = match &args[1] {
+                        Operand::Constant(MirConstant::String(s)) => match s.as_str() {
+                            "offer" => Some("offer"),
+                            "try_offer" => Some("try_offer"),
+                            "take" => Some("take"),
+                            "try_take" => Some("try_take"),
+                            "len" => Some("len"),
+                            "close" => Some("close"),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(m) = mname {
+                        method_raw.insert(*dst, (block.id, m));
+                        method_handles.insert(*dst, m);
+                    } else {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if !valid {
+                continue;
+            }
+
+            // Follow single-def copies of method handles (e.g. `_4 = _3`)
+            for (&dst, &(bb, sidx, src)) in &copy_from {
+                if let Some(&m) = method_raw.get(&src).map(|(_, m)| m) {
+                    if param_set.contains(&dst) || dst == self.func.return_local {
+                        valid = false;
+                        break;
+                    }
+                    method_handles.insert(dst, m);
+                    method_copy_skips.push((dst, bb, sidx));
+                }
+            }
+            if !valid {
+                continue;
+            }
+
+            // Verify every use of `q_group` and `method_handles` across the function is a safe
+            // `i64` queue operation with zero escape!
+            let skip_stmt_set: HashSet<(BlockId, usize)> = q_aliases
+                .iter()
+                .map(|&(_, bb, sidx)| (bb, sidx))
+                .chain(method_copy_skips.iter().map(|&(_, bb, sidx)| (bb, sidx)))
+                .collect();
+
+            for block in &self.func.blocks {
+                for (sidx, stmt) in block.statements.iter().enumerate() {
+                    if skip_stmt_set.contains(&(block.id, sidx)) {
+                        continue;
+                    }
+                    let mut tmp = HashSet::new();
+                    if let Statement::Assign(place, rval, _) = stmt {
+                        place.collect_uses(&mut tmp);
+                        rval.collect_uses(&mut tmp);
+                        let rl = place.root_local();
+                        if q_group.contains(&rl) || method_handles.contains_key(&rl) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    for id in tmp {
+                        let l = LocalId(id);
+                        if q_group.contains(&l) || method_handles.contains_key(&l) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !valid {
+                    break;
+                }
+                if let Some(term) = &block.terminator {
+                    match term {
+                        Terminator::Call {
+                            callee,
+                            args,
+                            destination,
+                            ..
+                        } => {
+                            if matches!(callee.as_str(), "Queue" | "sync.Queue" | "@std/sync.Queue")
+                                && *destination == Place::Local(q_init)
+                            {
+                                continue;
+                            }
+                            if callee == "__mir_unknown_get_field"
+                                && args.len() >= 2
+                                && operand_exact_local(&args[0])
+                                    .is_some_and(|l| q_group.contains(&l))
+                            {
+                                continue;
+                            }
+                            if callee == "__mir_unknown_call_method"
+                                && args.len() >= 2
+                                && operand_exact_local(&args[0])
+                                    .is_some_and(|l| q_group.contains(&l))
+                            {
+                                let ok_method = match &args[1] {
+                                    Operand::Constant(MirConstant::String(s)) => match s.as_str() {
+                                        "offer" | "try_offer" => {
+                                            args.len() == 3
+                                                && matches!(
+                                                    operand_mir_type(&args[2], self.func),
+                                                    MirType::Int
+                                                )
+                                        }
+                                        "take" | "try_take" | "len" | "close" => args.len() == 2,
+                                        _ => false,
+                                    },
+                                    _ => false,
+                                };
+                                if !ok_method {
+                                    valid = false;
+                                    break;
+                                }
+                                continue;
+                            }
+                            if !self.ctx.fn_metas.contains_key(callee)
+                                && let Some(&cl_loc) = self.local_name_to_id.get(callee)
+                                && let Some(&m) = method_handles.get(&cl_loc)
+                            {
+                                let ok_sig = match m {
+                                    "offer" | "try_offer" => {
+                                        args.len() == 1
+                                            && matches!(
+                                                operand_mir_type(&args[0], self.func),
+                                                MirType::Int
+                                            )
+                                    }
+                                    "take" | "try_take" | "len" | "close" => args.is_empty(),
+                                    _ => false,
+                                };
+                                if !ok_sig {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            for a in args {
+                                let mut tmp = HashSet::new();
+                                a.collect_uses(&mut tmp);
+                                for id in tmp {
+                                    let l = LocalId(id);
+                                    if q_group.contains(&l) || method_handles.contains_key(&l) {
+                                        valid = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Terminator::Return(Some(op), _) | Terminator::Raise(op, _) => {
+                            let mut tmp = HashSet::new();
+                            op.collect_uses(&mut tmp);
+                            for id in tmp {
+                                let l = LocalId(id);
+                                if q_group.contains(&l) || method_handles.contains_key(&l) {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !valid {
+                    break;
+                }
+            }
+
+            if !valid {
+                continue;
+            }
+
+            // Commit unboxed `AotQueue<i64>` lowering for `q_init`!
+            self.unboxed_queue_locals.insert(q_init);
+            for (alias_loc, bb, sidx) in q_aliases {
+                self.alias_map.insert(alias_loc, q_init);
+                self.skip_stmts.insert((bb, sidx));
+                self.omitted_locals.insert(alias_loc);
+            }
+            for (raw_loc, (call_bb, m)) in method_raw {
+                self.skip_calls.insert(call_bb);
+                self.omitted_locals.insert(raw_loc);
+                self.unboxed_queue_methods.insert(raw_loc, (q_init, m));
+            }
+            for (cp_loc, bb, sidx) in method_copy_skips {
+                self.skip_stmts.insert((bb, sidx));
+                self.omitted_locals.insert(cp_loc);
+                if let Some(&m) = method_handles.get(&cp_loc) {
+                    self.unboxed_queue_methods.insert(cp_loc, (q_init, m));
+                }
+            }
+
+            // Eliminate `AotValue` boxing/drop on `offer()` (dead dst) and `take()` (1-use copy into `Int`)
+            for blk in &self.func.blocks {
+                if blk.is_cleanup {
+                    continue;
+                }
+                if let Some(Terminator::Call {
+                    callee,
+                    destination: Place::Local(dst),
+                    success,
+                    ..
+                }) = &blk.terminator
+                    && let Some(&cl_loc) = self.local_name_to_id.get(callee)
+                    && let Some(&(_, mname)) = self.unboxed_queue_methods.get(&cl_loc)
+                {
+                    if matches!(mname, "offer" | "try_offer")
+                        && self.local_use_counts.get(dst).copied().unwrap_or(0) == 0
+                        && self.local_def_counts.get(dst).copied().unwrap_or(0) == 1
+                        && *dst != self.func.return_local
+                    {
+                        self.omitted_locals.insert(*dst);
+                    } else if mname == "take"
+                        && self.func.locals[dst.0].ty == MirType::Unknown
+                        && self.local_use_counts.get(dst).copied().unwrap_or(0) == 1
+                        && self.local_def_counts.get(dst).copied().unwrap_or(0) == 1
+                        && *dst != self.func.return_local
+                        && let Some(succ_blk) = self.func.blocks.get(success.0)
+                    {
+                        for (sidx, stmt) in succ_blk.statements.iter().enumerate() {
+                            if let Statement::Assign(
+                                Place::Local(int_dst),
+                                Rvalue::Use(
+                                    Operand::Copy(Place::Local(src))
+                                    | Operand::Move(Place::Local(src)),
+                                ),
+                                _,
+                            ) = stmt
+                                && *src == *dst
+                                && self.func.locals[int_dst.0].ty == MirType::Int
+                                && self.local_storage(*int_dst) == LocalStorage::Direct
+                            {
+                                self.unboxed_queue_take_redirect.insert(blk.id, *int_dst);
+                                self.skip_stmts.insert((succ_blk.id, sidx));
+                                self.omitted_locals.insert(*dst);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pre-pass (`AOT-SSO-REGEX`): detects chained `MirBinaryOp::Concat` trees (including
+    /// single-use `tostring(int/float)` leaves in immediately preceding single-predecessor blocks)
+    /// and fuses them into a single pre-sized `String` allocation.
+    fn analyze_chained_concat_fusion(&mut self) {
+        let mut pred_of: Vec<Option<BlockId>> = vec![None; self.func.blocks.len()];
+        let mut pred_cnt = vec![0usize; self.func.blocks.len()];
+        for blk in &self.func.blocks {
+            if let Some(term) = &blk.terminator {
+                for succ in term.successors() {
+                    if succ < pred_cnt.len() {
+                        pred_cnt[succ] += 1;
+                        pred_of[succ] = Some(blk.id);
+                    }
+                }
+            }
+        }
+
+        // Map single-use `tostring(int/float)` calls `tmp = call tostring(x)` -> (call_bb, arg, arg_ty)
+        let mut tostring_defs: HashMap<LocalId, (BlockId, Operand, MirType)> = HashMap::new();
+        for blk in &self.func.blocks {
+            if blk.is_cleanup || self.fused_tostring_calls.contains_key(&blk.id) {
+                continue;
+            }
+            if let Some(Terminator::Call {
+                callee,
+                args,
+                destination: Place::Local(tmp),
+                error: None,
+                ..
+            }) = &blk.terminator
+                && callee == "tostring"
+                && args.len() == 1
+                && self.local_use_counts.get(tmp).copied().unwrap_or(0) == 1
+                && self.local_def_counts.get(tmp).copied().unwrap_or(0) == 1
+                && !self.omitted_locals.contains(tmp)
+            {
+                let aty = operand_mir_type(&args[0], self.func);
+                if matches!(aty, MirType::Int | MirType::Float) {
+                    tostring_defs.insert(*tmp, (blk.id, args[0].clone(), aty));
+                }
+            }
+        }
+
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                continue;
+            }
+            // Collect linear single-predecessor ancestor chain of `blk` (up to 8 hops) for tostring lookup
+            let mut linear_ancestors: HashSet<BlockId> = HashSet::new();
+            let mut cur = blk.id;
+            for _ in 0..8 {
+                if pred_cnt[cur.0] == 1
+                    && let Some(p) = pred_of[cur.0]
+                {
+                    if linear_ancestors.insert(p) {
+                        cur = p;
+                        continue;
+                    }
+                }
+                break;
+            }
+
+            // Track local concat definitions inside this block: dst -> (sidx, lhs, rhs)
+            let mut concat_defs: HashMap<LocalId, (usize, Operand, Operand)> = HashMap::new();
+            for (sidx, stmt) in blk.statements.iter().enumerate() {
+                if self.skip_stmts.contains(&(blk.id, sidx)) {
+                    continue;
+                }
+                if let Statement::Assign(
+                    Place::Local(dst),
+                    Rvalue::BinaryOp(MirBinaryOp::Concat, lhs, rhs),
+                    _,
+                ) = stmt
+                    && self.local_storage(*dst) == LocalStorage::Direct
+                    && !self.omitted_locals.contains(dst)
+                {
+                    // Skip in-place `s = s .. rhs`
+                    let is_inplace = matches!(
+                        lhs,
+                        Operand::Copy(Place::Local(l)) | Operand::Move(Place::Local(l)) if l == dst
+                    );
+                    if !is_inplace {
+                        concat_defs.insert(*dst, (sidx, lhs.clone(), rhs.clone()));
+                    }
+                }
+            }
+            if concat_defs.is_empty() {
+                continue;
+            }
+
+            // Walk statements from bottom to top so outer concat roots consume inner single-use concats
+            let mut consumed_stmts: HashSet<usize> = HashSet::new();
+            for sidx in (0..blk.statements.len()).rev() {
+                if consumed_stmts.contains(&sidx) || self.skip_stmts.contains(&(blk.id, sidx)) {
+                    continue;
+                }
+                let Statement::Assign(
+                    Place::Local(_root_dst),
+                    Rvalue::BinaryOp(MirBinaryOp::Concat, lhs, rhs),
+                    _,
+                ) = &blk.statements[sidx]
+                else {
+                    continue;
+                };
+                if !concat_defs.contains_key(_root_dst) {
+                    continue;
+                }
+
+                // Expand concat tree into flat pieces
+                let mut pieces: Vec<ConcatPiece> = Vec::new();
+                let mut inner_stmt_skips: Vec<(LocalId, usize)> = Vec::new();
+                let mut inner_tostring_skips: Vec<(LocalId, BlockId)> = Vec::new();
+                let mut stack: Vec<Operand> = vec![rhs.clone(), lhs.clone()];
+                let mut expanded_any = false;
+
+                while let Some(op) = stack.pop() {
+                    if let Some(loc) = operand_exact_local(&op)
+                        && self.local_use_counts.get(&loc).copied().unwrap_or(0) == 1
+                        && self.local_def_counts.get(&loc).copied().unwrap_or(0) == 1
+                    {
+                        if let Some((csidx, clhs, crhs)) = concat_defs.get(&loc)
+                            && *csidx < sidx
+                            && !consumed_stmts.contains(csidx)
+                        {
+                            inner_stmt_skips.push((loc, *csidx));
+                            stack.push(crhs.clone());
+                            stack.push(clhs.clone());
+                            expanded_any = true;
+                            continue;
+                        }
+                        if let Some((tbb, targ, taty)) = tostring_defs.get(&loc)
+                            && linear_ancestors.contains(tbb)
+                            && !self.skip_calls.contains(tbb)
+                        {
+                            // Ensure `targ` local is not mutated between `tbb` and `blk`
+                            let safe_arg = match operand_exact_local(targ) {
+                                Some(al) => self.local_def_counts.get(&al).copied().unwrap_or(0) <= 1,
+                                None => true,
+                            };
+                            if safe_arg {
+                                inner_tostring_skips.push((loc, *tbb));
+                                match taty {
+                                    MirType::Int => pieces.push(ConcatPiece::Int(targ.clone())),
+                                    MirType::Float => pieces.push(ConcatPiece::Float(targ.clone())),
+                                    _ => pieces.push(ConcatPiece::Str(op)),
+                                }
+                                expanded_any = true;
+                                continue;
+                            }
+                        }
+                    }
+                    pieces.push(ConcatPiece::Str(op));
+                }
+
+                if expanded_any && pieces.len() >= 2 {
+                    for (loc, csidx) in inner_stmt_skips {
+                        consumed_stmts.insert(csidx);
+                        self.skip_stmts.insert((blk.id, csidx));
+                        self.omitted_locals.insert(loc);
+                    }
+                    for (loc, tbb) in inner_tostring_skips {
+                        self.skip_calls.insert(tbb);
+                        self.omitted_locals.insert(loc);
+                    }
+                    self.fused_concat_chains.insert((blk.id, sidx), pieces);
+                }
+            }
+        }
+    }
+
+    /// Pre-pass (`AOT-SSO-REGEX`): detects read-only `MirType::String` locals that are ONLY
+    /// assigned from non-mutated `String` locals or string constants (e.g. `local raw = payload_a;
+    /// if cond then raw = payload_b end` in `BENCH-NG-13`) and lowers them to `&str` (`0` clones!).
+    fn analyze_borrowed_select_str_locals(&mut self) {
+        let param_set: HashSet<LocalId> = self.func.params.iter().copied().collect();
+        let fused_mut_targets: HashSet<LocalId> = self
+            .fused_tostring_calls
+            .values()
+            .map(|(dst, _, _)| self.resolve_local(*dst))
+            .collect();
+        // Identify immutable source `String` locals (defined at most once, outside loops or params)
+        let mut loop_blocks: HashSet<BlockId> = HashSet::new();
+        for blk in &self.func.blocks {
+            if let Some(term) = &blk.terminator {
+                for succ in term.successors() {
+                    if succ <= blk.id.0 {
+                        // Back-edge header..latch
+                        for b in succ..=blk.id.0 {
+                            loop_blocks.insert(BlockId(b));
+                        }
+                    }
+                }
+            }
+        }
+        let mut stable_str_sources: HashSet<LocalId> = HashSet::new();
+        for decl in &self.func.locals {
+            if decl.ty != MirType::String || self.local_storage(decl.id) != LocalStorage::Direct {
+                continue;
+            }
+            let defs = self.local_def_counts.get(&decl.id).copied().unwrap_or(0);
+            if param_set.contains(&decl.id) && defs == 0 {
+                stable_str_sources.insert(decl.id);
+            } else if defs == 1 {
+                // Defined once outside any loop
+                let mut def_in_loop = false;
+                for blk in &self.func.blocks {
+                    if !loop_blocks.contains(&blk.id) {
+                        continue;
+                    }
+                    for stmt in &blk.statements {
+                        if let Statement::Assign(Place::Local(d), _, _) = stmt
+                            && *d == decl.id
+                        {
+                            def_in_loop = true;
+                        }
+                    }
+                    if let Some(Terminator::Call {
+                        destination: Place::Local(d),
+                        ..
+                    }) = &blk.terminator
+                        && *d == decl.id
+                    {
+                        def_in_loop = true;
+                    }
+                }
+                if !def_in_loop {
+                    stable_str_sources.insert(decl.id);
+                }
+            }
+        }
+
+        for decl in &self.func.locals {
+            let loc = decl.id;
+            if decl.ty != MirType::String
+                || param_set.contains(&loc)
+                || loc == self.func.return_local
+                || self.omitted_locals.contains(&loc)
+                || fused_mut_targets.contains(&loc)
+                || self.local_storage(loc) != LocalStorage::Direct
+                || self.local_def_counts.get(&loc).copied().unwrap_or(0) < 2
+            {
+                continue;
+            }
+            let mut ok = true;
+            for blk in &self.func.blocks {
+                if blk.is_cleanup {
+                    let mut used = HashSet::new();
+                    collect_block_used_locals(blk, &mut used);
+                    if used.iter().any(|&u| self.resolve_local(u) == loc) {
+                        ok = false;
+                        break;
+                    }
+                    continue;
+                }
+                for (sidx, stmt) in blk.statements.iter().enumerate() {
+                    if self.skip_stmts.contains(&(blk.id, sidx)) {
+                        continue;
+                    }
+                    if let Statement::Assign(place, rval, _) = stmt {
+                        if *place == Place::Local(loc) {
+                            let valid_rhs = match rval {
+                                Rvalue::Use(Operand::Constant(MirConstant::String(_))) => true,
+                                Rvalue::Use(
+                                    Operand::Copy(Place::Local(src))
+                                    | Operand::Move(Place::Local(src)),
+                                ) => stable_str_sources.contains(&self.resolve_local(*src)),
+                                _ => false,
+                            };
+                            if !valid_rhs {
+                                ok = false;
+                                break;
+                            }
+                        } else if let Rvalue::Aggregate(_, _) | Rvalue::Closure { .. } = rval {
+                            let mut tmp = HashSet::new();
+                            rval.collect_uses(&mut tmp);
+                            if tmp.iter().any(|&id| self.resolve_local(LocalId(id)) == loc) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !ok {
+                    break;
+                }
+                if let Some(term) = &blk.terminator {
+                    match term {
+                        Terminator::Call {
+                            destination: Place::Local(d),
+                            ..
+                        } if *d == loc => {
+                            ok = false;
+                            break;
+                        }
+                        Terminator::Return(Some(op), _) => {
+                            if operand_exact_local(op).is_some_and(|l| self.resolve_local(l) == loc)
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if ok {
+                self.borrowed_select_str_locals.insert(loc);
+                self.scoped_ref_locals.insert(loc);
+            }
+        }
+    }
+
+    /// Pre-pass (`AOT-SSO-REGEX`): lowers `inner = string.sub(s, start, end)` (when `s` is a
+    /// long-lived `&str` local in `borrowed_select_str_locals` or a `RefStr` param) to
+    /// `alloc::borrow::Cow<'_, str>` with zero heap allocation on valid UTF-8 slices!
+    fn analyze_cow_sub_str_locals(&mut self) {
+        let param_set: HashSet<LocalId> = self.func.params.iter().copied().collect();
+        let fused_mut_targets: HashSet<LocalId> = self
+            .fused_tostring_calls
+            .values()
+            .map(|(dst, _, _)| self.resolve_local(*dst))
+            .collect();
+        let mut sub_defs: Vec<(LocalId, Operand)> = Vec::new();
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                continue;
+            }
+            if let Some(Terminator::Call {
+                callee,
+                args,
+                destination: Place::Local(dst),
+                ..
+            }) = &blk.terminator
+                && callee == "string.sub"
+                && args.len() >= 2
+                && self.func.locals[dst.0].ty == MirType::String
+                && !param_set.contains(dst)
+                && *dst != self.func.return_local
+                && !self.omitted_locals.contains(dst)
+                && !fused_mut_targets.contains(dst)
+                && self.local_storage(*dst) == LocalStorage::Direct
+                && self.local_def_counts.get(dst).copied().unwrap_or(0) == 1
+            {
+                let is_long_lived_src = match &args[0] {
+                    Operand::Constant(MirConstant::String(_)) => true,
+                    _ => operand_exact_local(&args[0]).is_some_and(|l| {
+                        let r = self.resolve_local(l);
+                        self.borrowed_select_str_locals.contains(&r)
+                            || matches!(self.is_param(r), Some((_, ParamMode::RefStr)))
+                    }),
+                };
+                if is_long_lived_src {
+                    sub_defs.push((*dst, args[0].clone()));
+                }
+            }
+        }
+        if sub_defs.is_empty() {
+            return;
+        }
+
+        // Follow single-def pure-init-temp copies `inner = Move(sub_tmp)`
+        let mut copy_to_root: HashMap<LocalId, (LocalId, BlockId, usize)> = HashMap::new();
+        let cand_set: HashSet<LocalId> = sub_defs.iter().map(|(l, _)| *l).collect();
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                continue;
+            }
+            for (sidx, stmt) in blk.statements.iter().enumerate() {
+                if self.skip_stmts.contains(&(blk.id, sidx)) {
+                    continue;
+                }
+                if let Statement::Assign(
+                    Place::Local(dst),
+                    Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))),
+                    _,
+                ) = stmt
+                    && cand_set.contains(src)
+                    && !param_set.contains(dst)
+                    && *dst != self.func.return_local
+                    && self.local_storage(*dst) == LocalStorage::Direct
+                    && self.local_def_counts.get(dst).copied().unwrap_or(0) == 1
+                {
+                    copy_to_root.insert(*dst, (*src, blk.id, sidx));
+                }
+            }
+        }
+        let copy_skips: HashSet<(BlockId, usize)> = copy_to_root
+            .values()
+            .map(|&(_, bb, sidx)| (bb, sidx))
+            .collect();
+        let resolve_c = |loc: LocalId| -> LocalId {
+            let r = self.resolve_local(loc);
+            copy_to_root.get(&r).map(|&(root, _, _)| root).unwrap_or(r)
+        };
+
+        let mut disqual: HashSet<LocalId> = HashSet::new();
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                let mut used = HashSet::new();
+                collect_block_used_locals(blk, &mut used);
+                for u in used {
+                    let r = resolve_c(u);
+                    if cand_set.contains(&r) {
+                        disqual.insert(r);
+                    }
+                }
+                continue;
+            }
+            for (sidx, stmt) in blk.statements.iter().enumerate() {
+                if self.skip_stmts.contains(&(blk.id, sidx)) || copy_skips.contains(&(blk.id, sidx))
+                {
+                    continue;
+                }
+                if let Statement::Assign(place, rval, _) = stmt {
+                    if let Rvalue::UnaryOp(MirUnaryOp::Len, _)
+                    | Rvalue::BinaryOp(MirBinaryOp::Eq | MirBinaryOp::NotEq, _, _) = rval
+                    {
+                        continue;
+                    }
+                    let mut tmp = HashSet::new();
+                    place.collect_uses(&mut tmp);
+                    rval.collect_uses(&mut tmp);
+                    let rl = resolve_c(place.root_local());
+                    if cand_set.contains(&rl) {
+                        disqual.insert(rl);
+                    }
+                    for id in tmp {
+                        let r = resolve_c(LocalId(id));
+                        if cand_set.contains(&r) {
+                            disqual.insert(r);
+                        }
+                    }
+                }
+            }
+            if let Some(term) = &blk.terminator {
+                match term {
+                    Terminator::Call {
+                        callee,
+                        args,
+                        destination,
+                        ..
+                    } => {
+                        if callee == "string.sub"
+                            && matches!(destination, Place::Local(d) if cand_set.contains(d))
+                        {
+                            continue;
+                        }
+                        let str_ref_builtin = matches!(
+                            callee.as_str(),
+                            "string.split" | "string.len" | "string.sub" | "string.gsub" | "string.find"
+                        );
+                        if !str_ref_builtin {
+                            for a in args {
+                                let mut tmp = HashSet::new();
+                                a.collect_uses(&mut tmp);
+                                for id in tmp {
+                                    let r = resolve_c(LocalId(id));
+                                    if cand_set.contains(&r) {
+                                        disqual.insert(r);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Terminator::Return(Some(op), _) | Terminator::Raise(op, _) => {
+                        let mut tmp = HashSet::new();
+                        op.collect_uses(&mut tmp);
+                        for id in tmp {
+                            let r = resolve_c(LocalId(id));
+                            if cand_set.contains(&r) {
+                                disqual.insert(r);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for (c, _) in sub_defs {
+            if !disqual.contains(&c) {
+                self.cow_str_locals.insert(c);
+            }
+        }
+        for (dst, (root, bb, sidx)) in copy_to_root {
+            if self.cow_str_locals.contains(&root) {
+                self.alias_map.insert(dst, root);
+                self.skip_stmts.insert((bb, sidx));
+                self.omitted_locals.insert(dst);
+            }
+        }
+    }
+
+    /// Pre-pass (`AOT-SSO-REGEX`): detects `ch = string.sub(s, idx, idx)` locals that are only
+    /// ever compared against 1-byte ASCII string constants (`ch == "1"`, etc., as in `BENCH-NG-13`)
+    /// and lowers them to `Option<u8>` with zero `String` allocations.
+    fn analyze_single_byte_sub_locals(&mut self) {
+        let param_set: HashSet<LocalId> = self.func.params.iter().copied().collect();
+        let mut candidates: HashSet<LocalId> = HashSet::new();
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                continue;
+            }
+            if let Some(Terminator::Call {
+                callee,
+                args,
+                destination: Place::Local(dst),
+                ..
+            }) = &blk.terminator
+                && callee == "string.sub"
+                && args.len() >= 3
+                && !param_set.contains(dst)
+                && *dst != self.func.return_local
+                && !self.omitted_locals.contains(dst)
+                && self.local_storage(*dst) == LocalStorage::Direct
+                && self.local_def_counts.get(dst).copied().unwrap_or(0) == 1
+            {
+                let same_idx = match (&args[1], &args[2]) {
+                    (Operand::Constant(MirConstant::Int(a)), Operand::Constant(MirConstant::Int(b))) => {
+                        a == b
+                    }
+                    _ => {
+                        let l1 = operand_exact_local(&args[1]).map(|l| self.resolve_local(l));
+                        let l2 = operand_exact_local(&args[2]).map(|l| self.resolve_local(l));
+                        l1.is_some() && l1 == l2
+                    }
+                };
+                if same_idx {
+                    candidates.insert(*dst);
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+
+        // Follow single-def pure-init-temp copies `ch = Move/Copy(sub_tmp)` (e.g. `_82 = Move(_81)`)
+        // so both the temp and the named `ch` local collapse into a single `Option<u8>` local.
+        let mut copy_to_root: HashMap<LocalId, (LocalId, BlockId, usize)> = HashMap::new();
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                continue;
+            }
+            for (sidx, stmt) in blk.statements.iter().enumerate() {
+                if self.skip_stmts.contains(&(blk.id, sidx)) {
+                    continue;
+                }
+                if let Statement::Assign(
+                    Place::Local(dst),
+                    Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))),
+                    _,
+                ) = stmt
+                    && candidates.contains(src)
+                    && !param_set.contains(dst)
+                    && *dst != self.func.return_local
+                    && self.local_storage(*dst) == LocalStorage::Direct
+                    && self.local_def_counts.get(dst).copied().unwrap_or(0) == 1
+                {
+                    copy_to_root.insert(*dst, (*src, blk.id, sidx));
+                }
+            }
+        }
+        let copy_skip_stmts: HashSet<(BlockId, usize)> = copy_to_root
+            .values()
+            .map(|&(_, bb, sidx)| (bb, sidx))
+            .collect();
+        let resolve_cand = |loc: LocalId| -> LocalId {
+            let r = self.resolve_local(loc);
+            if let Some(&(root, _, _)) = copy_to_root.get(&r) {
+                root
+            } else {
+                r
+            }
+        };
+
+        // Verify every use of a candidate (including through copy_to_root / alias_map) is ONLY
+        // `Eq`/`NotEq` against a 1-byte ASCII string constant.
+        let mut disqual: HashSet<LocalId> = HashSet::new();
+        let is_ascii_1byte = |op: &Operand| -> bool {
+            matches!(op, Operand::Constant(MirConstant::String(s)) if s.len() == 1 && s.is_ascii())
+        };
+        for blk in &self.func.blocks {
+            for (sidx, stmt) in blk.statements.iter().enumerate() {
+                if self.skip_stmts.contains(&(blk.id, sidx))
+                    || copy_skip_stmts.contains(&(blk.id, sidx))
+                {
+                    continue;
+                }
+                if let Statement::Assign(_, rval, _) = stmt {
+                    if let Rvalue::BinaryOp(MirBinaryOp::Eq | MirBinaryOp::NotEq, lhs, rhs) = rval {
+                        let l_res = operand_exact_local(lhs).map(&resolve_cand);
+                        let r_res = operand_exact_local(rhs).map(&resolve_cand);
+                        if let Some(ll) = l_res
+                            && candidates.contains(&ll)
+                        {
+                            if !is_ascii_1byte(rhs) {
+                                disqual.insert(ll);
+                            }
+                            continue;
+                        }
+                        if let Some(rl) = r_res
+                            && candidates.contains(&rl)
+                        {
+                            if !is_ascii_1byte(lhs) {
+                                disqual.insert(rl);
+                            }
+                            continue;
+                        }
+                    }
+                    let mut tmp = HashSet::new();
+                    rval.collect_uses(&mut tmp);
+                    for id in tmp {
+                        let r = resolve_cand(LocalId(id));
+                        if candidates.contains(&r) {
+                            disqual.insert(r);
+                        }
+                    }
+                }
+            }
+            if let Some(term) = &blk.terminator {
+                match term {
+                    Terminator::Call { args, .. } => {
+                        for a in args {
+                            let mut tmp = HashSet::new();
+                            a.collect_uses(&mut tmp);
+                            for id in tmp {
+                                let r = resolve_cand(LocalId(id));
+                                if candidates.contains(&r) {
+                                    disqual.insert(r);
+                                }
+                            }
+                        }
+                    }
+                    Terminator::Return(Some(op), _) | Terminator::Raise(op, _) => {
+                        let mut tmp = HashSet::new();
+                        op.collect_uses(&mut tmp);
+                        for id in tmp {
+                            let r = resolve_cand(LocalId(id));
+                            if candidates.contains(&r) {
+                                disqual.insert(r);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for c in candidates {
+            if !disqual.contains(&c) {
+                self.byte_sub_locals.insert(c);
+            }
+        }
+        for (dst, (root, bb, sidx)) in copy_to_root {
+            if self.byte_sub_locals.contains(&root) {
+                self.alias_map.insert(dst, root);
+                self.skip_stmts.insert((bb, sidx));
+                self.omitted_locals.insert(dst);
+            }
+        }
+    }
+
+    /// Pre-pass (`AOT-SSO-REGEX`): lowers non-escaping `Array<string>` locals created strictly by
+    /// `string.split(src, sep)` and read only via borrowed `IfArrayGetOk` / `len()` to zero-alloc
+    /// `__LustSplitSpans<'a>` referencing `src` directly (0 byte copies, 0 `from_utf8`, 0 heap allocs!).
+    fn analyze_small_str_split_arrays(&mut self, tree: &StructuredNode) {
+        let param_set: HashSet<LocalId> = self.func.params.iter().copied().collect();
+        let mut split_inits: HashMap<LocalId, Operand> = HashMap::new();
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                continue;
+            }
+            if let Some(Terminator::Call {
+                callee,
+                args,
+                destination: Place::Local(dst),
+                ..
+            }) = &blk.terminator
+                && callee == "string.split"
+                && args.len() >= 2
+                && matches!(&self.func.locals[dst.0].ty, MirType::Array(inner) if **inner == MirType::String)
+                && !param_set.contains(dst)
+                && *dst != self.func.return_local
+                && self.local_storage(*dst) == LocalStorage::Direct
+                && self.local_def_counts.get(dst).copied().unwrap_or(0) == 1
+            {
+                // Verify source string is stable (single-def local, borrowed &str, Cow, or constant)
+                let src_ok = match &args[0] {
+                    Operand::Constant(MirConstant::String(_)) => true,
+                    _ => operand_exact_local(&args[0]).is_some_and(|l| {
+                        let r = self.resolve_local(l);
+                        self.scoped_ref_locals.contains(&r)
+                            || self.cow_str_locals.contains(&r)
+                            || (self.local_def_counts.get(&r).copied().unwrap_or(0) <= 1
+                                && self.local_storage(r) == LocalStorage::Direct)
+                    }),
+                };
+                if src_ok {
+                    split_inits.insert(*dst, args[0].clone());
+                }
+            }
+        }
+        if split_inits.is_empty() {
+            return;
+        }
+
+        // Propagate across pure-init-temp copies `arr = Move/Copy(split_tmp)` so we can fold them too!
+        let mut group: HashMap<LocalId, Operand> = split_inits.clone();
+        let mut copy_to_root: HashMap<LocalId, (LocalId, BlockId, usize)> = HashMap::new();
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                continue;
+            }
+            for (sidx, stmt) in blk.statements.iter().enumerate() {
+                if self.skip_stmts.contains(&(blk.id, sidx)) {
+                    continue;
+                }
+                if let Statement::Assign(
+                    Place::Local(dst),
+                    Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))),
+                    _,
+                ) = stmt
+                    && let Some(src_str_op) = split_inits.get(src).cloned()
+                    && matches!(&self.func.locals[dst.0].ty, MirType::Array(inner) if **inner == MirType::String)
+                    && !param_set.contains(dst)
+                    && *dst != self.func.return_local
+                    && self.local_storage(*dst) == LocalStorage::Direct
+                    && self.local_def_counts.get(dst).copied().unwrap_or(0) == 1
+                {
+                    group.insert(*dst, src_str_op);
+                    copy_to_root.insert(*dst, (*src, blk.id, sidx));
+                }
+            }
+        }
+
+        // Collect all `arr_local` used in `IfArrayGetOk` where `binding_local` is borrowed `&str`
+        let mut allowed_if_get_arrs: HashSet<LocalId> = HashSet::new();
+        let mut disqual: HashSet<LocalId> = HashSet::new();
+        collect_if_array_get_info(tree, self, &mut allowed_if_get_arrs, &mut disqual);
+
+        // Verify all remaining uses in blocks are only `IfArrayGetOk` (skipped), `Len`, or `array.len`
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                let mut used = HashSet::new();
+                collect_block_used_locals(blk, &mut used);
+                for u in used {
+                    if group.contains_key(&u) {
+                        disqual.insert(u);
+                    }
+                }
+                continue;
+            }
+            for (sidx, stmt) in blk.statements.iter().enumerate() {
+                if self.skip_stmts.contains(&(blk.id, sidx)) {
+                    continue;
+                }
+                if let Statement::Assign(place, rval, _) = stmt {
+                    if let Place::Local(dst) = place
+                        && group.contains_key(dst)
+                        && let Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))) = rval
+                        && group.contains_key(src)
+                    {
+                        continue;
+                    }
+                    if let Rvalue::UnaryOp(MirUnaryOp::Len, op) = rval
+                        && operand_exact_local(op)
+                            .is_some_and(|l| group.contains_key(&self.resolve_local(l)))
+                    {
+                        continue;
+                    }
+                    let mut tmp = HashSet::new();
+                    place.collect_uses(&mut tmp);
+                    rval.collect_uses(&mut tmp);
+                    let rl = self.resolve_local(place.root_local());
+                    if group.contains_key(&rl) {
+                        disqual.insert(rl);
+                    }
+                    for id in tmp {
+                        let r = self.resolve_local(LocalId(id));
+                        if group.contains_key(&r) {
+                            disqual.insert(r);
+                        }
+                    }
+                }
+            }
+            if let Some(term) = &blk.terminator {
+                match term {
+                    Terminator::Call {
+                        callee,
+                        args,
+                        destination,
+                        ..
+                    } => {
+                        if callee == "string.split"
+                            && matches!(destination, Place::Local(d) if group.contains_key(d))
+                        {
+                            continue;
+                        }
+                        if matches!(callee.as_str(), "array.len" | "table.len")
+                            && args.len() == 1
+                            && operand_exact_local(&args[0])
+                                .is_some_and(|l| group.contains_key(&self.resolve_local(l)))
+                        {
+                            continue;
+                        }
+                        if let Place::Local(d) = destination
+                            && group.contains_key(d)
+                        {
+                            disqual.insert(*d);
+                        }
+                        for a in args {
+                            let mut tmp = HashSet::new();
+                            a.collect_uses(&mut tmp);
+                            for id in tmp {
+                                let r = self.resolve_local(LocalId(id));
+                                if group.contains_key(&r) {
+                                    disqual.insert(r);
+                                }
+                            }
+                        }
+                    }
+                    Terminator::Return(Some(op), _) | Terminator::Raise(op, _) => {
+                        let mut tmp = HashSet::new();
+                        op.collect_uses(&mut tmp);
+                        for id in tmp {
+                            let r = self.resolve_local(LocalId(id));
+                            if group.contains_key(&r) {
+                                disqual.insert(r);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Propagate disqualification across copy edges
+        loop {
+            let mut changed = false;
+            for (&dst, &(src, _, _)) in &copy_to_root {
+                if disqual.contains(&dst) && disqual.insert(src) {
+                    changed = true;
+                }
+                if disqual.contains(&src) && disqual.insert(dst) {
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        for (loc, src_str_op) in group {
+            if !disqual.contains(&loc) {
+                self.small_str_array_locals.insert(loc, src_str_op);
+            }
+        }
+        // Fold pure-init-temp copy `arr = Move(split_tmp)` to eliminate the extra struct copy!
+        for (dst, (root, bb, sidx)) in copy_to_root {
+            if self.small_str_array_locals.contains_key(&root) {
+                self.alias_map.insert(dst, root);
+                self.skip_stmts.insert((bb, sidx));
+                self.omitted_locals.insert(dst);
+            }
+        }
+
+        // Promote `small_str_array_locals` that are NEVER passed to `len`/`array.len`, ONLY read
+        // at constant indices `0` or `1`, and split from a non-mutated borrowed/const `&str`
+        // into `Copy` `(Option<&str>, Option<&str>)` (`split_pair_locals`) — zero `Drop`, zero
+        // UTF-8 boundary re-checks, and stops scanning after the 2nd element!
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                continue;
+            }
+            for stmt in &blk.statements {
+                if let Statement::Assign(
+                    Place::Local(d),
+                    Rvalue::Use(Operand::Constant(MirConstant::Int(v))),
+                    _,
+                ) = stmt
+                    && self.local_def_counts.get(d).copied().unwrap_or(0) == 1
+                {
+                    self.const_int_locals.insert(*d, *v);
+                }
+            }
+        }
+        let mut uses_len_or_bad_idx: HashSet<LocalId> = HashSet::new();
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                continue;
+            }
+            for (sidx, stmt) in blk.statements.iter().enumerate() {
+                if self.skip_stmts.contains(&(blk.id, sidx)) {
+                    continue;
+                }
+                if let Statement::Assign(_, Rvalue::UnaryOp(MirUnaryOp::Len, op), _) = stmt
+                    && let Some(l) = operand_exact_local(op)
+                {
+                    uses_len_or_bad_idx.insert(self.resolve_local(l));
+                }
+            }
+            if let Some(Terminator::Call { callee, args, .. }) = &blk.terminator
+                && matches!(callee.as_str(), "array.len" | "table.len")
+                && let Some(arg0) = args.first()
+                && let Some(l) = operand_exact_local(arg0)
+            {
+                uses_len_or_bad_idx.insert(self.resolve_local(l));
+            }
+        }
+        fn check_split_pair_indices(
+            node: &StructuredNode,
+            fe: &FnEmitter<'_, '_>,
+            bad: &mut HashSet<LocalId>,
+        ) {
+            match node {
+                StructuredNode::IfArrayGetOk {
+                    arr_local,
+                    idx_local,
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    let r = fe.resolve_local(*arr_local);
+                    if fe.small_str_array_locals.contains_key(&r) {
+                        let cidx = fe.const_int_locals.get(&fe.resolve_local(*idx_local)).copied();
+                        if !matches!(cidx, Some(0 | 1)) {
+                            bad.insert(r);
+                        }
+                    }
+                    check_split_pair_indices(then_branch, fe, bad);
+                    if let Some(eb) = else_branch {
+                        check_split_pair_indices(eb, fe, bad);
+                    }
+                }
+                StructuredNode::Seq(items) => {
+                    for it in items {
+                        check_split_pair_indices(it, fe, bad);
+                    }
+                }
+                StructuredNode::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    check_split_pair_indices(then_branch, fe, bad);
+                    if let Some(eb) = else_branch {
+                        check_split_pair_indices(eb, fe, bad);
+                    }
+                }
+                StructuredNode::Switch { cases, default, .. } => {
+                    for (_, c) in cases {
+                        check_split_pair_indices(c, fe, bad);
+                    }
+                    check_split_pair_indices(default, fe, bad);
+                }
+                StructuredNode::Loop { body, .. } => check_split_pair_indices(body, fe, bad),
+                _ => {}
+            }
+        }
+        check_split_pair_indices(tree, self, &mut uses_len_or_bad_idx);
+        let pair_candidates: Vec<LocalId> = self
+            .small_str_array_locals
+            .iter()
+            .filter_map(|(&loc, src_op)| {
+                if self.omitted_locals.contains(&loc) || uses_len_or_bad_idx.contains(&loc) {
+                    return None;
+                }
+                let src_borrow_safe = match src_op {
+                    Operand::Constant(MirConstant::String(_)) => true,
+                    _ => operand_exact_local(src_op).is_some_and(|l| {
+                        let r = self.resolve_local(l);
+                        self.borrowed_array_str_locals.contains(&r)
+                            || self.scoped_ref_locals.contains(&r)
+                    }),
+                };
+                if src_borrow_safe { Some(loc) } else { None }
+            })
+            .collect();
+        for loc in pair_candidates {
+            self.split_pair_locals.insert(loc);
+        }
+
+        // Fuse `arr = string.split(src, non_empty_const); idx = 0; len = array.len(arr); while idx < len { if arr[idx] is Ok(elem) { body } idx += 1 }`
+        // directly into `for elem in src.split(sep) { body }` — zero buffer, zero `Drop`, zero UTF-8 re-checks!
+        let mut split_call_info: HashMap<LocalId, (BlockId, Operand, String)> = HashMap::new();
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                continue;
+            }
+            if let Some(Terminator::Call {
+                callee,
+                args,
+                destination: Place::Local(dst),
+                ..
+            }) = &blk.terminator
+                && callee == "string.split"
+                && args.len() >= 2
+                && let Operand::Constant(MirConstant::String(sep_lit)) = &args[1]
+                && !sep_lit.is_empty()
+            {
+                let r = self.resolve_local(*dst);
+                if self.small_str_array_locals.contains_key(&r) && !self.split_pair_locals.contains(&r)
+                {
+                    split_call_info.insert(r, (blk.id, args[0].clone(), sep_lit.clone()));
+                }
+            }
+        }
+        if !split_call_info.is_empty() {
+            // Map `len_loc -> (arr_id, len_call_bb)` for `len = array.len(arr)` (plus single-def copy)
+            let mut arr_len_locals: HashMap<LocalId, (LocalId, BlockId)> = HashMap::new();
+            for blk in &self.func.blocks {
+                if blk.is_cleanup {
+                    continue;
+                }
+                if let Some(Terminator::Call {
+                    callee,
+                    args,
+                    destination: Place::Local(dst),
+                    ..
+                }) = &blk.terminator
+                    && matches!(callee.as_str(), "array.len" | "table.len")
+                    && args.len() == 1
+                    && let Some(al) = operand_exact_local(&args[0])
+                {
+                    let ar = self.resolve_local(al);
+                    if split_call_info.contains_key(&ar) {
+                        arr_len_locals.insert(*dst, (ar, blk.id));
+                    }
+                }
+            }
+            let len_copies: Vec<(LocalId, (LocalId, BlockId))> = self
+                .func
+                .blocks
+                .iter()
+                .filter(|b| !b.is_cleanup)
+                .flat_map(|b| b.statements.iter())
+                .filter_map(|s| {
+                    if let Statement::Assign(
+                        Place::Local(dst),
+                        Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))),
+                        _,
+                    ) = s
+                        && let Some(&info) = arr_len_locals.get(src)
+                        && self.local_def_counts.get(dst).copied().unwrap_or(0) == 1
+                    {
+                        Some((*dst, info))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (d, info) in len_copies {
+                arr_len_locals.insert(d, info);
+            }
+
+            // Walk structured `WhileLoop`s to find fusable `0..arr.len()` split loops
+            fn find_split_iter_loops(
+                node: &StructuredNode,
+                fe: &FnEmitter<'_, '_>,
+                split_call_info: &HashMap<LocalId, (BlockId, Operand, String)>,
+                arr_len_locals: &HashMap<LocalId, (LocalId, BlockId)>,
+                found: &mut Vec<(BlockId, LocalId, BlockId, BlockId, Operand, String, LocalId)>,
+            ) {
+                match node {
+                    StructuredNode::WhileLoop {
+                        label,
+                        header_block,
+                        cond_op,
+                        negate_cond: false,
+                        body,
+                    } => {
+                        if let Some(cond_loc) = operand_exact_local(cond_op) {
+                            let hblk = &fe.func.blocks[header_block.0];
+                            // Header must compute `cond = (idx < len)` with no other side effects
+                            let mut lt_pair = None;
+                            let mut header_ok = true;
+                            for (sidx, st) in hblk.statements.iter().enumerate() {
+                                if fe.skip_stmts.contains(&(*header_block, sidx)) {
+                                    continue;
+                                }
+                                match st {
+                                    Statement::StorageLive(_, _) | Statement::StorageDead(_, _) => {}
+                                    Statement::Assign(
+                                        Place::Local(d),
+                                        Rvalue::BinaryOp(MirBinaryOp::Lt, l, r),
+                                        _,
+                                    ) if *d == cond_loc => {
+                                        if let (Some(il), Some(ll)) =
+                                            (operand_exact_local(l), operand_exact_local(r))
+                                        {
+                                            lt_pair = Some((fe.resolve_local(il), fe.resolve_local(ll)));
+                                        }
+                                    }
+                                    _ => {
+                                        header_ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if header_ok
+                                && let Some((idx_loc, len_loc)) = lt_pair
+                                && let Some(&(arr_id, len_bb)) = arr_len_locals.get(&len_loc)
+                                && let Some((split_bb, src_op, sep_lit)) = split_call_info.get(&arr_id)
+                                && let StructuredNode::Seq(items) = body.as_ref()
+                                && items.len() == 2
+                                && let StructuredNode::IfArrayGetOk {
+                                    header_block: if_hdr,
+                                    arr_local,
+                                    idx_local,
+                                    binding_local,
+                                    then_branch,
+                                    else_branch: None,
+                                } = &items[0]
+                                && fe.resolve_local(*arr_local) == arr_id
+                                && fe.resolve_local(*idx_local) == idx_loc
+                                && fe.borrowed_array_str_locals.contains(binding_local)
+                                && let StructuredNode::BasicBlock(latch_bb) = items[1]
+                            {
+                                // Verify `if_hdr` has no unskipped statements
+                                let if_hdr_clean = fe.func.blocks[if_hdr.0]
+                                    .statements
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(si, st)| {
+                                        fe.skip_stmts.contains(&(*if_hdr, si))
+                                            || matches!(
+                                                st,
+                                                Statement::StorageLive(_, _)
+                                                    | Statement::StorageDead(_, _)
+                                            )
+                                    });
+                                // Verify `latch_bb` ONLY increments `idx_loc` by 1
+                                let lblk = &fe.func.blocks[latch_bb.0];
+                                let mut inc_tmp: Option<LocalId> = None;
+                                let mut did_inc = false;
+                                let mut latch_ok = matches!(
+                                    lblk.terminator,
+                                    Some(Terminator::Goto(_, _)) | None
+                                );
+                                for (si, st) in lblk.statements.iter().enumerate() {
+                                    if fe.skip_stmts.contains(&(latch_bb, si)) {
+                                        continue;
+                                    }
+                                    match st {
+                                        Statement::StorageLive(_, _)
+                                        | Statement::StorageDead(_, _) => {}
+                                        Statement::Assign(
+                                            Place::Local(d),
+                                            Rvalue::BinaryOp(
+                                                MirBinaryOp::Add,
+                                                l,
+                                                Operand::Constant(MirConstant::Int(1)),
+                                            ),
+                                            _,
+                                        ) if operand_exact_local(l)
+                                            .is_some_and(|x| fe.resolve_local(x) == idx_loc) =>
+                                        {
+                                            if fe.resolve_local(*d) == idx_loc {
+                                                did_inc = true;
+                                            } else {
+                                                inc_tmp = Some(fe.resolve_local(*d));
+                                            }
+                                        }
+                                        Statement::Assign(
+                                            Place::Local(d),
+                                            Rvalue::Use(
+                                                Operand::Copy(Place::Local(s))
+                                                | Operand::Move(Place::Local(s)),
+                                            ),
+                                            _,
+                                        ) if fe.resolve_local(*d) == idx_loc
+                                            && inc_tmp == Some(fe.resolve_local(*s)) =>
+                                        {
+                                            did_inc = true;
+                                        }
+                                        _ => {
+                                            latch_ok = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                // Verify `idx_loc` is initialized to 0 once and only used in header + IfArrayGetOk + latch,
+                                // and `arr_id` is ONLY used in `len_bb` and `IfArrayGetOk`.
+                                let mut idx_zero_defs = 0usize;
+                                let mut idx_total_defs = 0usize;
+                                let mut arr_uses_other = false;
+                                for blk in &fe.func.blocks {
+                                    for (si, st) in blk.statements.iter().enumerate() {
+                                        if fe.skip_stmts.contains(&(blk.id, si)) {
+                                            continue;
+                                        }
+                                        if let Statement::Assign(Place::Local(d), rv, _) = st
+                                            && fe.resolve_local(*d) == idx_loc
+                                        {
+                                            idx_total_defs += 1;
+                                            if matches!(
+                                                rv,
+                                                Rvalue::Use(Operand::Constant(MirConstant::Int(0)))
+                                            ) {
+                                                idx_zero_defs += 1;
+                                            }
+                                        }
+                                    }
+                                    if let Some(Terminator::Call { args, .. }) = &blk.terminator
+                                        && blk.id != len_bb
+                                        && blk.id != *split_bb
+                                    {
+                                        for a in args {
+                                            if operand_exact_local(a)
+                                                .is_some_and(|x| fe.resolve_local(x) == arr_id)
+                                            {
+                                                arr_uses_other = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Also ensure `idx_loc` is not read inside `then_branch`
+                                fn node_reads_local(
+                                    n: &StructuredNode,
+                                    fe: &FnEmitter<'_, '_>,
+                                    target: LocalId,
+                                ) -> bool {
+                                    let mut used = HashSet::new();
+                                    match n {
+                                        StructuredNode::BasicBlock(bb) => {
+                                            collect_block_used_locals(&fe.func.blocks[bb.0], &mut used);
+                                            used.iter().any(|&u| fe.resolve_local(u) == target)
+                                        }
+                                        StructuredNode::Seq(xs) => {
+                                            xs.iter().any(|x| node_reads_local(x, fe, target))
+                                        }
+                                        StructuredNode::If {
+                                            cond_block,
+                                            then_branch,
+                                            else_branch,
+                                            ..
+                                        } => {
+                                            collect_block_used_locals(
+                                                &fe.func.blocks[cond_block.0],
+                                                &mut used,
+                                            );
+                                            used.iter().any(|&u| fe.resolve_local(u) == target)
+                                                || node_reads_local(then_branch, fe, target)
+                                                || else_branch
+                                                    .as_ref()
+                                                    .is_some_and(|e| node_reads_local(e, fe, target))
+                                        }
+                                        StructuredNode::IfArrayGetOk {
+                                            header_block,
+                                            arr_local,
+                                            idx_local,
+                                            then_branch,
+                                            else_branch,
+                                            ..
+                                        } => {
+                                            fe.resolve_local(*arr_local) == target
+                                                || fe.resolve_local(*idx_local) == target
+                                                || {
+                                                    collect_block_used_locals(
+                                                        &fe.func.blocks[header_block.0],
+                                                        &mut used,
+                                                    );
+                                                    used.iter().any(|&u| fe.resolve_local(u) == target)
+                                                }
+                                                || node_reads_local(then_branch, fe, target)
+                                                || else_branch
+                                                    .as_ref()
+                                                    .is_some_and(|e| node_reads_local(e, fe, target))
+                                        }
+                                        StructuredNode::Switch {
+                                            discr_block,
+                                            cases,
+                                            default,
+                                            ..
+                                        } => {
+                                            collect_block_used_locals(
+                                                &fe.func.blocks[discr_block.0],
+                                                &mut used,
+                                            );
+                                            used.iter().any(|&u| fe.resolve_local(u) == target)
+                                                || cases
+                                                    .iter()
+                                                    .any(|(_, c)| node_reads_local(c, fe, target))
+                                                || node_reads_local(default, fe, target)
+                                        }
+                                        StructuredNode::WhileLoop {
+                                            header_block, body, ..
+                                        } => {
+                                            collect_block_used_locals(
+                                                &fe.func.blocks[header_block.0],
+                                                &mut used,
+                                            );
+                                            used.iter().any(|&u| fe.resolve_local(u) == target)
+                                                || node_reads_local(body, fe, target)
+                                        }
+                                        StructuredNode::Loop { body, .. }
+                                        | StructuredNode::LabeledBlock { body, .. } => {
+                                            node_reads_local(body, fe, target)
+                                        }
+                                        StructuredNode::Return(bb, _) => {
+                                            collect_block_used_locals(&fe.func.blocks[bb.0], &mut used);
+                                            used.iter().any(|&u| fe.resolve_local(u) == target)
+                                        }
+                                        _ => false,
+                                    }
+                                }
+                                if if_hdr_clean
+                                    && latch_ok
+                                    && did_inc
+                                    && idx_zero_defs == 1
+                                    && idx_total_defs == 2
+                                    && !arr_uses_other
+                                    && !node_reads_local(then_branch, fe, idx_loc)
+                                    && !node_reads_local(then_branch, fe, arr_id)
+                                {
+                                    found.push((
+                                        *label,
+                                        arr_id,
+                                        *split_bb,
+                                        len_bb,
+                                        src_op.clone(),
+                                        sep_lit.clone(),
+                                        *binding_local,
+                                    ));
+                                }
+                            }
+                        }
+                        find_split_iter_loops(body, fe, split_call_info, arr_len_locals, found);
+                    }
+                    StructuredNode::Seq(items) => {
+                        for it in items {
+                            find_split_iter_loops(it, fe, split_call_info, arr_len_locals, found);
+                        }
+                    }
+                    StructuredNode::If {
+                        then_branch,
+                        else_branch,
+                        ..
+                    }
+                    | StructuredNode::IfArrayGetOk {
+                        then_branch,
+                        else_branch,
+                        ..
+                    } => {
+                        find_split_iter_loops(then_branch, fe, split_call_info, arr_len_locals, found);
+                        if let Some(eb) = else_branch {
+                            find_split_iter_loops(eb, fe, split_call_info, arr_len_locals, found);
+                        }
+                    }
+                    StructuredNode::Switch { cases, default, .. } => {
+                        for (_, c) in cases {
+                            find_split_iter_loops(c, fe, split_call_info, arr_len_locals, found);
+                        }
+                        find_split_iter_loops(default, fe, split_call_info, arr_len_locals, found);
+                    }
+                    StructuredNode::Loop { body, .. }
+                    | StructuredNode::LabeledBlock { body, .. } => {
+                        find_split_iter_loops(body, fe, split_call_info, arr_len_locals, found);
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut found_loops = Vec::new();
+            find_split_iter_loops(tree, self, &split_call_info, &arr_len_locals, &mut found_loops);
+            // Only fuse when each `arr_id` appears in a single fused loop
+            let mut arr_loop_counts: HashMap<LocalId, usize> = HashMap::new();
+            for item in &found_loops {
+                *arr_loop_counts.entry(item.1).or_insert(0) += 1;
+            }
+            for (label, arr_id, split_bb, len_bb, src_op, sep_lit, binding_local) in found_loops {
+                if arr_loop_counts.get(&arr_id).copied().unwrap_or(0) == 1 {
+                    self.skip_calls.insert(split_bb);
+                    self.skip_calls.insert(len_bb);
+                    self.omitted_locals.insert(arr_id);
+                    self.split_iter_loops
+                        .insert(label, (src_op, sep_lit, binding_local));
+                }
+            }
+        }
+    }
+
+    /// Pre-pass (`AOT-SSO-REGEX`): detects `res = string.gsub(...)` (`Array<string>`) locals that
+    /// are ONLY ever read at constant index `0` via `IfArrayGetOk`, lowering them directly to
+    /// `alloc::string::String` so `Vec<String>` and unused `count` formatting are completely elided.
+    fn analyze_gsub_first_only_locals(&mut self, tree: &StructuredNode) {
+        let param_set: HashSet<LocalId> = self.func.params.iter().copied().collect();
+        let mut gsub_inits: HashSet<LocalId> = HashSet::new();
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                continue;
+            }
+            if let Some(Terminator::Call {
+                callee,
+                destination: Place::Local(dst),
+                ..
+            }) = &blk.terminator
+                && callee == "string.gsub"
+                && matches!(&self.func.locals[dst.0].ty, MirType::Array(inner) if **inner == MirType::String)
+                && !param_set.contains(dst)
+                && *dst != self.func.return_local
+                && self.local_storage(*dst) == LocalStorage::Direct
+            {
+                gsub_inits.insert(*dst);
+            }
+        }
+        if gsub_inits.is_empty() {
+            return;
+        }
+
+        let mut group: HashSet<LocalId> = gsub_inits.clone();
+        let mut copy_edges: Vec<(LocalId, LocalId, BlockId, usize)> = Vec::new();
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                continue;
+            }
+            for (sidx, stmt) in blk.statements.iter().enumerate() {
+                if let Statement::Assign(
+                    Place::Local(dst),
+                    Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))),
+                    _,
+                ) = stmt
+                    && group.contains(src)
+                    && matches!(&self.func.locals[dst.0].ty, MirType::Array(inner) if **inner == MirType::String)
+                    && !param_set.contains(dst)
+                    && *dst != self.func.return_local
+                    && self.local_storage(*dst) == LocalStorage::Direct
+                    && self.local_def_counts.get(dst).copied().unwrap_or(0) == 1
+                {
+                    group.insert(*dst);
+                    copy_edges.push((*dst, *src, blk.id, sidx));
+                }
+            }
+        }
+
+        // Collect constant-int definitions `idx = 0`
+        let mut const_zero_locals: HashSet<LocalId> = HashSet::new();
+        for blk in &self.func.blocks {
+            for stmt in &blk.statements {
+                if let Statement::Assign(
+                    Place::Local(dst),
+                    Rvalue::Use(Operand::Constant(MirConstant::Int(0))),
+                    _,
+                ) = stmt
+                    && self.local_def_counts.get(dst).copied().unwrap_or(0) == 1
+                {
+                    const_zero_locals.insert(*dst);
+                }
+            }
+        }
+
+        let mut disqual: HashSet<LocalId> = HashSet::new();
+        check_gsub_if_array_get_zero_only(tree, self, &group, &const_zero_locals, &mut disqual);
+
+        // Ensure no other uses of `group` exist (except skipped bounds-check len / pure init copy)
+        for blk in &self.func.blocks {
+            if blk.is_cleanup {
+                let mut used = HashSet::new();
+                collect_block_used_locals(blk, &mut used);
+                for u in used {
+                    if group.contains(&u) {
+                        disqual.insert(u);
+                    }
+                }
+                continue;
+            }
+            for (sidx, stmt) in blk.statements.iter().enumerate() {
+                if self.skip_stmts.contains(&(blk.id, sidx)) {
+                    continue;
+                }
+                if let Statement::Assign(place, rval, _) = stmt {
+                    if let Place::Local(dst) = place
+                        && group.contains(dst)
+                        && let Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))) = rval
+                        && group.contains(src)
+                    {
+                        continue;
+                    }
+                    // Allow dead `len` temp only if already skipped; otherwise disqualify
+                    let mut tmp = HashSet::new();
+                    place.collect_uses(&mut tmp);
+                    rval.collect_uses(&mut tmp);
+                    let rl = self.resolve_local(place.root_local());
+                    if group.contains(&rl) {
+                        disqual.insert(rl);
+                    }
+                    for id in tmp {
+                        let r = self.resolve_local(LocalId(id));
+                        if group.contains(&r) {
+                            disqual.insert(r);
+                        }
+                    }
+                }
+            }
+            if let Some(term) = &blk.terminator {
+                match term {
+                    Terminator::Call {
+                        callee,
+                        args,
+                        destination,
+                        ..
+                    } => {
+                        if callee == "string.gsub"
+                            && matches!(destination, Place::Local(d) if group.contains(d))
+                        {
+                            continue;
+                        }
+                        if let Place::Local(d) = destination
+                            && group.contains(d)
+                        {
+                            disqual.insert(*d);
+                        }
+                        for a in args {
+                            let mut tmp = HashSet::new();
+                            a.collect_uses(&mut tmp);
+                            for id in tmp {
+                                let r = self.resolve_local(LocalId(id));
+                                if group.contains(&r) {
+                                    disqual.insert(r);
+                                }
+                            }
+                        }
+                    }
+                    Terminator::Return(Some(op), _) | Terminator::Raise(op, _) => {
+                        let mut tmp = HashSet::new();
+                        op.collect_uses(&mut tmp);
+                        for id in tmp {
+                            let r = self.resolve_local(LocalId(id));
+                            if group.contains(&r) {
+                                disqual.insert(r);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        loop {
+            let mut changed = false;
+            for &(dst, src, _, _) in &copy_edges {
+                if disqual.contains(&dst) && disqual.insert(src) {
+                    changed = true;
+                }
+                if disqual.contains(&src) && disqual.insert(dst) {
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        for loc in group {
+            if !disqual.contains(&loc) {
+                self.gsub_first_only_locals.insert(loc);
+            }
+        }
+        // Fold pure-init-temp copies `res = Move(gsub_tmp)` so buffer reuse in loops works in-place!
+        for (dst, src, bb, sidx) in copy_edges {
+            if self.gsub_first_only_locals.contains(&src) && gsub_inits.contains(&src) {
+                self.alias_map.insert(dst, src);
+                self.skip_stmts.insert((bb, sidx));
+                self.omitted_locals.insert(dst);
+            }
         }
     }
 
@@ -9476,6 +12356,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 // Skip the canonical bounds-check temporaries in `header_block` if unused elsewhere
                 self.mark_if_array_get_header_skips(*header_block);
                 // Skip the redundant `binding_local = arr_local[idx_local]` in the leading block of `then_branch`
+                let mut folded_def_stmt: Option<(BlockId, usize)> = None;
                 if let Some(then_bb) = leading_block_of(then_branch) {
                     let stmts = &self.func.blocks[then_bb.0].statements;
                     for (sidx, stmt) in stmts.iter().enumerate() {
@@ -9487,8 +12368,51 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                             && idx == idx_local
                         {
                             self.skip_stmts.insert((then_bb, sidx));
+                            folded_def_stmt = Some((then_bb, sidx));
                             break;
                         }
+                    }
+                }
+                // Borrowed `IfArrayGetOk` (`AOT-SSO-REGEX`): when `binding_local` is a read-only
+                // `MirType::String` that never escapes `then_branch` and `arr_local` is not mutated
+                // inside `then_branch`, bind `&str` directly with ZERO `.clone()`!
+                let arr_id = self.resolve_local(*arr_local);
+                let elem_is_str = matches!(
+                    &self.func.locals[arr_id.0].ty,
+                    MirType::Array(inner) if **inner == MirType::String
+                );
+                if elem_is_str
+                    && folded_def_stmt.is_some()
+                    && self.local_storage(arr_id) == LocalStorage::Direct
+                    && self.local_storage(*binding_local) == LocalStorage::Direct
+                    && !self.func.params.contains(binding_local)
+                    && *binding_local != self.func.return_local
+                    && self.local_def_counts.get(binding_local).copied().unwrap_or(0) == 1
+                    && !param_escapes_by_move(self.func, *binding_local)
+                {
+                    let mut then_blocks = HashSet::new();
+                    collect_node_blocks(then_branch, &mut then_blocks);
+                    let mut used_outside = false;
+                    for blk in &self.func.blocks {
+                        if then_blocks.contains(&blk.id) {
+                            continue;
+                        }
+                        let mut used = HashSet::new();
+                        collect_block_used_locals(blk, &mut used);
+                        if used
+                            .iter()
+                            .any(|&u| self.resolve_local(u) == *binding_local)
+                        {
+                            used_outside = true;
+                            break;
+                        }
+                    }
+                    let arr_mutated_in_then =
+                        array_mutated_in_blocks(self.func, arr_id, &then_blocks, &self.alias_map);
+                    if !used_outside && !arr_mutated_in_then {
+                        self.borrowed_array_str_locals.insert(*binding_local);
+                        self.omitted_locals.insert(*binding_local);
+                        self.scoped_ref_locals.insert(*binding_local);
                     }
                 }
                 self.analyze_structured_folds(then_branch);
@@ -9550,22 +12474,19 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
         else {
             return;
         };
-        let Some(lhs_loc) = operand_exact_local(lhs) else {
-            return;
-        };
-        let Some(rhs_loc) = operand_exact_local(rhs) else {
-            return;
-        };
-        let Some(&(lhs_idx, lhs_rval)) = last_def.get(&lhs_loc) else {
-            return;
-        };
-        let Some(&(rhs_idx, rhs_rval)) = last_def.get(&rhs_loc) else {
-            return;
-        };
+        let mut to_skip = vec![(and_idx, cond_local)];
+        let mut branch_rvals: Vec<&Rvalue> = Vec::new();
+        for op in [lhs, rhs] {
+            if let Some(loc) = operand_exact_local(op)
+                && let Some(&(idx, rval)) = last_def.get(&loc)
+            {
+                to_skip.push((idx, loc));
+                branch_rvals.push(rval);
+            }
+        }
 
         // Find optional len_tmp
-        let mut to_skip = vec![(and_idx, cond_local), (lhs_idx, lhs_loc), (rhs_idx, rhs_loc)];
-        for rval in [lhs_rval, rhs_rval] {
+        for rval in branch_rvals {
             if let Rvalue::BinaryOp(MirBinaryOp::Lt | MirBinaryOp::Gt, a, b) = rval {
                 for op in [a, b] {
                     if let Some(loc) = operand_exact_local(op)
@@ -9701,7 +12622,9 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
         self.omitted_locals.insert(opt_loc);
         self.omitted_locals.insert(cond_local);
         self.omitted_locals.insert(binding_local);
-        self.scoped_ref_locals.insert(binding_local);
+        if !self.ctx.struct_is_rc_cyclic(&struct_name) {
+            self.scoped_ref_locals.insert(binding_local);
+        }
         self.if_option_some.insert(
             cond_block,
             IfOptionSomePlan {
@@ -9710,6 +12633,365 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 struct_name,
             },
         );
+    }
+
+    /// Pre-pass (`AOT-BUDGET-SOUND`): when `GasMetering::LoopChunked` is active, batches all
+    /// `Statement::ResourceCheck(ResourceKind::Gas, amt, _)` inside each loop's header and body
+    /// (including straight-line blocks, branch upper bounds, and statically bounded constant-trip
+    /// inner loops) into a single loop-header `__ctx.charge_gas(total_weight)?` call.
+    fn analyze_loop_chunked_gas(&mut self, node: &StructuredNode) {
+        if self.ctx.opts.gas_metering != GasMetering::LoopChunked {
+            return;
+        }
+        match node {
+            StructuredNode::WhileLoop {
+                label,
+                header_block,
+                body,
+                ..
+            } => {
+                let mut total_weight: i64 = 0;
+                let mut folded_stmts: Vec<(BlockId, usize)> = Vec::new();
+                let mut header_w = 0_i64;
+                for (sidx, stmt) in self.func.blocks[header_block.0].statements.iter().enumerate() {
+                    if let Statement::ResourceCheck(ResourceKind::Gas, amt, _) = stmt {
+                        header_w = header_w.saturating_add((*amt as i64).max(1));
+                        folded_stmts.push((*header_block, sidx));
+                    }
+                }
+                total_weight = total_weight.saturating_add(header_w);
+                let body_w = self.collect_loop_body_gas_weight(body, &mut folded_stmts);
+                total_weight = total_weight.saturating_add(body_w);
+                if !folded_stmts.is_empty() {
+                    for site in folded_stmts {
+                        self.skip_stmts.insert(site);
+                    }
+                    self.loop_chunked_header_gas
+                        .insert(*label, total_weight.max(1));
+                }
+            }
+            StructuredNode::Loop { label, body } => {
+                let mut folded_stmts: Vec<(BlockId, usize)> = Vec::new();
+                let body_w = self.collect_loop_body_gas_weight(body, &mut folded_stmts);
+                if !folded_stmts.is_empty() {
+                    for site in folded_stmts {
+                        self.skip_stmts.insert(site);
+                    }
+                    self.loop_chunked_header_gas
+                        .insert(*label, body_w.max(1));
+                }
+            }
+            StructuredNode::BasicBlock(bb) => {
+                self.batch_single_block_gas(*bb);
+            }
+            StructuredNode::Seq(items) => {
+                for item in items {
+                    self.analyze_loop_chunked_gas(item);
+                }
+            }
+            StructuredNode::If {
+                cond_block,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.batch_single_block_gas(*cond_block);
+                self.analyze_loop_chunked_gas(then_branch);
+                if let Some(eb) = else_branch {
+                    self.analyze_loop_chunked_gas(eb);
+                }
+            }
+            StructuredNode::IfArrayGetOk {
+                header_block,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.batch_single_block_gas(*header_block);
+                self.analyze_loop_chunked_gas(then_branch);
+                if let Some(eb) = else_branch {
+                    self.analyze_loop_chunked_gas(eb);
+                }
+            }
+            StructuredNode::Switch {
+                discr_block,
+                cases,
+                default,
+                ..
+            } => {
+                self.batch_single_block_gas(*discr_block);
+                for (_, c) in cases {
+                    self.analyze_loop_chunked_gas(c);
+                }
+                self.analyze_loop_chunked_gas(default);
+            }
+            StructuredNode::LabeledBlock { body, .. } => {
+                self.analyze_loop_chunked_gas(body);
+            }
+            StructuredNode::Return(bb, _) => {
+                self.batch_single_block_gas(*bb);
+            }
+            _ => {}
+        }
+    }
+
+    fn batch_single_block_gas(&mut self, bb: BlockId) {
+        let mut first_sidx: Option<usize> = None;
+        let mut total: i64 = 0;
+        let mut count: usize = 0;
+        for (sidx, stmt) in self.func.blocks[bb.0].statements.iter().enumerate() {
+            if self.skip_stmts.contains(&(bb, sidx)) {
+                continue;
+            }
+            if let Statement::ResourceCheck(ResourceKind::Gas, amt, _) = stmt {
+                if first_sidx.is_none() {
+                    first_sidx = Some(sidx);
+                } else {
+                    self.skip_stmts.insert((bb, sidx));
+                }
+                total = total.saturating_add((*amt as i64).max(1));
+                count += 1;
+            }
+        }
+        if count > 1
+            && let Some(first) = first_sidx
+        {
+            self.block_chunked_gas.insert((bb, first), total);
+        }
+    }
+
+    /// Recursively collects gas weights inside a loop body that can be folded into the enclosing
+    /// loop header under `GasMetering::LoopChunked`. Nested non-constant loops keep their own
+    /// chunked header charge via recursive `analyze_loop_chunked_gas`.
+    fn collect_loop_body_gas_weight(
+        &mut self,
+        node: &StructuredNode,
+        folded_stmts: &mut Vec<(BlockId, usize)>,
+    ) -> i64 {
+        match node {
+            StructuredNode::BasicBlock(bb) | StructuredNode::Return(bb, _) => {
+                let mut w = 0_i64;
+                for (sidx, stmt) in self.func.blocks[bb.0].statements.iter().enumerate() {
+                    if let Statement::ResourceCheck(ResourceKind::Gas, amt, _) = stmt {
+                        w = w.saturating_add((*amt as i64).max(1));
+                        folded_stmts.push((*bb, sidx));
+                    }
+                }
+                w
+            }
+            StructuredNode::Seq(items) => {
+                let mut sum = 0_i64;
+                for item in items {
+                    sum = sum.saturating_add(self.collect_loop_body_gas_weight(item, folded_stmts));
+                }
+                sum
+            }
+            StructuredNode::LabeledBlock { body, .. } => {
+                self.collect_loop_body_gas_weight(body, folded_stmts)
+            }
+            StructuredNode::If {
+                cond_block,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let mut w = 0_i64;
+                for (sidx, stmt) in self.func.blocks[cond_block.0].statements.iter().enumerate() {
+                    if let Statement::ResourceCheck(ResourceKind::Gas, amt, _) = stmt {
+                        w = w.saturating_add((*amt as i64).max(1));
+                        folded_stmts.push((*cond_block, sidx));
+                    }
+                }
+                let tw = self.collect_loop_body_gas_weight(then_branch, folded_stmts);
+                let ew = else_branch
+                    .as_deref()
+                    .map(|eb| self.collect_loop_body_gas_weight(eb, folded_stmts))
+                    .unwrap_or(0);
+                w.saturating_add(tw.max(ew))
+            }
+            StructuredNode::IfArrayGetOk {
+                header_block,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let mut w = 0_i64;
+                for (sidx, stmt) in self.func.blocks[header_block.0].statements.iter().enumerate() {
+                    if let Statement::ResourceCheck(ResourceKind::Gas, amt, _) = stmt {
+                        w = w.saturating_add((*amt as i64).max(1));
+                        folded_stmts.push((*header_block, sidx));
+                    }
+                }
+                let tw = self.collect_loop_body_gas_weight(then_branch, folded_stmts);
+                let ew = else_branch
+                    .as_deref()
+                    .map(|eb| self.collect_loop_body_gas_weight(eb, folded_stmts))
+                    .unwrap_or(0);
+                w.saturating_add(tw.max(ew))
+            }
+            StructuredNode::Switch {
+                discr_block,
+                cases,
+                default,
+                ..
+            } => {
+                let mut w = 0_i64;
+                for (sidx, stmt) in self.func.blocks[discr_block.0].statements.iter().enumerate() {
+                    if let Statement::ResourceCheck(ResourceKind::Gas, amt, _) = stmt {
+                        w = w.saturating_add((*amt as i64).max(1));
+                        folded_stmts.push((*discr_block, sidx));
+                    }
+                }
+                let mut max_arm = self.collect_loop_body_gas_weight(default, folded_stmts);
+                for (_, c) in cases {
+                    let cw = self.collect_loop_body_gas_weight(c, folded_stmts);
+                    if cw > max_arm {
+                        max_arm = cw;
+                    }
+                }
+                w.saturating_add(max_arm)
+            }
+            StructuredNode::WhileLoop {
+                header_block,
+                cond_op,
+                negate_cond,
+                body,
+                ..
+            } => {
+                // If this inner loop has a small statically-bounded constant trip count (e.g. `while k < 4`),
+                // fold `trip_count * inner_weight` directly into the outer loop header charge!
+                if let Some(trips) = self.estimate_const_inner_loop_trips(*header_block, cond_op, *negate_cond, body) {
+                    let mut inner_folded = Vec::new();
+                    let mut inner_w = 0_i64;
+                    for (sidx, stmt) in self.func.blocks[header_block.0].statements.iter().enumerate() {
+                        if let Statement::ResourceCheck(ResourceKind::Gas, amt, _) = stmt {
+                            inner_w = inner_w.saturating_add((*amt as i64).max(1));
+                            inner_folded.push((*header_block, sidx));
+                        }
+                    }
+                    let bw = self.collect_loop_body_gas_weight(body, &mut inner_folded);
+                    inner_w = inner_w.saturating_add(bw);
+                    if !inner_folded.is_empty() {
+                        folded_stmts.extend(inner_folded);
+                        return inner_w.saturating_mul(trips.saturating_add(1));
+                    }
+                }
+                // Otherwise, analyze the inner loop independently with its own chunked header.
+                self.analyze_loop_chunked_gas(node);
+                0
+            }
+            StructuredNode::Loop { .. } => {
+                self.analyze_loop_chunked_gas(node);
+                0
+            }
+            _ => 0,
+        }
+    }
+
+    /// Detects a simple bounded constant-trip inner loop (`k < C` or `k <= C` with `k = k + step`,
+    /// `step > 0`, no calls or nested loops) initialized to a constant `start` and returns `trips <= 1024`.
+    fn estimate_const_inner_loop_trips(
+        &self,
+        header_block: BlockId,
+        cond_op: &Operand,
+        negate_cond: bool,
+        body: &StructuredNode,
+    ) -> Option<i64> {
+        if negate_cond {
+            return None;
+        }
+        let cond_loc = operand_exact_local(cond_op)?;
+        let mut cmp_info: Option<(LocalId, MirBinaryOp, i64)> = None;
+        for stmt in &self.func.blocks[header_block.0].statements {
+            if let Statement::Assign(
+                Place::Local(dst),
+                Rvalue::BinaryOp(op @ (MirBinaryOp::Lt | MirBinaryOp::LtEq), lhs, Operand::Constant(MirConstant::Int(bound))),
+                _,
+            ) = stmt
+                && *dst == cond_loc
+                && let Some(iv) = operand_exact_local(lhs)
+            {
+                cmp_info = Some((iv, *op, *bound));
+            }
+        }
+        let (iv, op, bound) = cmp_info?;
+        // Collect all blocks in `body` (rejecting nested loops, calls, or breaks/returns)
+        let mut body_bbs = Vec::new();
+        if !collect_simple_straight_body_blocks(body, self.func, &mut body_bbs) {
+            return None;
+        }
+        // Check that `iv` is incremented by a positive constant step inside `body_bbs`
+        let mut step_val: Option<i64> = None;
+        let mut iv_writes = 0usize;
+        for &bb in &body_bbs {
+            let mut tmp_adds: HashMap<LocalId, i64> = HashMap::new();
+            for stmt in &self.func.blocks[bb.0].statements {
+                if let Statement::Assign(Place::Local(dst), rval, _) = stmt {
+                    if let Rvalue::BinaryOp(MirBinaryOp::Add, lhs, Operand::Constant(MirConstant::Int(s))) = rval
+                        && operand_exact_local(lhs) == Some(iv)
+                        && *s > 0
+                    {
+                        tmp_adds.insert(*dst, *s);
+                        if *dst == iv {
+                            iv_writes += 1;
+                            step_val = Some(*s);
+                        }
+                    } else if *dst == iv {
+                        iv_writes += 1;
+                        if let Rvalue::Use(op_src) = rval
+                            && let Some(src_l) = operand_exact_local(op_src)
+                            && let Some(&s) = tmp_adds.get(&src_l)
+                        {
+                            step_val = Some(s);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        let step = step_val?;
+        if iv_writes != 1 || step <= 0 {
+            return None;
+        }
+        // Find constant initializer for `iv` outside `body_bbs`
+        let body_set: HashSet<BlockId> = body_bbs.into_iter().collect();
+        let mut init_val: Option<i64> = None;
+        for blk in &self.func.blocks {
+            if blk.is_cleanup || blk.id == header_block || body_set.contains(&blk.id) {
+                continue;
+            }
+            for stmt in &blk.statements {
+                if let Statement::Assign(Place::Local(dst), rval, _) = stmt
+                    && *dst == iv
+                {
+                    if let Rvalue::Use(Operand::Constant(MirConstant::Int(c))) = rval {
+                        if init_val.is_some() && init_val != Some(*c) {
+                            return None;
+                        }
+                        init_val = Some(*c);
+                    } else {
+                        return None;
+                    }
+                }
+            }
+        }
+        let start = init_val?;
+        let end = if op == MirBinaryOp::LtEq {
+            bound.checked_add(1)?
+        } else {
+            bound
+        };
+        if end <= start {
+            return Some(0);
+        }
+        let span = end.checked_sub(start)?;
+        let trips = (span + step - 1) / step;
+        if (0..=1024).contains(&trips) {
+            Some(trips)
+        } else {
+            None
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -9781,16 +13063,29 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 self.emit_block_statements(*cond_block, indent)?;
                 if let Some(plan) = self.if_option_some.get(cond_block).cloned() {
                     let src_expr = self.emit_place_ref_expr(&plan.src_place);
-                    let deref_expr = if self.ctx.struct_is_cyclic(&plan.struct_name) {
-                        format!("{src_expr}.as_deref()")
+                    if self.ctx.struct_is_rc_cyclic(&plan.struct_name) {
+                        let opt_expr = if matches!(plan.src_place, Place::Field(_, _)) {
+                            src_expr
+                        } else {
+                            format!("{src_expr}.clone()")
+                        };
+                        let _ = writeln!(
+                            self.out,
+                            "{pad}if let Some(mut _{}) = {opt_expr} {{",
+                            plan.binding_local.0
+                        );
                     } else {
-                        format!("{src_expr}.as_ref()")
-                    };
-                    let _ = writeln!(
-                        self.out,
-                        "{pad}if let Some(_{}) = {deref_expr} {{",
-                        plan.binding_local.0
-                    );
+                        let deref_expr = if self.ctx.struct_is_arena_cyclic(&plan.struct_name) {
+                            format!("{src_expr}.as_deref()")
+                        } else {
+                            format!("{src_expr}.as_ref()")
+                        };
+                        let _ = writeln!(
+                            self.out,
+                            "{pad}if let Some(_{}) = {deref_expr} {{",
+                            plan.binding_local.0
+                        );
+                    }
                     self.emit_node(then_branch, indent + 1)?;
                     if let Some(eb) = else_branch {
                         let _ = writeln!(self.out, "{pad}}} else {{");
@@ -9825,6 +13120,25 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                     MirType::Array(inner) => inner.as_ref().clone(),
                     _ => self.func.locals[binding_local.0].ty.clone(),
                 };
+                if self.gsub_first_only_locals.contains(&arr_id) {
+                    let _ = writeln!(self.out, "{pad}{{");
+                    if self.borrowed_array_str_locals.contains(binding_local) {
+                        let _ = writeln!(
+                            self.out,
+                            "{pad}    let _{}: &str = {arr_var}.as_str();",
+                            binding_local.0
+                        );
+                    } else {
+                        self.emit_assign_local_val(
+                            *binding_local,
+                            &format!("{arr_var}.clone()"),
+                            indent + 1,
+                        );
+                    }
+                    self.emit_node(then_branch, indent + 1)?;
+                    let _ = writeln!(self.out, "{pad}}}");
+                    return Ok(());
+                }
                 if self.local_storage(arr_id) == LocalStorage::RcRefCell {
                     // Drop the RefCell borrow BEFORE entering `then_branch` so mutations inside
                     // `then_branch` to `arr` or its aliases never cause re-entrant borrow conflicts.
@@ -9839,6 +13153,55 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                     );
                     let _ = writeln!(self.out, "{pad}if let Some(__elem) = __opt_elem {{");
                     self.emit_assign_local_val(*binding_local, "__elem", indent + 1);
+                } else if self.split_pair_locals.contains(&arr_id) {
+                    let cidx = self.const_int_locals.get(&idx_id).copied();
+                    let field = if cidx == Some(0) { "0" } else { "1" };
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}if let Some(__elem) = {arr_var}.{field} {{"
+                    );
+                    if self.borrowed_array_str_locals.contains(binding_local) {
+                        let _ = writeln!(
+                            self.out,
+                            "{pad}    let _{}: &str = __elem;",
+                            binding_local.0
+                        );
+                    } else {
+                        self.emit_assign_local_val(
+                            *binding_local,
+                            "alloc::string::String::from(__elem)",
+                            indent + 1,
+                        );
+                    }
+                } else if let Some(src_str_op) = self.small_str_array_locals.get(&arr_id).cloned() {
+                    let src_str_expr = self.emit_operand_str_ref(&src_str_op);
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}if let Some((__lo, __hi)) = usize::try_from({idx_expr}).ok().and_then(|__i| {arr_var}.get(__i)) {{"
+                    );
+                    if self.borrowed_array_str_locals.contains(binding_local) {
+                        let _ = writeln!(
+                            self.out,
+                            "{pad}    let _{}: &str = &({src_str_expr})[__lo..__hi];",
+                            binding_local.0
+                        );
+                    } else {
+                        self.emit_assign_local_val(
+                            *binding_local,
+                            &format!("alloc::string::String::from(&({src_str_expr})[__lo..__hi])"),
+                            indent + 1,
+                        );
+                    }
+                } else if self.borrowed_array_str_locals.contains(binding_local) {
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}if let Some(__elem) = usize::try_from({idx_expr}).ok().and_then(|__i| {arr_var}.get(__i)) {{"
+                    );
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}    let _{}: &str = __elem.as_str();",
+                        binding_local.0
+                    );
                 } else if self.ctx.is_copy_type(&elem_ty) {
                     let _ = writeln!(
                         self.out,
@@ -9901,7 +13264,37 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 negate_cond,
                 body,
             } => {
+                if let Some((src_op, sep_lit, binding_local)) =
+                    self.split_iter_loops.get(label).cloned()
+                    && let StructuredNode::Seq(items) = body.as_ref()
+                    && let Some(StructuredNode::IfArrayGetOk { then_branch, .. }) = items.first()
+                {
+                    let src_expr = self.emit_operand_str_ref(&src_op);
+                    let sep_arg = if sep_lit.len() == 1 && sep_lit.as_bytes()[0] < 128 {
+                        format!("{:?}", sep_lit.as_bytes()[0] as char)
+                    } else {
+                        format!("{sep_lit:?}")
+                    };
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}'bb{}: for _{} in ({src_expr}).split({sep_arg}) {{",
+                        label.0, binding_local.0
+                    );
+                    if let Some(&weight) = self.loop_chunked_header_gas.get(label)
+                        && self.in_cleanup_closure.is_none()
+                    {
+                        let _ = writeln!(self.out, "{pad}    __ctx.charge_gas({weight}_i64)?;");
+                    }
+                    self.emit_node(then_branch, indent + 1)?;
+                    let _ = writeln!(self.out, "{pad}}}");
+                    return Ok(());
+                }
                 let _ = writeln!(self.out, "{pad}'bb{}: loop {{", label.0);
+                if let Some(&weight) = self.loop_chunked_header_gas.get(label)
+                    && self.in_cleanup_closure.is_none()
+                {
+                    let _ = writeln!(self.out, "{pad}    __ctx.charge_gas({weight}_i64)?;");
+                }
                 self.emit_block_statements(*header_block, indent + 1)?;
                 let cond_expr = self.emit_operand_bool(cond_op);
                 if *negate_cond {
@@ -9914,6 +13307,11 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             }
             StructuredNode::Loop { label, body } => {
                 let _ = writeln!(self.out, "{pad}'bb{}: loop {{", label.0);
+                if let Some(&weight) = self.loop_chunked_header_gas.get(label)
+                    && self.in_cleanup_closure.is_none()
+                {
+                    let _ = writeln!(self.out, "{pad}    __ctx.charge_gas({weight}_i64)?;");
+                }
                 self.emit_node(body, indent + 1)?;
                 let _ = writeln!(self.out, "{pad}}}");
             }
@@ -10066,6 +13464,21 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             if self.skip_stmts.contains(&(bb, sidx)) {
                 continue;
             }
+            if let Statement::ResourceCheck(ResourceKind::Gas, _, _) = stmt
+                && let Some(&batched) = self.block_chunked_gas.get(&(bb, sidx))
+            {
+                if self.in_cleanup_closure.is_none() {
+                    let pad = "    ".repeat(indent);
+                    let _ = writeln!(self.out, "{pad}__ctx.charge_gas({batched}_i64)?;");
+                }
+                continue;
+            }
+            if let Some(pieces) = self.fused_concat_chains.get(&(bb, sidx)).cloned()
+                && let Statement::Assign(place, _, _) = stmt
+            {
+                self.emit_fused_concat_chain(place, &pieces, indent);
+                continue;
+            }
             self.emit_statement(stmt, indent)?;
         }
         Ok(())
@@ -10104,11 +13517,19 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                     match base_ty {
                         MirType::Map(k_ty, _) => {
                             let map_expr = self.emit_place_value_expr(base);
-                            let key_expr = self.emit_local_as_map_key(*idx, &k_ty);
-                            let _ = writeln!(
-                                self.out,
-                                "{pad}{{ let __val = {val_expr}; {map_expr}.set({key_expr}, __val, __alloc)?; }}"
-                            );
+                            if matches!(*k_ty, MirType::String) {
+                                let k_ref = self.emit_operand_str_ref(&Operand::Copy(Place::Local(*idx)));
+                                let _ = writeln!(
+                                    self.out,
+                                    "{pad}{{ let __val = {val_expr}; {map_expr}.set_borrowed({k_ref}, __val, __alloc)?; }}"
+                                );
+                            } else {
+                                let key_expr = self.emit_local_as_map_key(*idx, &k_ty);
+                                let _ = writeln!(
+                                    self.out,
+                                    "{pad}{{ let __val = {val_expr}; {map_expr}.set({key_expr}, __val, __alloc)?; }}"
+                                );
+                            }
                         }
                         MirType::Unknown => {
                             let base_expr = self.emit_place_value_expr(base);
@@ -10179,18 +13600,43 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                     return Ok(());
                 }
 
-                // Special case: field write `s.field_i = val` on `RcRefCell` struct
-                if let Place::Field(base, fidx) = place
-                    && let Place::Local(base_loc) = base.as_ref()
-                    && self.local_storage(*base_loc) == LocalStorage::RcRefCell
+                // Special case: field write `s.field_i = val` on `RcRefCell` struct or `is_mutated_cyclic` struct
+                if let Place::Field(base, fidx) = place {
+                    let base_ty = self.place_mir_type(base);
+                    if let MirType::Struct(sname) = &base_ty
+                        && self.ctx.struct_is_rc_cyclic(sname)
+                    {
+                        let target_ty = self.place_mir_type(place);
+                        let val_expr = self.emit_rvalue(rval, Some(&target_ty))?;
+                        let base_expr = self.emit_place_value_expr(base);
+                        let _ = writeln!(
+                            self.out,
+                            "{pad}{{ let __val = {val_expr}; lust_aot_rt::ref_borrow_mut(&({base_expr}).0)?.field_{fidx} = __val; }}"
+                        );
+                        return Ok(());
+                    }
+                    if let Place::Local(base_loc) = base.as_ref()
+                        && self.local_storage(*base_loc) == LocalStorage::RcRefCell
+                    {
+                        let target_ty = self.place_mir_type(place);
+                        let val_expr = self.emit_rvalue(rval, Some(&target_ty))?;
+                        let base_var = self.local_var_name(*base_loc);
+                        let _ = writeln!(
+                            self.out,
+                            "{pad}{{ let __val = {val_expr}; lust_aot_rt::ref_borrow_mut(&{base_var})?.field_{fidx} = __val; }}"
+                        );
+                        return Ok(());
+                    }
+                }
+
+                // Special case: borrowed `&str` select local assignment `_6 = Copy(_1)` -> `_6 = _1.as_str();`
+                if let Place::Local(dst) = place
+                    && self.borrowed_select_str_locals.contains(&self.resolve_local(*dst))
+                    && let Rvalue::Use(op) = rval
                 {
-                    let target_ty = self.place_mir_type(place);
-                    let val_expr = self.emit_rvalue(rval, Some(&target_ty))?;
-                    let base_var = self.local_var_name(*base_loc);
-                    let _ = writeln!(
-                        self.out,
-                        "{pad}{{ let __val = {val_expr}; lust_aot_rt::ref_borrow_mut(&{base_var})?.field_{fidx} = __val; }}"
-                    );
+                    let dst_var = self.local_var_name(*dst);
+                    let sref = self.emit_operand_str_ref(op);
+                    let _ = writeln!(self.out, "{pad}{dst_var} = {sref};");
                     return Ok(());
                 }
 
@@ -10412,22 +13858,43 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 let raw = self.emit_binop(*op, lhs, rhs)?;
                 let l_ty = operand_mir_type(lhs, self.func);
                 let r_ty = operand_mir_type(rhs, self.func);
-                if (matches!(l_ty, MirType::Unknown) || matches!(r_ty, MirType::Unknown))
-                    && !matches!(
-                        op,
-                        MirBinaryOp::Eq
-                            | MirBinaryOp::NotEq
-                            | MirBinaryOp::Lt
-                            | MirBinaryOp::LtEq
-                            | MirBinaryOp::Gt
-                            | MirBinaryOp::GtEq
-                            | MirBinaryOp::And
-                            | MirBinaryOp::Or
-                    )
+                let is_bool_op = matches!(
+                    op,
+                    MirBinaryOp::Eq
+                        | MirBinaryOp::NotEq
+                        | MirBinaryOp::Lt
+                        | MirBinaryOp::LtEq
+                        | MirBinaryOp::Gt
+                        | MirBinaryOp::GtEq
+                        | MirBinaryOp::And
+                        | MirBinaryOp::Or
+                );
+                let any_unknown = matches!(l_ty, MirType::Unknown) || matches!(r_ty, MirType::Unknown);
+                if any_unknown
+                    && !is_bool_op
                     && let Some(exp) = expected_ty
                     && !matches!(exp, MirType::Unknown)
                 {
                     Ok(self.coerce_expr_to_type(&raw, &MirType::Unknown, exp))
+                } else if let Some(exp) = expected_ty
+                    && matches!(exp, MirType::Unknown)
+                {
+                    let res_ty = if is_bool_op {
+                        MirType::Bool
+                    } else if any_unknown {
+                        MirType::Unknown
+                    } else if matches!(op, MirBinaryOp::Concat) {
+                        MirType::String
+                    } else if matches!(l_ty, MirType::Float) || matches!(r_ty, MirType::Float) {
+                        MirType::Float
+                    } else {
+                        MirType::Int
+                    };
+                    if matches!(res_ty, MirType::Unknown) {
+                        Ok(raw)
+                    } else {
+                        Ok(self.coerce_expr_to_type(&raw, &res_ty, &MirType::Unknown))
+                    }
                 } else {
                     Ok(raw)
                 }
@@ -10441,6 +13908,34 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                     && !matches!(exp, MirType::Unknown)
                 {
                     Ok(self.coerce_expr_to_type(&raw, &MirType::Unknown, exp))
+                } else if let Some(exp) = expected_ty
+                    && matches!(exp, MirType::Unknown)
+                {
+                    let res_ty = match op {
+                        MirUnaryOp::Not => MirType::Bool,
+                        MirUnaryOp::Len => MirType::Int,
+                        MirUnaryOp::Neg => {
+                            if matches!(o_ty, MirType::Unknown) {
+                                MirType::Unknown
+                            } else if matches!(o_ty, MirType::Float) {
+                                MirType::Float
+                            } else {
+                                MirType::Int
+                            }
+                        }
+                        MirUnaryOp::BitNot => {
+                            if matches!(o_ty, MirType::Unknown) {
+                                MirType::Unknown
+                            } else {
+                                MirType::Int
+                            }
+                        }
+                    };
+                    if matches!(res_ty, MirType::Unknown) {
+                        Ok(raw)
+                    } else {
+                        Ok(self.coerce_expr_to_type(&raw, &res_ty, &MirType::Unknown))
+                    }
                 } else {
                     Ok(raw)
                 }
@@ -10460,7 +13955,29 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                         };
                         fields.push(format!("field_{i}: {val_expr}"));
                     }
-                    Ok(format!("{rust_sname} {{ {} }}", fields.join(", ")))
+                    if meta.is_some_and(|m| m.is_mutated_cyclic) {
+                        let data_name = format!("{rust_sname}_Data");
+                        if self.ctx.opts.max_memory_bytes.is_some() {
+                            let data_ty = if meta.is_some_and(|m| m.needs_arena_lt) {
+                                format!("{data_name}<'_>")
+                            } else {
+                                data_name.clone()
+                            };
+                            fields.push("__charged: __sz".to_string());
+                            fields.push("__budget: __alloc.share()".to_string());
+                            Ok(format!(
+                                "{{ let __sz = core::mem::size_of::<{data_ty}>(); __alloc.try_charge(__sz).map_err(lust_aot_rt::AotError::from)?; {rust_sname}(alloc::rc::Rc::new(core::cell::RefCell::new({data_name} {{ {} }}))) }}",
+                                fields.join(", ")
+                            ))
+                        } else {
+                            Ok(format!(
+                                "{rust_sname}(alloc::rc::Rc::new(core::cell::RefCell::new({data_name} {{ {} }})))",
+                                fields.join(", ")
+                            ))
+                        }
+                    } else {
+                        Ok(format!("{rust_sname} {{ {} }}", fields.join(", ")))
+                    }
                 }
                 MirType::Enum(ename) => self.emit_enum_aggregate(ename, operands),
                 MirType::Tuple(elem_tys) => {
@@ -10673,7 +14190,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             let raw_call = format!("{}({})", lifted_meta.rust_name, call_args.join(", "));
             let ret_expr = self.coerce_expr_to_type("__res", &ret_ty, &MirType::Unknown);
             let alloc_setup = if lifted_meta.needs_alloc {
-                "let __c_alloc = lust_aot_rt::LustBudgetAlloc::unbounded(); "
+                "let __c_alloc = __c_ctx.budget_alloc.share(); "
             } else {
                 ""
             };
@@ -10832,6 +14349,31 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             ));
         }
 
+        // 1-byte `string.sub(s, i, i)` peephole (`AOT-SSO-REGEX`): `Option<u8> == Some(b)`
+        if matches!(op, MirBinaryOp::Eq | MirBinaryOp::NotEq) {
+            let cmp = if op == MirBinaryOp::Eq { "==" } else { "!=" };
+            if let Some(l) = operand_exact_local(lhs).map(|id| self.resolve_local(id))
+                && self.byte_sub_locals.contains(&l)
+                && let Operand::Constant(MirConstant::String(lit)) = rhs
+                && lit.len() == 1
+                && lit.is_ascii()
+            {
+                let var = self.local_var_name(l);
+                let byte = lit.as_bytes()[0];
+                return Ok(format!("({var} {cmp} Some({byte}_u8))"));
+            }
+            if let Some(r) = operand_exact_local(rhs).map(|id| self.resolve_local(id))
+                && self.byte_sub_locals.contains(&r)
+                && let Operand::Constant(MirConstant::String(lit)) = lhs
+                && lit.len() == 1
+                && lit.is_ascii()
+            {
+                let var = self.local_var_name(r);
+                let byte = lit.as_bytes()[0];
+                return Ok(format!("({var} {cmp} Some({byte}_u8))"));
+            }
+        }
+
         // String equality
         if matches!(lhs_ty, MirType::String) || matches!(rhs_ty, MirType::String) {
             let l = self.emit_operand_str_ref(lhs);
@@ -10970,7 +14512,11 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             MirUnaryOp::Len => {
                 if matches!(ty, MirType::Map(_, _)) {
                     let m = self.emit_operand_value(operand);
-                    Ok(format!("{m}.len()?"))
+                    if self.operand_is_direct_raw_map(operand) {
+                        Ok(format!("({m}.len() as i64)"))
+                    } else {
+                        Ok(format!("{m}.len()?"))
+                    }
                 } else if let Some(loc) = operand_exact_local(operand)
                     && self.local_storage(loc) == LocalStorage::RcRefCell
                 {
@@ -11003,7 +14549,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             }
             if let MirType::Struct(sname) = inner.as_ref() {
                 let val_expr = self.emit_operand_owned(operand, inner);
-                if self.ctx.struct_is_cyclic(sname) {
+                if self.ctx.struct_is_arena_cyclic(sname) {
                     let rname = rust_struct_name(sname);
                     if self.ctx.opts.max_memory_bytes.is_some() {
                         return Ok(format!(
@@ -11186,7 +14732,11 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 {
                     let ty = operand_mir_type(arg, self.func);
                     let len_expr = if matches!(ty, MirType::Map(_, _)) {
-                        format!("{}.len()?", self.emit_operand_value(arg))
+                        if self.operand_is_direct_raw_map(arg) {
+                            format!("({}.len() as i64)", self.emit_operand_value(arg))
+                        } else {
+                            format!("{}.len()?", self.emit_operand_value(arg))
+                        }
                     } else if matches!(ty, MirType::Unknown) {
                         format!("({}.len()? as i64)", self.emit_operand_value(arg))
                     } else if let Some(loc) = operand_exact_local(arg)
@@ -11207,6 +14757,8 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                     let dst_ty = self.place_mir_type(destination);
                     let expr = if matches!(dst_ty, MirType::Unknown) {
                         "lust_aot_rt::AotValue::map()".to_string()
+                    } else if self.place_is_direct_raw_map(destination) {
+                        "lust_aot_rt::AotRawMap::new()".to_string()
                     } else {
                         "lust_aot_rt::AotMap::new()".to_string()
                     };
@@ -11215,16 +14767,32 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 return Ok(());
             }
             "map.set" | "table.set" if args.len() >= 3 => {
+                if self.map_rmw_set_plans.contains_key(&bb) {
+                    let m_ty = operand_mir_type(&args[0], self.func);
+                    if let MirType::Map(_, v_ty) = m_ty {
+                        let v_expr = self.emit_operand_owned(&args[2], &v_ty);
+                        let _ = writeln!(self.out, "{pad}*__rmw_slot = {v_expr};");
+                        return Ok(());
+                    }
+                }
                 let m_ty = operand_mir_type(&args[0], self.func);
                 match m_ty {
                     MirType::Map(k_ty, v_ty) => {
                         let m_expr = self.emit_operand_value(&args[0]);
-                        let k_expr = self.emit_operand_as_map_key(&args[1], &k_ty);
                         let v_expr = self.emit_operand_owned(&args[2], &v_ty);
-                        let _ = writeln!(
-                            self.out,
-                            "{pad}{{ let __k = {k_expr}; let __v = {v_expr}; {m_expr}.set(__k, __v, __alloc)?; }}"
-                        );
+                        if matches!(*k_ty, MirType::String) {
+                            let k_ref = self.emit_operand_str_ref(&args[1]);
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}{{ let __v = {v_expr}; {m_expr}.set_borrowed({k_ref}, __v, __alloc)?; }}"
+                            );
+                        } else {
+                            let k_expr = self.emit_operand_as_map_key(&args[1], &k_ty);
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}{{ let __k = {k_expr}; let __v = {v_expr}; {m_expr}.set(__k, __v, __alloc)?; }}"
+                            );
+                        }
                     }
                     MirType::Unknown => {
                         let m_expr = self.emit_operand_value(&args[0]);
@@ -11240,18 +14808,66 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 return Ok(());
             }
             "map.get" | "table.get" if args.len() >= 2 => {
+                if let Some(&(_, m_loc, ref k_op, val_dst)) = self.map_rmw_get_plans.get(&bb) {
+                    let m_ty = self.func.locals[m_loc.0].ty.clone();
+                    let m_var = self.local_var_name(m_loc);
+                    if let MirType::Map(k_ty, _) = m_ty {
+                        if matches!(*k_ty, MirType::String) {
+                            let k_ref = self.emit_operand_str_ref(k_op);
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}let __rmw_slot = {m_var}.get_mut({k_ref}).ok_or(lust_aot_rt::AotError::MissingMapKey)?;"
+                            );
+                        } else {
+                            let k_expr = self.emit_operand_as_map_key(k_op, &k_ty);
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}let __rmw_slot = {{ let __k = {k_expr}; {m_var}.get_mut(&__k).ok_or(lust_aot_rt::AotError::MissingMapKey)? }};"
+                            );
+                        }
+                        self.emit_assign_local_val(val_dst, "*__rmw_slot", indent);
+                        return Ok(());
+                    }
+                }
                 if !self.dest_is_omitted(destination) {
                     let m_ty = operand_mir_type(&args[0], self.func);
                     let dst_ty = self.place_mir_type(destination);
+                    let is_raw = self.operand_is_direct_raw_map(&args[0]);
                     let expr = match m_ty {
                         MirType::Map(k_ty, v_ty) => {
                             let m_expr = self.emit_operand_value(&args[0]);
-                            let k_expr = self.emit_operand_as_map_key(&args[1], &k_ty);
-                            if matches!(dst_ty, MirType::Option(_)) {
-                                format!("{{ let __k = {k_expr}; {m_expr}.get_opt(&__k)? }}")
+                            if matches!(*k_ty, MirType::String) {
+                                let k_ref = self.emit_operand_str_ref(&args[1]);
+                                if matches!(dst_ty, MirType::Option(_)) {
+                                    if is_raw {
+                                        format!("{m_expr}.get_opt({k_ref})")
+                                    } else {
+                                        format!("{m_expr}.get_opt({k_ref})?")
+                                    }
+                                } else {
+                                    let raw = if is_raw {
+                                        format!("{m_expr}.get_or_err({k_ref})?")
+                                    } else {
+                                        format!("{m_expr}.get({k_ref})?")
+                                    };
+                                    self.coerce_expr_to_type(&raw, &v_ty, &dst_ty)
+                                }
                             } else {
-                                let raw = format!("{{ let __k = {k_expr}; {m_expr}.get(&__k)? }}");
-                                self.coerce_expr_to_type(&raw, &v_ty, &dst_ty)
+                                let k_expr = self.emit_operand_as_map_key(&args[1], &k_ty);
+                                if matches!(dst_ty, MirType::Option(_)) {
+                                    if is_raw {
+                                        format!("{{ let __k = {k_expr}; {m_expr}.get_opt(&__k) }}")
+                                    } else {
+                                        format!("{{ let __k = {k_expr}; {m_expr}.get_opt(&__k)? }}")
+                                    }
+                                } else {
+                                    let raw = if is_raw {
+                                        format!("{{ let __k = {k_expr}; {m_expr}.get_or_err(&__k)? }}")
+                                    } else {
+                                        format!("{{ let __k = {k_expr}; {m_expr}.get(&__k)? }}")
+                                    };
+                                    self.coerce_expr_to_type(&raw, &v_ty, &dst_ty)
+                                }
                             }
                         }
                         MirType::Unknown => {
@@ -11267,14 +14883,49 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 return Ok(());
             }
             "map.get_unwrap" if args.len() >= 2 => {
+                if let Some(&(_, m_loc, ref k_op, val_dst)) = self.map_rmw_get_plans.get(&bb) {
+                    let m_ty = self.func.locals[m_loc.0].ty.clone();
+                    let m_var = self.local_var_name(m_loc);
+                    if let MirType::Map(k_ty, _) = m_ty {
+                        if matches!(*k_ty, MirType::String) {
+                            let k_ref = self.emit_operand_str_ref(k_op);
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}let __rmw_slot = {m_var}.get_mut({k_ref}).ok_or(lust_aot_rt::AotError::MissingMapKey)?;"
+                            );
+                        } else {
+                            let k_expr = self.emit_operand_as_map_key(k_op, &k_ty);
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}let __rmw_slot = {{ let __k = {k_expr}; {m_var}.get_mut(&__k).ok_or(lust_aot_rt::AotError::MissingMapKey)? }};"
+                            );
+                        }
+                        self.emit_assign_local_val(val_dst, "*__rmw_slot", indent);
+                        return Ok(());
+                    }
+                }
                 if !self.dest_is_omitted(destination) {
                     let m_ty = operand_mir_type(&args[0], self.func);
                     let dst_ty = self.place_mir_type(destination);
+                    let is_raw = self.operand_is_direct_raw_map(&args[0]);
                     let expr = match m_ty {
                         MirType::Map(k_ty, v_ty) => {
                             let m_expr = self.emit_operand_value(&args[0]);
-                            let k_expr = self.emit_operand_as_map_key(&args[1], &k_ty);
-                            let raw = format!("{{ let __k = {k_expr}; {m_expr}.get(&__k)? }}");
+                            let raw = if matches!(*k_ty, MirType::String) {
+                                let k_ref = self.emit_operand_str_ref(&args[1]);
+                                if is_raw {
+                                    format!("{m_expr}.get_or_err({k_ref})?")
+                                } else {
+                                    format!("{m_expr}.get({k_ref})?")
+                                }
+                            } else {
+                                let k_expr = self.emit_operand_as_map_key(&args[1], &k_ty);
+                                if is_raw {
+                                    format!("{{ let __k = {k_expr}; {m_expr}.get_or_err(&__k)? }}")
+                                } else {
+                                    format!("{{ let __k = {k_expr}; {m_expr}.get(&__k)? }}")
+                                }
+                            };
                             self.coerce_expr_to_type(&raw, &v_ty, &dst_ty)
                         }
                         MirType::Unknown => {
@@ -11293,14 +14944,34 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 if !self.dest_is_omitted(destination) {
                     let m_ty = operand_mir_type(&args[0], self.func);
                     let dst_ty = self.place_mir_type(destination);
+                    let is_raw = self.operand_is_direct_raw_map(&args[0]);
                     let expr = match m_ty {
                         MirType::Map(k_ty, v_ty) => {
                             let m_expr = self.emit_operand_value(&args[0]);
-                            let k_expr = self.emit_operand_as_map_key(&args[1], &k_ty);
                             let def_expr = self.emit_operand_owned(&args[2], &v_ty);
-                            let raw = format!(
-                                "{{ let __k = {k_expr}; match {m_expr}.get_opt(&__k)? {{ Some(__v) => __v, None => {def_expr} }} }}"
-                            );
+                            let raw = if matches!(*k_ty, MirType::String) {
+                                let k_ref = self.emit_operand_str_ref(&args[1]);
+                                if is_raw {
+                                    format!(
+                                        "match {m_expr}.get_opt({k_ref}) {{ Some(__v) => __v, None => {def_expr} }}"
+                                    )
+                                } else {
+                                    format!(
+                                        "match {m_expr}.get_opt({k_ref})? {{ Some(__v) => __v, None => {def_expr} }}"
+                                    )
+                                }
+                            } else {
+                                let k_expr = self.emit_operand_as_map_key(&args[1], &k_ty);
+                                if is_raw {
+                                    format!(
+                                        "{{ let __k = {k_expr}; match {m_expr}.get_opt(&__k) {{ Some(__v) => __v, None => {def_expr} }} }}"
+                                    )
+                                } else {
+                                    format!(
+                                        "{{ let __k = {k_expr}; match {m_expr}.get_opt(&__k)? {{ Some(__v) => __v, None => {def_expr} }} }}"
+                                    )
+                                }
+                            };
                             self.coerce_expr_to_type(&raw, &v_ty, &dst_ty)
                         }
                         MirType::Unknown => {
@@ -11322,10 +14993,24 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 if !self.dest_is_omitted(destination) {
                     let m_ty = operand_mir_type(&args[0], self.func);
                     let m_expr = self.emit_operand_value(&args[0]);
+                    let is_raw = self.operand_is_direct_raw_map(&args[0]);
                     let expr = match m_ty {
                         MirType::Map(k_ty, _) => {
-                            let k_expr = self.emit_operand_as_map_key(&args[1], &k_ty);
-                            format!("{{ let __k = {k_expr}; {m_expr}.has(&__k)? }}")
+                            if matches!(*k_ty, MirType::String) {
+                                let k_ref = self.emit_operand_str_ref(&args[1]);
+                                if is_raw {
+                                    format!("{m_expr}.has({k_ref})")
+                                } else {
+                                    format!("{m_expr}.has({k_ref})?")
+                                }
+                            } else {
+                                let k_expr = self.emit_operand_as_map_key(&args[1], &k_ty);
+                                if is_raw {
+                                    format!("{{ let __k = {k_expr}; {m_expr}.has(&__k) }}")
+                                } else {
+                                    format!("{{ let __k = {k_expr}; {m_expr}.has(&__k)? }}")
+                                }
+                            }
                         }
                         _ => {
                             let k_expr = self.emit_operand_as_map_key(&args[1], &MirType::Unknown);
@@ -11340,8 +15025,11 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 if !self.dest_is_omitted(destination) {
                     let m_ty = operand_mir_type(&args[0], self.func);
                     let m_expr = self.emit_operand_value(&args[0]);
+                    let is_raw = self.operand_is_direct_raw_map(&args[0]);
                     let expr = if matches!(m_ty, MirType::Unknown) {
                         format!("{m_expr}.map_is_empty()?")
+                    } else if is_raw {
+                        format!("{m_expr}.is_empty()")
                     } else {
                         format!("{m_expr}.is_empty()?")
                     };
@@ -11352,10 +15040,24 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             "map.delete" | "map.remove" if args.len() >= 2 => {
                 let m_ty = operand_mir_type(&args[0], self.func);
                 let m_expr = self.emit_operand_value(&args[0]);
+                let is_raw = self.operand_is_direct_raw_map(&args[0]);
                 let expr = match m_ty {
                     MirType::Map(k_ty, _) => {
-                        let k_expr = self.emit_operand_as_map_key(&args[1], &k_ty);
-                        format!("{{ let __k = {k_expr}; {m_expr}.delete(&__k, __alloc)? }}")
+                        if matches!(*k_ty, MirType::String) {
+                            let k_ref = self.emit_operand_str_ref(&args[1]);
+                            if is_raw {
+                                format!("{m_expr}.delete({k_ref}, __alloc)")
+                            } else {
+                                format!("{m_expr}.delete({k_ref}, __alloc)?")
+                            }
+                        } else {
+                            let k_expr = self.emit_operand_as_map_key(&args[1], &k_ty);
+                            if is_raw {
+                                format!("{{ let __k = {k_expr}; {m_expr}.delete(&__k, __alloc) }}")
+                            } else {
+                                format!("{{ let __k = {k_expr}; {m_expr}.delete(&__k, __alloc)? }}")
+                            }
+                        }
                     }
                     _ => {
                         let k_expr = self.emit_operand_as_map_key(&args[1], &MirType::Unknown);
@@ -11379,8 +15081,11 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             "map.clear" if !args.is_empty() => {
                 let m_ty = operand_mir_type(&args[0], self.func);
                 let m_expr = self.emit_operand_value(&args[0]);
+                let is_raw = self.operand_is_direct_raw_map(&args[0]);
                 if matches!(m_ty, MirType::Unknown) {
                     let _ = writeln!(self.out, "{pad}{m_expr}.map_clear()?;");
+                } else if is_raw {
+                    let _ = writeln!(self.out, "{pad}{m_expr}.clear();");
                 } else {
                     let _ = writeln!(self.out, "{pad}{m_expr}.clear()?;");
                 }
@@ -11601,6 +15306,30 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             }
             "string.sub" if args.len() >= 2 => {
                 if !self.dest_is_omitted(destination) {
+                    if let Place::Local(dst) = destination
+                        && self.byte_sub_locals.contains(&self.resolve_local(*dst))
+                    {
+                        let s = self.emit_operand_str_ref(&args[0]);
+                        let idx_expr = self.emit_operand_owned(&args[1], &MirType::Int);
+                        let raw = format!(
+                            "{{ let __b = ({s}).as_bytes(); let __i = {idx_expr}; let __adj = if __i >= 1 {{ __i.wrapping_sub(1) as usize }} else if __i < 0 {{ (__b.len() as i64).wrapping_add(__i) as usize }} else {{ usize::MAX }}; __b.get(__adj).copied() }}"
+                        );
+                        self.emit_assign_place_val(destination, &raw, indent);
+                        return Ok(());
+                    }
+                    if let Place::Local(dst) = destination
+                        && self.cow_str_locals.contains(&self.resolve_local(*dst))
+                    {
+                        let s = self.emit_operand_str_ref(&args[0]);
+                        let start = self.emit_operand_owned(&args[1], &MirType::Int);
+                        let end = args
+                            .get(2)
+                            .map(|a| format!("Some({})", self.emit_operand_owned(a, &MirType::Int)))
+                            .unwrap_or_else(|| "None".to_string());
+                        let raw = format!("__lust_aot_string_sub_cow({s}, {start}, {end})");
+                        self.emit_assign_place_val(destination, &raw, indent);
+                        return Ok(());
+                    }
                     let s = self.emit_operand_str_ref(&args[0]);
                     let start = self.emit_operand_owned(&args[1], &MirType::Int);
                     let end = args
@@ -11649,6 +15378,40 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 if !self.dest_is_omitted(destination) {
                     let s = self.emit_operand_str_ref(&args[0]);
                     let sep = self.emit_operand_str_ref(&args[1]);
+                    if let Place::Local(dst) = destination
+                        && self.split_pair_locals.contains(&self.resolve_local(*dst))
+                    {
+                        let expr = if let Operand::Constant(MirConstant::String(sep_lit)) = &args[1]
+                            && sep_lit.len() == 1
+                            && sep_lit.as_bytes()[0] < 128
+                        {
+                            format!(
+                                "__lust_aot_string_split_pair_byte({s}, {}_u8)",
+                                sep_lit.as_bytes()[0]
+                            )
+                        } else {
+                            format!("__lust_aot_string_split_pair({s}, {sep})")
+                        };
+                        self.emit_assign_place_val(destination, &expr, indent);
+                        return Ok(());
+                    }
+                    if let Place::Local(dst) = destination
+                        && self.small_str_array_locals.contains_key(&self.resolve_local(*dst))
+                    {
+                        let expr = if let Operand::Constant(MirConstant::String(sep_lit)) = &args[1]
+                            && sep_lit.len() == 1
+                            && sep_lit.as_bytes()[0] < 128
+                        {
+                            format!(
+                                "__lust_aot_string_split_spans_byte({s}, {}_u8, __alloc)",
+                                sep_lit.as_bytes()[0]
+                            )
+                        } else {
+                            format!("__lust_aot_string_split_spans({s}, {sep}, __alloc)")
+                        };
+                        self.emit_assign_place_val(destination, &expr, indent);
+                        return Ok(());
+                    }
                     let dst_ty = self.place_mir_type(destination);
                     let expr = match &dst_ty {
                         MirType::Array(inner) if matches!(**inner, MirType::Unknown) => format!(
@@ -11667,29 +15430,63 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 let s = self.emit_operand_str_ref(&args[0]);
                 let pat = self.emit_operand_str_ref(&args[1]);
                 let repl = self.emit_operand_str_ref(&args[2]);
-                let limit = args
-                    .get(3)
+                let limit_op = args.get(3);
+                let limit = limit_op
                     .map(|a| format!("Some({})", self.emit_operand_owned(a, &MirType::Int)))
                     .unwrap_or_else(|| "None".to_string());
+                // Compile-time constant ASCII character-class `+` specialization (`AOT-SSO-REGEX`):
+                // e.g. `string.gsub(line, "[0-9]+", "#")` emits a zero-alloc O(N) const bitmap loop!
+                let const_bm_spec = if limit_op.is_none()
+                    && let Operand::Constant(MirConstant::String(pat_lit)) = &args[1]
+                    && let Operand::Constant(MirConstant::String(repl_lit)) = &args[2]
+                    && !repl_lit.contains('%')
+                {
+                    try_compile_ascii_class_plus_bitmap(pat_lit).map(|bm| (bm, repl_lit.clone()))
+                } else {
+                    None
+                };
+                let gsub_pair_expr = if let Some((bm, repl_lit)) = &const_bm_spec {
+                    format!(
+                        "{{ const __BM: [u64; 4] = [{}_u64, {}_u64, 0_u64, 0_u64]; let __src: &str = {s}; let __bytes = __src.as_bytes(); let mut __out = alloc::string::String::with_capacity(__src.len()); let mut __pos = 0usize; let mut __span = 0usize; let mut __cnt = 0_i64; while __pos < __bytes.len() {{ let __b = __bytes[__pos]; if __b < 128 && (__BM[(__b >> 6) as usize] & (1_u64 << (__b & 63))) != 0 {{ if __pos > __span {{ __out.push_str(&__src[__span..__pos]); }} __pos += 1; while __pos < __bytes.len() {{ let __b2 = __bytes[__pos]; if __b2 < 128 && (__BM[(__b2 >> 6) as usize] & (1_u64 << (__b2 & 63))) != 0 {{ __pos += 1; }} else {{ break; }} }} __out.push_str({repl_lit:?}); __cnt += 1; __span = __pos; }} else {{ __pos += 1; }} }} if __span < __bytes.len() {{ __out.push_str(&__src[__span..]); }} (__out, __cnt) }}",
+                        bm[0], bm[1]
+                    )
+                } else {
+                    format!("__lust_aot_string_gsub({s}, {pat}, {repl}, {limit})?")
+                };
                 if self.dest_is_omitted(destination) {
-                    let _ = writeln!(
-                        self.out,
-                        "{pad}let _ = __lust_aot_string_gsub({s}, {pat}, {repl}, {limit})?;"
-                    );
+                    let _ = writeln!(self.out, "{pad}let _ = {gsub_pair_expr};");
+                } else if let Place::Local(dst) = destination
+                    && self.gsub_first_only_locals.contains(&self.resolve_local(*dst))
+                {
+                    let dst_r = self.resolve_local(*dst);
+                    let src_same = operand_exact_local(&args[0])
+                        .is_some_and(|l| self.resolve_local(l) == dst_r);
+                    if let Some((bm, repl_lit)) = &const_bm_spec
+                        && self.local_storage(dst_r) == LocalStorage::Direct
+                        && !src_same
+                    {
+                        let dst_var = self.local_var_name(dst_r);
+                        let _ = writeln!(
+                            self.out,
+                            "{pad}{{ const __BM: [u64; 4] = [{}_u64, {}_u64, 0_u64, 0_u64]; let __src: &str = {s}; let __bytes = __src.as_bytes(); {dst_var}.clear(); let mut __pos = 0usize; let mut __span = 0usize; while __pos < __bytes.len() {{ let __b = __bytes[__pos]; if __b < 128 && (__BM[(__b >> 6) as usize] & (1_u64 << (__b & 63))) != 0 {{ if __pos > __span {{ {dst_var}.push_str(&__src[__span..__pos]); }} __pos += 1; while __pos < __bytes.len() {{ let __b2 = __bytes[__pos]; if __b2 < 128 && (__BM[(__b2 >> 6) as usize] & (1_u64 << (__b2 & 63))) != 0 {{ __pos += 1; }} else {{ break; }} }} {dst_var}.push_str({repl_lit:?}); __span = __pos; }} else {{ __pos += 1; }} }} if __span < __bytes.len() {{ {dst_var}.push_str(&__src[__span..]); }} }}",
+                            bm[0], bm[1]
+                        );
+                    } else {
+                        let expr = format!("({gsub_pair_expr}).0");
+                        self.emit_assign_place_val(destination, &expr, indent);
+                    }
                 } else {
                     let dst_ty = self.place_mir_type(destination);
                     let expr = match &dst_ty {
                         MirType::Array(inner) if matches!(**inner, MirType::String) => format!(
-                            "{{ let (__out, __cnt) = __lust_aot_string_gsub({s}, {pat}, {repl}, {limit})?; let mut __v = alloc::vec::Vec::new_in(__alloc); __v.push(__out); let mut __cs = alloc::string::String::new(); lust_aot_rt::string_append_int(&mut __cs, __cnt); __v.push(__cs); __v }}"
+                            "{{ let (__out, __cnt) = {gsub_pair_expr}; let mut __v = alloc::vec::Vec::with_capacity_in(2, __alloc); __v.push(__out); let mut __cs = alloc::string::String::new(); lust_aot_rt::string_append_int(&mut __cs, __cnt); __v.push(__cs); __v }}"
                         ),
-                        MirType::String => format!(
-                            "__lust_aot_string_gsub({s}, {pat}, {repl}, {limit})?.0"
-                        ),
+                        MirType::String => format!("({gsub_pair_expr}).0"),
                         MirType::Unknown => format!(
-                            "{{ let (__out, __cnt) = __lust_aot_string_gsub({s}, {pat}, {repl}, {limit})?; lust_aot_rt::AotValue::array(alloc::vec![lust_aot_rt::AotValue::str(__out), lust_aot_rt::AotValue::Int(__cnt)]) }}"
+                            "{{ let (__out, __cnt) = {gsub_pair_expr}; lust_aot_rt::AotValue::array(alloc::vec![lust_aot_rt::AotValue::str(__out), lust_aot_rt::AotValue::Int(__cnt)]) }}"
                         ),
                         _ => format!(
-                            "{{ let (__out, __cnt) = __lust_aot_string_gsub({s}, {pat}, {repl}, {limit})?; let mut __v = alloc::vec::Vec::new_in(__alloc); __v.push(lust_aot_rt::AotValue::str(__out)); __v.push(lust_aot_rt::AotValue::Int(__cnt)); __v }}"
+                            "{{ let (__out, __cnt) = {gsub_pair_expr}; let mut __v = alloc::vec::Vec::with_capacity_in(2, __alloc); __v.push(lust_aot_rt::AotValue::str(__out)); __v.push(lust_aot_rt::AotValue::Int(__cnt)); __v }}"
                         ),
                     };
                     self.emit_assign_place_val(destination, &expr, indent);
@@ -11801,6 +15598,32 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 return Ok(());
             }
             "__mir_unknown_get_field" if args.len() >= 2 => {
+                // Devirtualize statically-known concrete struct field access (`AOT-DEVIRT`: 0 heap allocs)
+                if let MirType::Struct(sname) = operand_mir_type(&args[0], self.func)
+                    && let Operand::Constant(MirConstant::String(fname)) = &args[1]
+                    && let Some(smeta) = self.ctx.structs.get(&sname)
+                    && let Some((fidx, (_, fty))) =
+                        smeta.fields.iter().enumerate().find(|(_, (n, _))| n == fname)
+                {
+                    if !self.dest_is_omitted(destination) {
+                        let recv = self.emit_operand_value(&args[0]);
+                        let raw = if smeta.is_mutated_cyclic {
+                            if self.ctx.is_copy_type(fty) {
+                                format!("lust_aot_rt::ref_borrow(&({recv}).0)?.field_{fidx}")
+                            } else {
+                                format!("lust_aot_rt::ref_borrow(&({recv}).0)?.field_{fidx}.clone()")
+                            }
+                        } else if self.ctx.is_copy_type(fty) {
+                            format!("({recv}).field_{fidx}")
+                        } else {
+                            format!("({recv}).field_{fidx}.clone()")
+                        };
+                        let dst_ty = self.place_mir_type(destination);
+                        let expr = self.coerce_expr_to_type(&raw, fty, &dst_ty);
+                        self.emit_assign_place_val(destination, &expr, indent);
+                    }
+                    return Ok(());
+                }
                 let obj = self.emit_operand_as_aot_value(&args[0]);
                 let field = self.emit_operand_str_ref(&args[1]);
                 let raw = format!("__lust_aot_unknown_get_field(&({obj}), {field})?");
@@ -11814,6 +15637,79 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 return Ok(());
             }
             "__mir_unknown_call_method" if args.len() >= 2 => {
+                // Direct unboxed `AotQueue<i64>` method dispatch (`AOT-DEVIRT`)
+                if let Some(q_raw) = operand_exact_local(&args[0])
+                    && self.unboxed_queue_locals.contains(&self.resolve_local(q_raw))
+                    && let Operand::Constant(MirConstant::String(mname)) = &args[1]
+                {
+                    let q_loc = self.resolve_local(q_raw);
+                    self.emit_unboxed_queue_method_call(bb, q_loc, mname, &args[2..], destination, indent);
+                    return Ok(());
+                }
+                // Devirtualize statically-known concrete struct method call (`AOT-DEVIRT`: 0 heap allocs)
+                if let MirType::Struct(sname) = operand_mir_type(&args[0], self.func)
+                    && let Operand::Constant(MirConstant::String(mname)) = &args[1]
+                {
+                    let full_method = format!("{sname}:{mname}");
+                    if let Some(fmeta) = self.ctx.fn_metas.get(&full_method).cloned()
+                        && let Some(mfn) = self
+                            .ctx
+                            .module
+                            .functions
+                            .iter()
+                            .find(|f| f.signature.name == full_method)
+                    {
+                        let mut cargs = Vec::new();
+                        if fmeta.needs_ctx {
+                            cargs.push("__ctx".to_string());
+                        }
+                        if fmeta.needs_alloc {
+                            cargs.push("__alloc".to_string());
+                        }
+                        if fmeta.needs_arena {
+                            cargs.push("__arena".to_string());
+                        }
+                        let self_mode = fmeta.param_modes.first().copied().unwrap_or(ParamMode::ByValue);
+                        let self_arg = match self_mode {
+                            ParamMode::RefStruct => self.emit_operand_ref_borrowed(&args[0]),
+                            ParamMode::MutRefStruct => self.emit_operand_mut_ref_borrowed(&args[0]),
+                            _ => self.emit_operand_owned(&args[0], &MirType::Struct(sname.clone())),
+                        };
+                        cargs.push(self_arg);
+                        for (pi, &pid) in mfn.params.iter().enumerate().skip(1) {
+                            let pty = &mfn.locals[pid.0].ty;
+                            let pmode = fmeta.param_modes.get(pi).copied().unwrap_or(ParamMode::ByValue);
+                            let arg_op = args.get(pi + 1);
+                            let a_expr = match arg_op {
+                                Some(op) => match pmode {
+                                    ParamMode::RefStr => self.emit_operand_str_ref(op),
+                                    ParamMode::RefStruct => self.emit_operand_ref_borrowed(op),
+                                    ParamMode::MutRefStruct => self.emit_operand_mut_ref_borrowed(op),
+                                    ParamMode::RefSlice => self.emit_operand_slice_ref(op),
+                                    _ => self.emit_operand_owned(op, pty),
+                                },
+                                None => self.ctx.rust_default_expr(pty),
+                            };
+                            cargs.push(a_expr);
+                        }
+                        let raw_call = format!("{}({})", fmeta.rust_name, cargs.join(", "));
+                        let call_res = if fmeta.can_fail {
+                            format!("{raw_call}?")
+                        } else {
+                            format!("match {raw_call} {{ Ok(__v) => __v }}")
+                        };
+                        if self.dest_is_omitted(destination)
+                            || matches!(self.place_mir_type(destination), MirType::Unit)
+                        {
+                            let _ = writeln!(self.out, "{pad}let _ = {call_res};");
+                        } else {
+                            let dst_ty = self.place_mir_type(destination);
+                            let expr = self.coerce_expr_to_type(&call_res, &fmeta.return_type, &dst_ty);
+                            self.emit_assign_place_val(destination, &expr, indent);
+                        }
+                        return Ok(());
+                    }
+                }
                 let obj = self.emit_operand_as_aot_value(&args[0]);
                 let method = self.emit_operand_str_ref(&args[1]);
                 let rest: Vec<String> = args[2..]
@@ -11849,6 +15745,17 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                     .get(1)
                     .map(|a| self.emit_operand_str_ref(a))
                     .unwrap_or_else(|| "\"suspend\"".to_string());
+                if let Place::Local(dst) = destination
+                    && self.unboxed_queue_locals.contains(&self.resolve_local(*dst))
+                {
+                    let r = self.resolve_local(*dst);
+                    let q_var = self.local_var_name(r);
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}{q_var} = lust_aot_rt::AotQueue::<i64>::with_capacity_and_strategy(({cap}).max(0) as usize, {strat});"
+                    );
+                    return Ok(());
+                }
                 let raw = format!("__lust_aot_new_queue({cap}, {strat}, __ctx)?");
                 if self.dest_is_omitted(destination) {
                     let _ = writeln!(self.out, "{pad}let _ = {raw};");
@@ -12007,6 +15914,10 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
         if !self.ctx.fn_metas.contains_key(callee)
             && let Some(&cl_loc) = self.local_name_to_id.get(callee)
         {
+            if let Some(&(q_loc, method_name)) = self.unboxed_queue_methods.get(&cl_loc) {
+                self.emit_unboxed_queue_method_call(bb, q_loc, method_name, args, destination, indent);
+                return Ok(());
+            }
             let cl_ty = self.func.locals[cl_loc.0].ty.clone();
             let cl_expr = self.emit_operand_value(&Operand::Copy(Place::Local(cl_loc)));
             match cl_ty {
@@ -12468,7 +16379,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             if arm_meta.needs_alloc || arm_meta.needs_arena {
                 let _ = writeln!(
                     self.out,
-                    "{pad}            let __e_alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__e_ctx.budget_alloc.limit_bytes());"
+                    "{pad}            let __e_alloc = __e_ctx.budget_alloc.share();"
                 );
             }
             if arm_meta.needs_arena {
@@ -12719,7 +16630,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
         if arm_meta.needs_alloc || arm_meta.needs_arena {
             let _ = writeln!(
                 self.out,
-                "{arm_pad}let __h_alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__h_ctx.budget_alloc.limit_bytes());"
+                "{arm_pad}let __h_alloc = __h_ctx.budget_alloc.share();"
             );
         }
         if arm_meta.needs_arena {
@@ -12994,7 +16905,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
         if cont_meta.needs_alloc || cont_meta.needs_arena {
             let _ = writeln!(
                 self.out,
-                "{pad}            let __k_alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__k_ctx.budget_alloc.limit_bytes());"
+                "{pad}            let __k_alloc = __k_ctx.budget_alloc.share();"
             );
         }
         if cont_meta.needs_arena {
@@ -13136,7 +17047,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
         if fin_meta.needs_alloc || fin_meta.needs_arena {
             let _ = writeln!(
                 self.out,
-                "{pad}        let __fin_alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__fin_ctx.budget_alloc.limit_bytes());"
+                "{pad}        let __fin_alloc = __fin_ctx.budget_alloc.share();"
             );
         }
         if fin_meta.needs_arena {
@@ -13193,7 +17104,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
         if child_meta.needs_alloc || child_meta.needs_arena {
             let _ = writeln!(
                 self.out,
-                "{pad}        let __sp_alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__sp_ctx.budget_alloc.limit_bytes());"
+                "{pad}        let __sp_alloc = __sp_ctx.budget_alloc.share();"
             );
         }
         if child_meta.needs_arena {
@@ -13672,6 +17583,83 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
     // Place & Operand Formatting Helpers
     // -----------------------------------------------------------------------
 
+    fn operand_is_direct_raw_map(&self, op: &Operand) -> bool {
+        operand_exact_local(op)
+            .is_some_and(|l| self.direct_raw_map_locals.contains(&self.resolve_local(l)))
+    }
+
+    fn place_is_direct_raw_map(&self, place: &Place) -> bool {
+        matches!(place, Place::Local(l) if self.direct_raw_map_locals.contains(&self.resolve_local(*l)))
+    }
+
+    fn emit_unboxed_queue_method_call(
+        &mut self,
+        bb: BlockId,
+        q_loc: LocalId,
+        method_name: &str,
+        args: &[Operand],
+        destination: &Place,
+        indent: usize,
+    ) {
+        let pad = "    ".repeat(indent);
+        let q_var = self.local_var_name(q_loc);
+        let dst_ty = self.place_mir_type(destination);
+        match method_name {
+            "offer" | "try_offer" => {
+                let val_expr = args
+                    .first()
+                    .map(|a| self.emit_operand_owned(a, &MirType::Int))
+                    .unwrap_or_else(|| "0_i64".to_string());
+                let raw = format!("{q_var}.offer({val_expr})?");
+                if self.dest_is_omitted(destination) || matches!(dst_ty, MirType::Unit) {
+                    let _ = writeln!(self.out, "{pad}let _ = {raw};");
+                } else {
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::Bool, &dst_ty);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+            }
+            "take" => {
+                let raw = format!("{q_var}.take()?");
+                if let Some(&int_dst) = self.unboxed_queue_take_redirect.get(&bb) {
+                    self.emit_assign_local_val(int_dst, &raw, indent);
+                } else if self.dest_is_omitted(destination) || matches!(dst_ty, MirType::Unit) {
+                    let _ = writeln!(self.out, "{pad}let _ = {raw};");
+                } else {
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::Int, &dst_ty);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+            }
+            "try_take" => {
+                let raw = format!(
+                    "match {q_var}.try_take() {{ Some(__v) => lust_aot_rt::AotValue::Int(__v), None => lust_aot_rt::AotValue::Nil }}"
+                );
+                if self.dest_is_omitted(destination) || matches!(dst_ty, MirType::Unit) {
+                    let _ = writeln!(self.out, "{pad}let _ = {raw};");
+                } else {
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::Unknown, &dst_ty);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+            }
+            "len" => {
+                let raw = format!("{q_var}.len()");
+                if self.dest_is_omitted(destination) || matches!(dst_ty, MirType::Unit) {
+                    let _ = writeln!(self.out, "{pad}let _ = {raw};");
+                } else {
+                    let expr = self.coerce_expr_to_type(&raw, &MirType::Int, &dst_ty);
+                    self.emit_assign_place_val(destination, &expr, indent);
+                }
+            }
+            "close" => {
+                let _ = writeln!(self.out, "{pad}{q_var}.close();");
+                if !self.dest_is_omitted(destination) && !matches!(dst_ty, MirType::Unit) {
+                    let def = self.ctx.rust_default_expr(&dst_ty);
+                    self.emit_assign_place_val(destination, &def, indent);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn dest_is_omitted(&self, place: &Place) -> bool {
         matches!(place, Place::Local(l) if self.omitted_locals.contains(l))
     }
@@ -13734,7 +17722,18 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
         match place {
             Place::Local(id) => self.local_var_name(*id),
             Place::Field(base, fidx) => {
-                if let Place::Local(base_loc) = base.as_ref()
+                let base_ty = self.place_mir_type(base);
+                if let MirType::Struct(sname) = &base_ty
+                    && self.ctx.struct_is_rc_cyclic(sname)
+                {
+                    let base_expr = self.emit_place_value_expr(base);
+                    let fty = self.place_mir_type(place);
+                    if self.ctx.is_copy_type(&fty) {
+                        format!("lust_aot_rt::ref_borrow(&({base_expr}).0)?.field_{fidx}")
+                    } else {
+                        format!("lust_aot_rt::ref_borrow(&({base_expr}).0)?.field_{fidx}.clone()")
+                    }
+                } else if let Place::Local(base_loc) = base.as_ref()
                     && self.local_storage(*base_loc) == LocalStorage::RcRefCell
                 {
                     let var = self.local_var_name(*base_loc);
@@ -13859,7 +17858,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                     let ret_aot =
                         self.coerce_expr_to_type("__fn_res", return_type, &MirType::Unknown);
                     format!(
-                        "{{ let __fn_ref = ({expr}).clone(); lust_aot_rt::AotValue::closure(move |__c_ctx: &mut lust_aot_rt::AotCtx, __c_args: &[lust_aot_rt::AotValue]| -> Result<lust_aot_rt::AotValue, lust_aot_rt::AotError> {{ let __c_alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__c_ctx.budget_alloc.limit_bytes()); let __fn_res = (__fn_ref)({})?; Ok({ret_aot}) }}) }}",
+                        "{{ let __fn_ref = ({expr}).clone(); lust_aot_rt::AotValue::closure(move |__c_ctx: &mut lust_aot_rt::AotCtx, __c_args: &[lust_aot_rt::AotValue]| -> Result<lust_aot_rt::AotValue, lust_aot_rt::AotError> {{ let __c_alloc = __c_ctx.budget_alloc.share(); let __fn_res = (__fn_ref)({})?; Ok({ret_aot}) }}) }}",
                         cargs.join(", ")
                     )
                 }
@@ -13935,7 +17934,20 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                                     }
                                 }
                                 MirType::Array(_) => {
-                                    if self.is_param(r).is_some_and(|(_, m)| {
+                                    if self.gsub_first_only_locals.contains(&r) {
+                                        if is_move
+                                            && self.is_pure_init_temp(r)
+                                            && self.local_use_counts.get(&r).copied().unwrap_or(0) <= 1
+                                        {
+                                            format!("core::mem::take(&mut {var})")
+                                        } else {
+                                            format!("{var}.clone()")
+                                        }
+                                    } else if self.small_str_array_locals.contains_key(&r) {
+                                        format!(
+                                            "core::mem::replace(&mut {var}, __LustSplitSpans::new_in(__alloc))"
+                                        )
+                                    } else if self.is_param(r).is_some_and(|(_, m)| {
                                         matches!(m, ParamMode::RefSlice | ParamMode::MutVec)
                                     }) {
                                         format!(
@@ -13952,18 +17964,36 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                                         format!("{var}.clone()")
                                     }
                                 }
-                                MirType::Map(_, _) | MirType::Function { .. } | MirType::Unknown => {
+                                MirType::Map(_, _) => {
+                                    if self.direct_raw_map_locals.contains(&r)
+                                        && self.is_pure_init_temp(r)
+                                        && self.local_use_counts.get(&r).copied().unwrap_or(0) <= 1
+                                    {
+                                        format!("core::mem::take(&mut {var})")
+                                    } else {
+                                        format!("{var}.clone()")
+                                    }
+                                }
+                                MirType::Function { .. } | MirType::Unknown => {
                                     format!("{var}.clone()")
                                 }
                                 MirType::Enum(_) => {
                                     format!("{var}.clone()")
                                 }
-                                MirType::Option(_) => {
-                                    format!("core::mem::take(&mut {var})")
+                                MirType::Option(inner) => {
+                                    if let MirType::Struct(sname) = inner.as_ref()
+                                        && self.ctx.struct_is_rc_cyclic(sname)
+                                    {
+                                        format!("{var}.clone()")
+                                    } else {
+                                        format!("core::mem::take(&mut {var})")
+                                    }
                                 }
                                 MirType::Struct(sname) => {
                                     if let Some(s) = self.ctx.structs.get(sname) {
-                                        if s.is_cyclic {
+                                        if s.is_mutated_cyclic {
+                                            format!("{var}.clone()")
+                                        } else if s.is_cyclic {
                                             format!("core::mem::take(&mut {var})")
                                         } else if s.derives_default {
                                             if is_move
@@ -13999,10 +18029,16 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 }
                 if self.ctx.is_copy_type(expected_ty) {
                     expr
-                } else if matches!(expected_ty, MirType::Option(_)) {
-                    format!("core::mem::take(&mut {expr})")
+                } else if let MirType::Option(inner) = expected_ty {
+                    if let MirType::Struct(sname) = inner.as_ref()
+                        && self.ctx.struct_is_rc_cyclic(sname)
+                    {
+                        format!("{expr}.clone()")
+                    } else {
+                        format!("core::mem::take(&mut {expr})")
+                    }
                 } else if let MirType::Struct(sname) = expected_ty
-                    && self.ctx.structs.get(sname).is_some_and(|s| s.is_cyclic)
+                    && self.ctx.struct_is_arena_cyclic(sname)
                 {
                     format!("core::mem::take(&mut {expr})")
                 } else {
@@ -14083,7 +18119,11 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 let var = self.local_var_name(r);
                 if self.local_storage(r) == LocalStorage::RcRefCell {
                     format!("lust_aot_rt::ref_borrow(&{var})?.as_str()")
-                } else if let Some((_, ParamMode::RefStr)) = self.is_param(r) {
+                } else if self.cow_str_locals.contains(&r) {
+                    format!("{var}.as_ref()")
+                } else if self.scoped_ref_locals.contains(&r)
+                    || matches!(self.is_param(r), Some((_, ParamMode::RefStr)))
+                {
                     var
                 } else {
                     format!("{var}.as_str()")
@@ -14103,6 +18143,93 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             MirType::Unknown => format!("({v}).is_truthy()"),
             _ => v,
         }
+    }
+
+    fn emit_fused_concat_chain(
+        &mut self,
+        place: &Place,
+        pieces: &[ConcatPiece],
+        indent: usize,
+    ) {
+        let has_budget = self.ctx.opts.max_memory_bytes.is_some();
+        if !has_budget
+            && let Place::Local(dst) = place
+        {
+            let r = self.resolve_local(*dst);
+            let self_ref = pieces.iter().any(|p| match p {
+                ConcatPiece::Str(op) | ConcatPiece::Int(op) | ConcatPiece::Float(op) => {
+                    operand_exact_local(op).is_some_and(|l| self.resolve_local(l) == r)
+                }
+            });
+            if !self_ref
+                && self.local_storage(r) == LocalStorage::Direct
+                && self.func.locals[r.0].ty == MirType::String
+                && !self.scoped_ref_locals.contains(&r)
+                && !self.cow_str_locals.contains(&r)
+            {
+                let pad = "    ".repeat(indent);
+                let dst_var = self.local_var_name(r);
+                let mut stmt = format!("{pad}{{ {dst_var}.clear(); ");
+                for piece in pieces {
+                    match piece {
+                        ConcatPiece::Str(op) => {
+                            let sref = self.emit_operand_str_ref(op);
+                            let _ = write!(stmt, "{dst_var}.push_str({sref}); ");
+                        }
+                        ConcatPiece::Int(op) => {
+                            let v = self.emit_operand_value(op);
+                            let _ = write!(
+                                stmt,
+                                "lust_aot_rt::string_append_int(&mut {dst_var}, {v}); "
+                            );
+                        }
+                        ConcatPiece::Float(op) => {
+                            let v = self.emit_operand_value(op);
+                            let _ = write!(
+                                stmt,
+                                "lust_aot_rt::string_append_float(&mut {dst_var}, {v}); "
+                            );
+                        }
+                    }
+                }
+                stmt.push('}');
+                let _ = writeln!(self.out, "{stmt}");
+                return;
+            }
+        }
+        let mut expr = String::from("{ let mut __s = alloc::string::String::with_capacity(32); ");
+        for piece in pieces {
+            match piece {
+                ConcatPiece::Str(op) => {
+                    let sref = self.emit_operand_str_ref(op);
+                    if has_budget {
+                        let _ = write!(
+                            expr,
+                            "{{ let __seg = {sref}; __alloc.try_charge(__seg.len()).map_err(lust_aot_rt::AotError::from)?; __s.push_str(__seg); }} "
+                        );
+                    } else {
+                        let _ = write!(expr, "__s.push_str({sref}); ");
+                    }
+                }
+                ConcatPiece::Int(op) => {
+                    let v = self.emit_operand_value(op);
+                    if has_budget {
+                        let _ = write!(
+                            expr,
+                            "lust_aot_rt::try_string_append_int(&mut __s, {v}, __alloc)?; "
+                        );
+                    } else {
+                        let _ = write!(expr, "lust_aot_rt::string_append_int(&mut __s, {v}); ");
+                    }
+                }
+                ConcatPiece::Float(op) => {
+                    let v = self.emit_operand_value(op);
+                    let _ = write!(expr, "lust_aot_rt::string_append_float(&mut __s, {v}); ");
+                }
+            }
+        }
+        expr.push_str("__s }");
+        self.emit_assign_place_val(place, &expr, indent);
     }
 
     fn emit_operand_as_display_string(&self, op: &Operand) -> String {
@@ -14130,6 +18257,393 @@ enum CleanupActionSig {
 enum ChainActionLoc {
     Stmt(BlockId, usize),
     Call(BlockId),
+}
+
+fn collect_block_used_locals(block: &BasicBlock, out: &mut HashSet<LocalId>) {
+    let mut tmp = HashSet::new();
+    for stmt in &block.statements {
+        if let Statement::Assign(place, rval, _) = stmt {
+            out.insert(place.root_local());
+            place.collect_uses(&mut tmp);
+            rval.collect_uses(&mut tmp);
+        }
+    }
+    if let Some(term) = &block.terminator {
+        match term {
+            Terminator::Cond { cond, .. } => cond.collect_uses(&mut tmp),
+            Terminator::Switch { discr, .. } => discr.collect_uses(&mut tmp),
+            Terminator::Call {
+                args, destination, ..
+            } => {
+                out.insert(destination.root_local());
+                destination.collect_uses(&mut tmp);
+                for a in args {
+                    a.collect_uses(&mut tmp);
+                }
+            }
+            Terminator::Return(Some(op), _) | Terminator::Raise(op, _) => {
+                op.collect_uses(&mut tmp);
+            }
+            _ => {}
+        }
+    }
+    for id in tmp {
+        out.insert(LocalId(id));
+    }
+}
+
+fn collect_node_blocks(node: &StructuredNode, out: &mut HashSet<BlockId>) {
+    match node {
+        StructuredNode::BasicBlock(bb) | StructuredNode::Return(bb, _) => {
+            out.insert(*bb);
+        }
+        StructuredNode::Seq(items) => {
+            for item in items {
+                collect_node_blocks(item, out);
+            }
+        }
+        StructuredNode::If {
+            cond_block,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            out.insert(*cond_block);
+            collect_node_blocks(then_branch, out);
+            if let Some(eb) = else_branch {
+                collect_node_blocks(eb, out);
+            }
+        }
+        StructuredNode::IfArrayGetOk {
+            header_block,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            out.insert(*header_block);
+            collect_node_blocks(then_branch, out);
+            if let Some(eb) = else_branch {
+                collect_node_blocks(eb, out);
+            }
+        }
+        StructuredNode::Switch {
+            discr_block,
+            cases,
+            default,
+            ..
+        } => {
+            out.insert(*discr_block);
+            for (_, c) in cases {
+                collect_node_blocks(c, out);
+            }
+            collect_node_blocks(default, out);
+        }
+        StructuredNode::WhileLoop {
+            header_block, body, ..
+        } => {
+            out.insert(*header_block);
+            collect_node_blocks(body, out);
+        }
+        StructuredNode::Loop { body, .. } | StructuredNode::LabeledBlock { body, .. } => {
+            collect_node_blocks(body, out);
+        }
+        StructuredNode::StateMachineFallback { blocks, .. } => {
+            for &b in blocks {
+                out.insert(b);
+            }
+        }
+        StructuredNode::Break(_) | StructuredNode::Continue(_) => {}
+    }
+}
+
+fn array_mutated_in_blocks(
+    func: &MirFunction,
+    arr_id: LocalId,
+    blocks: &HashSet<BlockId>,
+    alias_map: &HashMap<LocalId, LocalId>,
+) -> bool {
+    let resolve = |mut loc: LocalId| -> LocalId {
+        for _ in 0..func.locals.len() {
+            if let Some(&next) = alias_map.get(&loc) {
+                loc = next;
+            } else {
+                break;
+            }
+        }
+        loc
+    };
+    for &bb in blocks {
+        let blk = &func.blocks[bb.0];
+        for stmt in &blk.statements {
+            if let Statement::Assign(place, _, _) = stmt
+                && resolve(place.root_local()) == arr_id
+            {
+                return true;
+            }
+        }
+        if let Some(Terminator::Call {
+            callee,
+            args,
+            destination,
+            ..
+        }) = &blk.terminator
+        {
+            if resolve(destination.root_local()) == arr_id {
+                return true;
+            }
+            if matches!(
+                callee.as_str(),
+                "array.push" | "table.push" | "array.pop" | "table.pop" | "array.clear"
+            ) && args
+                .first()
+                .and_then(operand_exact_local)
+                .is_some_and(|l| resolve(l) == arr_id)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn collect_if_array_get_info(
+    node: &StructuredNode,
+    fe: &FnEmitter<'_, '_>,
+    allowed: &mut HashSet<LocalId>,
+    disqual: &mut HashSet<LocalId>,
+) {
+    match node {
+        StructuredNode::IfArrayGetOk {
+            arr_local,
+            binding_local,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let arr_id = fe.resolve_local(*arr_local);
+            if fe.borrowed_array_str_locals.contains(binding_local) {
+                allowed.insert(arr_id);
+            } else {
+                disqual.insert(arr_id);
+            }
+            collect_if_array_get_info(then_branch, fe, allowed, disqual);
+            if let Some(eb) = else_branch {
+                collect_if_array_get_info(eb, fe, allowed, disqual);
+            }
+        }
+        StructuredNode::Seq(items) => {
+            for item in items {
+                collect_if_array_get_info(item, fe, allowed, disqual);
+            }
+        }
+        StructuredNode::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_if_array_get_info(then_branch, fe, allowed, disqual);
+            if let Some(eb) = else_branch {
+                collect_if_array_get_info(eb, fe, allowed, disqual);
+            }
+        }
+        StructuredNode::Switch { cases, default, .. } => {
+            for (_, c) in cases {
+                collect_if_array_get_info(c, fe, allowed, disqual);
+            }
+            collect_if_array_get_info(default, fe, allowed, disqual);
+        }
+        StructuredNode::WhileLoop { body, .. }
+        | StructuredNode::Loop { body, .. }
+        | StructuredNode::LabeledBlock { body, .. } => {
+            collect_if_array_get_info(body, fe, allowed, disqual);
+        }
+        _ => {}
+    }
+}
+
+fn check_gsub_if_array_get_zero_only(
+    node: &StructuredNode,
+    fe: &FnEmitter<'_, '_>,
+    group: &HashSet<LocalId>,
+    const_zero_locals: &HashSet<LocalId>,
+    disqual: &mut HashSet<LocalId>,
+) {
+    match node {
+        StructuredNode::IfArrayGetOk {
+            arr_local,
+            idx_local,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let arr_id = fe.resolve_local(*arr_local);
+            let idx_id = fe.resolve_local(*idx_local);
+            if group.contains(&arr_id)
+                && (!const_zero_locals.contains(&idx_id) || else_branch.is_some())
+            {
+                disqual.insert(arr_id);
+            }
+            check_gsub_if_array_get_zero_only(then_branch, fe, group, const_zero_locals, disqual);
+            if let Some(eb) = else_branch {
+                check_gsub_if_array_get_zero_only(eb, fe, group, const_zero_locals, disqual);
+            }
+        }
+        StructuredNode::Seq(items) => {
+            for item in items {
+                check_gsub_if_array_get_zero_only(item, fe, group, const_zero_locals, disqual);
+            }
+        }
+        StructuredNode::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            check_gsub_if_array_get_zero_only(then_branch, fe, group, const_zero_locals, disqual);
+            if let Some(eb) = else_branch {
+                check_gsub_if_array_get_zero_only(eb, fe, group, const_zero_locals, disqual);
+            }
+        }
+        StructuredNode::Switch { cases, default, .. } => {
+            for (_, c) in cases {
+                check_gsub_if_array_get_zero_only(c, fe, group, const_zero_locals, disqual);
+            }
+            check_gsub_if_array_get_zero_only(default, fe, group, const_zero_locals, disqual);
+        }
+        StructuredNode::WhileLoop { body, .. }
+        | StructuredNode::Loop { body, .. }
+        | StructuredNode::LabeledBlock { body, .. } => {
+            check_gsub_if_array_get_zero_only(body, fe, group, const_zero_locals, disqual);
+        }
+        _ => {}
+    }
+}
+
+/// Compiles a simple single-atom ASCII character-class `+` pattern (e.g. `"[0-9]+"`, `"%d+"`,
+/// `"[a-zA-Z0-9_]+"`, `"%w+"`, `"%s+"`) into a 128-bit `[u64; 2]` ASCII membership bitmap.
+/// Returns `None` for any pattern that can match non-ASCII bytes, captures, anchors, or multiple atoms.
+fn try_compile_ascii_class_plus_bitmap(pat: &str) -> Option<[u64; 2]> {
+    let bytes = pat.as_bytes();
+    if bytes.len() < 2 || *bytes.last()? != b'+' {
+        return None;
+    }
+    let body = &bytes[..bytes.len() - 1];
+    let mut bm = [0u64; 2];
+    let set_bit = |bm: &mut [u64; 2], b: u8| {
+        if b < 128 {
+            bm[(b >> 6) as usize] |= 1_u64 << (b & 63);
+        }
+    };
+    let set_class = |bm: &mut [u64; 2], cls: u8| -> bool {
+        if cls.is_ascii_uppercase() {
+            // Negated classes match non-ASCII bytes >= 128, so reject for ASCII-only fast path.
+            return false;
+        }
+        for b in 0u8..128 {
+            let hit = match cls {
+                b'a' => b.is_ascii_alphabetic(),
+                b'c' => b.is_ascii_control(),
+                b'd' => b.is_ascii_digit(),
+                b'l' => b.is_ascii_lowercase(),
+                b'u' => b.is_ascii_uppercase(),
+                b'w' => b.is_ascii_alphanumeric() || b == b'_',
+                b'x' => b.is_ascii_hexdigit(),
+                b's' => b.is_ascii_whitespace(),
+                b'p' => b.is_ascii_punctuation(),
+                b'z' => b == 0,
+                _ => return false,
+            };
+            if hit {
+                set_bit(bm, b);
+            }
+        }
+        true
+    };
+
+    if body.len() == 2 && body[0] == b'%' {
+        if set_class(&mut bm, body[1]) {
+            return Some(bm);
+        }
+        return None;
+    }
+    if body.len() >= 3 && body[0] == b'[' && *body.last()? == b']' {
+        let inner = &body[1..body.len() - 1];
+        if inner.is_empty() || inner[0] == b'^' {
+            return None;
+        }
+        let mut i = 0usize;
+        while i < inner.len() {
+            if inner[i] == b'%' && i + 1 < inner.len() {
+                let c = inner[i + 1];
+                if !set_class(&mut bm, c) {
+                    if c < 128 {
+                        set_bit(&mut bm, c);
+                    } else {
+                        return None;
+                    }
+                }
+                i += 2;
+            } else if i + 2 < inner.len() && inner[i + 1] == b'-' {
+                let lo = inner[i];
+                let hi = inner[i + 2];
+                if lo >= 128 || hi >= 128 || lo > hi {
+                    return None;
+                }
+                for b in lo..=hi {
+                    set_bit(&mut bm, b);
+                }
+                i += 3;
+            } else {
+                let c = inner[i];
+                if c >= 128 || c == b'[' || c == b']' {
+                    return None;
+                }
+                set_bit(&mut bm, c);
+                i += 1;
+            }
+        }
+        if bm[0] != 0 || bm[1] != 0 {
+            return Some(bm);
+        }
+    }
+    None
+}
+
+fn collect_simple_straight_body_blocks(
+    node: &StructuredNode,
+    func: &MirFunction,
+    out: &mut Vec<BlockId>,
+) -> bool {
+    match node {
+        StructuredNode::BasicBlock(bb) => {
+            if matches!(
+                func.blocks[bb.0].terminator,
+                Some(Terminator::Call { .. } | Terminator::Return(_, _) | Terminator::Raise(_, _))
+            ) {
+                return false;
+            }
+            out.push(*bb);
+            true
+        }
+        StructuredNode::Seq(items) => items
+            .iter()
+            .all(|it| collect_simple_straight_body_blocks(it, func, out)),
+        StructuredNode::LabeledBlock { body, .. } => {
+            collect_simple_straight_body_blocks(body, func, out)
+        }
+        StructuredNode::If {
+            cond_block,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            out.push(*cond_block);
+            collect_simple_straight_body_blocks(then_branch, func, out)
+                && else_branch
+                    .as_deref()
+                    .is_none_or(|eb| collect_simple_straight_body_blocks(eb, func, out))
+        }
+        _ => false,
+    }
 }
 
 fn operand_sig(op: &Operand, func: &MirFunction) -> String {

@@ -157,6 +157,63 @@ std::thread_local! {
     static CLOSURE_UPVALUE_BUFFER_GROWTHS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
 
+#[cfg(feature = "std")]
+struct PureNativeCacheEntry {
+    vm_id: crate::bytecode::value::VmId,
+    globals_version: u64,
+    ptrs: Rc<hashbrown::HashSet<usize, DefaultHashBuilder>>,
+}
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    static FRAME_EXIT_SLOW_COUNT: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static FRAME_EXIT_OSR_COUNT: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static MAP_MUTATION_GEN: core::cell::Cell<u64> = const { core::cell::Cell::new(1) };
+    static PURE_NATIVE_CACHE: core::cell::RefCell<Option<PureNativeCacheEntry>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "std")]
+pub(super) fn drop_pure_native_cache_for_vm(vm_id: crate::bytecode::value::VmId) {
+    PURE_NATIVE_CACHE.with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut()
+            && guard.as_ref().is_some_and(|e| e.vm_id == vm_id)
+        {
+            *guard = None;
+        }
+    });
+}
+
+#[inline(always)]
+fn current_map_mutation_gen() -> u64 {
+    #[cfg(feature = "std")]
+    {
+        MAP_MUTATION_GEN.with(core::cell::Cell::get)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        1
+    }
+}
+
+#[inline(always)]
+fn bump_map_mutation_gen() {
+    #[cfg(feature = "std")]
+    MAP_MUTATION_GEN.with(|c| c.set(c.get().wrapping_add(1).max(1)));
+}
+
+#[inline(always)]
+fn record_frame_exit_slow() {
+    #[cfg(feature = "std")]
+    FRAME_EXIT_SLOW_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+#[inline(always)]
+fn record_frame_exit_osr() {
+    #[cfg(feature = "std")]
+    FRAME_EXIT_OSR_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
 #[inline(always)]
 fn record_frame_hoist_reload() {
     #[cfg(all(feature = "std", debug_assertions))]
@@ -263,7 +320,7 @@ fn write_frame_reg_fast(
     let idx = reg as usize;
     if !value.is_plain() {
         frame.mark_non_plain(idx);
-        if cycle_collector.is_enabled() {
+        if cycle_collector.is_enabled() && !crate::bytecode::value::is_cycle_leaf_value(&value) {
             cycle_collector.register_value(&value);
         }
     }
@@ -280,7 +337,7 @@ fn map_read(map: &Value, key: &Value, unwrap: bool) -> Result<Value> {
     };
     let found = map
         .borrow()
-        .get(&ValueKey::from_value(key))
+        .get(&crate::bytecode::value::ValueKeyRef(key))
         .map(Value::fast_clone);
     match (found, unwrap) {
         (Some(value), true) => Ok(value),
@@ -305,8 +362,8 @@ fn map_write(
             message: format!("map.set expects a map, got {:?}", map.type_of()),
         });
     };
-    let stores_container =
-        !cycle::CycleCollector::is_leaf(key) || !cycle::CycleCollector::is_leaf(value);
+    let stores_container = !crate::bytecode::value::is_cycle_leaf_value(key)
+        || !crate::bytecode::value::is_cycle_leaf_value(value);
     let key = ValueKey::from_value(key);
     let mut map = map.borrow_mut();
     if budgets.mem_budget_enabled() && !map.contains_key(&key) {
@@ -317,6 +374,7 @@ fn map_write(
             })?;
     }
     map.insert(key, value.fast_clone());
+    bump_map_mutation_gen();
     if stores_container {
         cycle_collector.record_mutation();
     }
@@ -423,6 +481,7 @@ where
 
 enum FrameExit {
     EndOfChunk,
+    TopReturn(Register),
     CollectCycles,
     OutOfGas(u64),
     FallbackToOuter,
@@ -544,6 +603,190 @@ impl VM {
         CLOSURE_UPVALUE_BUFFER_GROWTHS.with(core::cell::Cell::get)
     }
 
+    /// Returns the per-thread count of `FrameExit::Slow` ejections from `'frame_fast`.
+    #[inline]
+    pub fn frame_exit_slow_count() -> u64 {
+        #[cfg(feature = "std")]
+        {
+            FRAME_EXIT_SLOW_COUNT.with(core::cell::Cell::get)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            0
+        }
+    }
+
+    /// Resets the per-thread `FrameExit::Slow` counter to zero.
+    #[inline]
+    pub fn reset_frame_exit_slow_count() {
+        #[cfg(feature = "std")]
+        FRAME_EXIT_SLOW_COUNT.with(|c| c.set(0));
+    }
+
+    /// Returns the per-thread count of `FrameExit::TryOsr` ejections from `'frame_fast`.
+    #[inline]
+    pub fn frame_exit_osr_count() -> u64 {
+        #[cfg(feature = "std")]
+        {
+            FRAME_EXIT_OSR_COUNT.with(core::cell::Cell::get)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            0
+        }
+    }
+
+    /// Resets the per-thread `FrameExit::TryOsr` counter to zero.
+    #[inline]
+    pub fn reset_frame_exit_osr_count() {
+        #[cfg(feature = "std")]
+        FRAME_EXIT_OSR_COUNT.with(|c| c.set(0));
+    }
+
+    /// Returns the cached set of pure synchronous stdlib `Rc<NativeFn>` pointers that can be
+    /// invoked directly inside `'frame_fast` without accessing `VM::with_current` or yielding.
+    #[cfg(feature = "std")]
+    fn pure_sync_native_ptrs(&self) -> Rc<hashbrown::HashSet<usize, DefaultHashBuilder>> {
+        let cached = PURE_NATIVE_CACHE.with(|cell| {
+            let guard = cell.borrow();
+            guard
+                .as_ref()
+                .filter(|e| e.vm_id == self.id && e.globals_version == self.globals_version)
+                .map(|e| Rc::clone(&e.ptrs))
+        });
+        if let Some(ptrs) = cached {
+            return ptrs;
+        }
+
+        let mut ptrs: hashbrown::HashSet<usize, DefaultHashBuilder> =
+            hashbrown::HashSet::with_hasher(DefaultHashBuilder::default());
+        let mut insert_from_module = |mod_name: &str, members: &[&str]| {
+            let mod_val = self
+                .natives
+                .get(mod_name)
+                .or_else(|| self.globals.get(mod_name));
+            if let Some(Value::Map(map)) = mod_val {
+                let borrowed = map.borrow();
+                for &member in members {
+                    let key_val = Value::string(member);
+                    if let Some(Value::NativeFunction(f)) =
+                        borrowed.get(&crate::bytecode::value::ValueKeyRef(&key_val))
+                    {
+                        ptrs.insert(Rc::as_ptr(f) as usize);
+                    }
+                }
+            }
+        };
+
+        insert_from_module(
+            "string",
+            &[
+                "len",
+                "sub",
+                "lower",
+                "upper",
+                "split",
+                "trim",
+                "trim_start",
+                "trim_end",
+                "replace",
+                "starts_with",
+                "ends_with",
+                "contains",
+                "is_empty",
+                "chars",
+                "lines",
+                "slice",
+                "index_of",
+                "char",
+                "rep",
+                "reverse",
+                "format",
+            ],
+        );
+        insert_from_module("array", &["len", "is_empty"]);
+        insert_from_module(
+            "math",
+            &[
+                "abs",
+                "floor",
+                "ceil",
+                "round",
+                "sqrt",
+                "sin",
+                "cos",
+                "tan",
+                "asin",
+                "acos",
+                "atan",
+                "atan2",
+                "min",
+                "max",
+                "clamp",
+                "deg",
+                "rad",
+                "exp",
+                "log",
+                "tointeger",
+                "tofloat",
+                "mod",
+                "pow",
+            ],
+        );
+        for bit_mod in ["bit", "bitwise"] {
+            insert_from_module(
+                bit_mod,
+                &["band", "bor", "bxor", "bnot", "lshift", "rshift", "arshift"],
+            );
+        }
+        for qual in [
+            "math.abs",
+            "math.floor",
+            "math.ceil",
+            "math.round",
+            "math.sqrt",
+            "math.sin",
+            "math.cos",
+            "math.tan",
+            "math.asin",
+            "math.acos",
+            "math.atan",
+            "math.atan2",
+            "math.min",
+            "math.max",
+            "math.clamp",
+            "math.deg",
+            "math.rad",
+            "math.exp",
+            "math.log",
+            "math.tointeger",
+            "math.tofloat",
+            "math.mod",
+            "math.pow",
+            "bit.band",
+            "bit.bor",
+            "bit.bxor",
+            "bit.bnot",
+            "bit.lshift",
+            "bit.rshift",
+            "bit.arshift",
+        ] {
+            if let Some(Value::NativeFunction(f)) = self.natives.get(qual) {
+                ptrs.insert(Rc::as_ptr(f) as usize);
+            }
+        }
+
+        let rc = Rc::new(ptrs);
+        PURE_NATIVE_CACHE.with(|cell| {
+            *cell.borrow_mut() = Some(PureNativeCacheEntry {
+                vm_id: self.id,
+                globals_version: self.globals_version,
+                ptrs: Rc::clone(&rc),
+            });
+        });
+        rc
+    }
+
     fn is_loop_in_hierarchy(
         &self,
         function_idx: usize,
@@ -622,7 +865,36 @@ impl VM {
         let _vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
         #[cfg(feature = "std")]
         if self.backend == crate::vm::VmBackend::Cranelift {
-            return self.run_cranelift();
+            let skip_top_probe = {
+                #[cfg(feature = "test-deopt")]
+                let has_spike = self.test_deopt_spike_hook.is_some();
+                #[cfg(not(feature = "test-deopt"))]
+                let has_spike = false;
+                if !has_spike
+                    && let Some(top) = self.call_stack.last()
+                {
+                    let cache_rc = self.get_synced_cranelift_fallback_cache();
+                    let cache = cache_rc.borrow();
+                    cache.cranelift_call_state.get(top.function_idx).copied() == Some(1)
+                } else {
+                    false
+                }
+            };
+            if skip_top_probe {
+                let result = self.run_inner::<false>();
+                if crate::bytecode::value::has_active_specialized_caches() {
+                    crate::bytecode::value::sync_all_specialized_arrays();
+                }
+                return result;
+            }
+            let top_func_idx = self.call_stack.last().map(|f| f.function_idx);
+            let res = self.run_cranelift();
+            if res.is_ok()
+                && let Some(idx) = top_func_idx
+            {
+                self.record_cranelift_call_probe(idx);
+            }
+            return res;
         }
         // Specialize the dispatch loop once rather than testing it around every
         // instruction; the interpreter-only copy has no trace bookkeeping or JIT backedges.
@@ -632,7 +904,9 @@ impl VM {
         } else {
             self.run_inner::<false>()
         };
-        crate::bytecode::value::sync_all_specialized_arrays();
+        if crate::bytecode::value::has_active_specialized_caches() {
+            crate::bytecode::value::sync_all_specialized_arrays();
+        }
         result
     }
 
@@ -757,9 +1031,11 @@ impl VM {
         let mut cur_chunk_len: usize = 0;
         let mut cur_has_packed: bool = false;
         // Keep the allocations from returned closure frames for the next call.
-        let mut closure_upvalue_pool = Vec::new();
+        let mut closure_upvalue_pool: Vec<Vec<Upvalue>> = Vec::new();
         #[cfg(feature = "std")]
         let mut cur_has_osr_entries: bool = false;
+        #[cfg(feature = "std")]
+        let pure_natives = self.pure_sync_native_ptrs();
 
         'dispatch: loop {
             debug_assert_eq!(
@@ -820,9 +1096,25 @@ impl VM {
                 let has_gas_limit = (self.slow_path_flags & SLOW_PATH_GAS_LIMIT) != 0;
                 let skip_gas = (self.slow_path_flags & SLOW_PATH_SKIP_GAS) != 0;
                 #[cfg(feature = "std")]
-                let can_osr =
-                    self.backend == crate::vm::VmBackend::Cranelift && cur_has_osr_entries;
-                let allow_inloop_calls = self.backend != crate::vm::VmBackend::Cranelift;
+                let is_cranelift = self.backend == crate::vm::VmBackend::Cranelift;
+                #[cfg(all(feature = "std", feature = "test-deopt"))]
+                let has_spike_hook = self.test_deopt_spike_hook.is_some();
+                #[cfg(all(feature = "std", not(feature = "test-deopt")))]
+                let has_spike_hook = false;
+                #[cfg(feature = "std")]
+                let cl_fallback_cache = if is_cranelift {
+                    Some(self.get_synced_cranelift_fallback_cache())
+                } else {
+                    None
+                };
+                #[cfg(feature = "std")]
+                let cl_cache_ref = cl_fallback_cache.as_ref().map(|c| c.borrow());
+                #[cfg(feature = "std")]
+                let (cl_call_states, cl_osr_exhausted): (&[u8], &[bool]) = match cl_cache_ref.as_deref() {
+                    Some(c) => (c.cranelift_call_state.as_slice(), c.osr_exhausted_funcs.as_slice()),
+                    None => (&[], &[]),
+                };
+                let allow_inloop_calls = true;
                 let has_active_finalizers = self.has_active_finalizers;
                 let max_stack_depth = self.max_stack_depth;
                 let min_inloop_return_depth = self.call_until_depth.unwrap_or(0).saturating_add(1);
@@ -851,6 +1143,10 @@ impl VM {
 
                     Ok('frame_fast: loop {
                         let func = &functions[cur_func_idx];
+                        #[cfg(feature = "std")]
+                        let can_osr = is_cranelift
+                            && !func.block_entry_pcs.is_empty()
+                            && !matches!(cl_osr_exhausted.get(cur_func_idx), Some(true));
                         let instructions = &func.chunk.instructions;
                         let packed_code = &func.chunk.packed_code;
                         let extra_args = &func.chunk.extra_args;
@@ -2056,9 +2352,6 @@ impl VM {
                                     );
                                 }
                                 let value = regs[value_reg as usize].fast_clone();
-                                if !crate::vm::cycle::CycleCollector::is_leaf(&value) {
-                                    cycle_collector.record_mutation();
-                                }
                                 let Value::Struct(s) = &regs[obj_reg as usize] else {
                                     unreachable!()
                                 };
@@ -2075,6 +2368,16 @@ impl VM {
                                         } else {
                                             value
                                         };
+                                        if !crate::bytecode::value::is_strict_scalar_leaf(
+                                            &canonical,
+                                        ) {
+                                            if s.is_leaf_struct.replace(false)
+                                                && cycle_collector.is_enabled()
+                                            {
+                                                cycle_collector.register_struct_direct(s);
+                                            }
+                                            cycle_collector.record_mutation();
+                                        }
                                         borrowed[idx] = canonical;
                                     } else {
                                         return Err(LustError::RuntimeError {
@@ -2198,13 +2501,35 @@ impl VM {
                                         }
                                     }
                                     Value::Map(map) => {
-                                        let field_name = constants[field_idx as usize]
-                                            .as_string_rc()
-                                            .ok_or_else(|| LustError::RuntimeError {
-                                                message: "Field name must be a string".to_string(),
-                                            })?;
-                                        let key = ValueKey::from(field_name);
-                                        map.borrow().get(&key).cloned().unwrap_or(Value::Nil)
+                                        let map_gen = current_map_mutation_gen();
+                                        if let Some(cached) =
+                                            ic_slots[ip].probe_module_map_native(map, map_gen)
+                                        {
+                                            cached
+                                        } else {
+                                            let field_const = &constants[field_idx as usize];
+                                            if field_const.as_string_rc().is_none() {
+                                                return Err(LustError::RuntimeError {
+                                                    message: "Field name must be a string"
+                                                        .to_string(),
+                                                });
+                                            }
+                                            let val = map
+                                                .borrow()
+                                                .get(&crate::bytecode::value::ValueKeyRef(
+                                                    field_const,
+                                                ))
+                                                .map(Value::fast_clone)
+                                                .unwrap_or(Value::Nil);
+                                            if matches!(val, Value::NativeFunction(_)) {
+                                                ic_slots[ip].insert_module_map_native(
+                                                    map,
+                                                    map_gen,
+                                                    val.fast_clone(),
+                                                );
+                                            }
+                                            val
+                                        }
                                     }
                                     _ => {
                                         break 'frame_fast FrameExit::Slow(
@@ -2251,9 +2576,6 @@ impl VM {
                                                 slot_idx
                                             }
                                         };
-                                        if !crate::vm::cycle::CycleCollector::is_leaf(value) {
-                                            cycle_collector.record_mutation();
-                                        }
                                         {
                                             let mut borrowed = s.fields.borrow_mut();
                                             if idx < borrowed.len() {
@@ -2266,6 +2588,16 @@ impl VM {
                                                 } else {
                                                     value.fast_clone()
                                                 };
+                                                if !crate::bytecode::value::is_strict_scalar_leaf(
+                                                    &canonical,
+                                                ) {
+                                                    if s.is_leaf_struct.replace(false)
+                                                        && cycle_collector.is_enabled()
+                                                    {
+                                                        cycle_collector.register_struct_direct(s);
+                                                    }
+                                                    cycle_collector.record_mutation();
+                                                }
                                                 borrowed[idx] = canonical;
                                             } else {
                                                 return Err(LustError::RuntimeError {
@@ -2296,6 +2628,7 @@ impl VM {
                                             budgets.charge_map_entry_estimate()?;
                                         }
                                         map.borrow_mut().insert(key, value.fast_clone());
+                                        bump_map_mutation_gen();
                                     }
                                     _ => {
                                         break 'frame_fast FrameExit::Slow(
@@ -2385,8 +2718,11 @@ impl VM {
                                     .ok_or_else(|| LustError::RuntimeError {
                                         message: "Array index must be an integer".to_string(),
                                     })?;
-                                let result = if let Some(val) =
-                                    crate::bytecode::value::get_specialized_cached_element(arr, idx)
+                                let result = if crate::bytecode::value::has_active_specialized_caches()
+                                    && let Some(val) =
+                                        crate::bytecode::value::get_specialized_cached_element(
+                                            arr, idx,
+                                        )
                                 {
                                     val
                                 } else if idx >= 0
@@ -2423,8 +2759,11 @@ impl VM {
                                     .ok_or_else(|| LustError::RuntimeError {
                                         message: "Array index must be an integer".to_string(),
                                     })?;
-                                let result = if let Some(val) =
-                                    crate::bytecode::value::get_specialized_cached_element(arr, idx)
+                                let result = if crate::bytecode::value::has_active_specialized_caches()
+                                    && let Some(val) =
+                                        crate::bytecode::value::get_specialized_cached_element(
+                                            arr, idx,
+                                        )
                                 {
                                     val
                                 } else if idx >= 0
@@ -2460,14 +2799,20 @@ impl VM {
                                 };
                                 let value = regs[value_reg as usize].fast_clone();
                                 charge_array_push_budget(budgets, arr, &value)?;
-                                if !crate::vm::cycle::CycleCollector::is_leaf(&value) {
+                                if !crate::bytecode::value::is_cycle_leaf_value(&value) {
                                     cycle_collector.record_mutation();
                                 }
-                                crate::bytecode::value::sync_specialized_array(arr);
+                                let spec_active =
+                                    crate::bytecode::value::has_active_specialized_caches();
+                                if spec_active {
+                                    crate::bytecode::value::sync_specialized_array(arr);
+                                }
                                 arr.push_value_fast(value);
-                                crate::bytecode::value::invalidate_specialized_array_cache(
-                                    arr.as_ptr() as usize,
-                                );
+                                if spec_active {
+                                    crate::bytecode::value::invalidate_specialized_array_cache(
+                                        arr.as_ptr() as usize,
+                                    );
+                                }
                                 false
                             }
                             OP_SET_INDEX => {
@@ -2486,14 +2831,7 @@ impl VM {
                                     .ok_or_else(|| LustError::RuntimeError {
                                         message: "Array index must be an integer".to_string(),
                                     })?;
-                                let value = regs[value_reg as usize].fast_clone();
-                                if let Some(res) =
-                                    crate::bytecode::value::set_specialized_cached_element(
-                                        arr, idx, &value,
-                                    )
-                                {
-                                    res.map_err(|message| LustError::RuntimeError { message })?;
-                                } else {
+                                if !crate::bytecode::value::has_active_specialized_caches() {
                                     if idx < 0 {
                                         return Err(LustError::RuntimeError {
                                             message: format!(
@@ -2503,10 +2841,20 @@ impl VM {
                                             ),
                                         });
                                     }
-                                    if !crate::vm::cycle::CycleCollector::is_leaf(&value) {
-                                        cycle_collector.record_mutation();
-                                    }
-                                    if let Err(len) = arr.set_value_fast(idx as usize, value) {
+                                    let set_res = match &regs[value_reg as usize] {
+                                        Value::Bool(b) => arr.set_bool(idx as usize, *b),
+                                        Value::Int(i) => arr.set_int(idx as usize, *i as i64),
+                                        Value::Float(f) => arr.set_float(idx as usize, *f as f64),
+                                        other => {
+                                            let value = other.fast_clone();
+                                            if !crate::bytecode::value::is_cycle_leaf_value(&value)
+                                            {
+                                                cycle_collector.record_mutation();
+                                            }
+                                            arr.set_value_fast(idx as usize, value)
+                                        }
+                                    };
+                                    if let Err(len) = set_res {
                                         return Err(LustError::RuntimeError {
                                             message: format!(
                                                 "Array index {} out of bounds (length: {})",
@@ -2514,9 +2862,41 @@ impl VM {
                                             ),
                                         });
                                     }
-                                    crate::bytecode::value::invalidate_specialized_array_cache(
-                                        arr.as_ptr() as usize,
-                                    );
+                                } else {
+                                    let value = regs[value_reg as usize].fast_clone();
+                                    if let Some(res) =
+                                        crate::bytecode::value::set_specialized_cached_element(
+                                            arr, idx, &value,
+                                        )
+                                    {
+                                        res.map_err(|message| LustError::RuntimeError {
+                                            message,
+                                        })?;
+                                    } else {
+                                        if idx < 0 {
+                                            return Err(LustError::RuntimeError {
+                                                message: format!(
+                                                    "Array index {} out of bounds (length: {})",
+                                                    idx,
+                                                    arr.len_fast()
+                                                ),
+                                            });
+                                        }
+                                        if !crate::bytecode::value::is_cycle_leaf_value(&value) {
+                                            cycle_collector.record_mutation();
+                                        }
+                                        if let Err(len) = arr.set_value_fast(idx as usize, value) {
+                                            return Err(LustError::RuntimeError {
+                                                message: format!(
+                                                    "Array index {} out of bounds (length: {})",
+                                                    idx, len
+                                                ),
+                                            });
+                                        }
+                                        crate::bytecode::value::invalidate_specialized_array_cache(
+                                            arr.as_ptr() as usize,
+                                        );
+                                    }
                                 }
                                 false
                             }
@@ -2537,7 +2917,14 @@ impl VM {
                                     .ok_or_else(|| LustError::RuntimeError {
                                         message: "Array index must be an integer".to_string(),
                                     })?;
-                                let found = if let Some(val) =
+                                let found = if !crate::bytecode::value::has_active_specialized_caches()
+                                {
+                                    if idx >= 0 {
+                                        arr.get_value_fast(idx as usize)
+                                    } else {
+                                        None
+                                    }
+                                } else if let Some(val) =
                                     crate::bytecode::value::get_specialized_cached_element(arr, idx)
                                 {
                                     Some(val)
@@ -2597,8 +2984,12 @@ impl VM {
                                 let array_reg = packed.b();
                                 let len = match &regs[array_reg as usize] {
                                     Value::Array(arr) => {
-                                        crate::bytecode::value::get_specialized_cached_len(arr)
-                                            .unwrap_or_else(|| arr.len_fast())
+                                        if crate::bytecode::value::has_active_specialized_caches() {
+                                            crate::bytecode::value::get_specialized_cached_len(arr)
+                                                .unwrap_or_else(|| arr.len_fast())
+                                        } else {
+                                            arr.len_fast()
+                                        }
                                     }
                                     other => {
                                         return Err(LustError::RuntimeError {
@@ -2617,37 +3008,45 @@ impl VM {
                             }
                             OP_LOAD_UPVALUE => {
                                 let dest = packed.a();
-                                let upvalue_idx = packed.b();
-                                if (upvalue_idx as usize) < frame.upvalues.len() {
-                                    let value = frame.upvalues[upvalue_idx as usize].clone();
-                                    write_frame_reg_fast(frame, regs, cycle_collector, dest, value)
+                                let upvalue_idx = packed.b() as usize;
+                                let value = if upvalue_idx < frame.shared_upvalues.len() {
+                                    frame.shared_upvalues[upvalue_idx].get()
+                                } else if upvalue_idx < frame.upvalues.len() {
+                                    frame.upvalues[upvalue_idx].fast_clone()
                                 } else {
                                     return Err(LustError::RuntimeError {
                                         message: format!(
                                             "Upvalue index {} out of bounds (have {} upvalues)",
                                             upvalue_idx,
-                                            frame.upvalues.len()
+                                            frame.shared_upvalues.len().max(frame.upvalues.len())
                                         ),
                                     });
+                                };
+                                if value.is_plain() {
+                                    write_frame_reg_scalar(regs, dest, value)
+                                } else {
+                                    write_frame_reg_fast(frame, regs, cycle_collector, dest, value)
                                 }
                             }
                             OP_STORE_UPVALUE => {
-                                let upvalue_idx = packed.a();
+                                let upvalue_idx = packed.a() as usize;
                                 let src = packed.b();
-                                let value = regs[src as usize].clone();
-                                let idx = upvalue_idx as usize;
-                                if idx < frame.upvalues.len() {
-                                    frame.upvalues[idx] = value.clone();
-                                    if idx < frame.shared_upvalues.len() {
-                                        frame.shared_upvalues[idx].set(value);
+                                let value = regs[src as usize].fast_clone();
+                                if upvalue_idx < frame.shared_upvalues.len() {
+                                    if upvalue_idx < frame.upvalues.len() {
+                                        frame.upvalues[upvalue_idx] = value.fast_clone();
                                     }
+                                    frame.shared_upvalues[upvalue_idx].set(value);
+                                    false
+                                } else if upvalue_idx < frame.upvalues.len() {
+                                    frame.upvalues[upvalue_idx] = value;
                                     false
                                 } else {
                                     return Err(LustError::RuntimeError {
                                         message: format!(
                                             "Upvalue index {} out of bounds (have {} upvalues)",
                                             upvalue_idx,
-                                            frame.upvalues.len()
+                                            frame.shared_upvalues.len().max(frame.upvalues.len())
                                         ),
                                     });
                                 }
@@ -2655,11 +3054,77 @@ impl VM {
 
                             OP_CALL => {
                                 let callee_reg = packed.a();
-                                if allow_inloop_calls {
+                                #[cfg(feature = "std")]
+                                if let Value::NativeFunction(native_fn) = &regs[callee_reg as usize] {
+                                    let fn_ptr = Rc::as_ptr(native_fn) as usize;
+                                    if pure_natives.contains(&fn_ptr) {
+                                        let w0 = extra_args[packed.bx() as usize];
+                                        let first_arg = (w0 & 0xFF) as u8;
+                                        let arg_count = ((w0 >> 8) & 0xFF) as u8;
+                                        let dest = ((w0 >> 16) & 0xFF) as u8;
+                                        let arg_start = first_arg as usize;
+                                        let arg_end = arg_start + arg_count as usize;
+                                        if arg_count == 0 || arg_end <= frame.reg_count as usize {
+                                            let fn_rc = Rc::clone(native_fn);
+                                            let args_slice: &[Value] = if arg_count == 0 {
+                                                &[]
+                                            } else {
+                                                &regs[arg_start..arg_end]
+                                            };
+                                            let outcome = fn_rc(args_slice).map_err(|e| {
+                                                LustError::RuntimeError { message: e }
+                                            })?;
+                                            match outcome {
+                                                NativeCallResult::Return(val) => {
+                                                    if val.is_plain() {
+                                                        write_frame_reg_scalar(regs, dest, val)
+                                                    } else {
+                                                        write_frame_reg_fast(
+                                                            frame,
+                                                            regs,
+                                                            cycle_collector,
+                                                            dest,
+                                                            val,
+                                                        )
+                                                    }
+                                                }
+                                                _ => {
+                                                    return Err(LustError::RuntimeError {
+                                                        message: "Unexpected non-return outcome from pure synchronous native"
+                                                            .to_string(),
+                                                    });
+                                                }
+                                            }
+                                        } else {
+                                            break 'frame_fast FrameExit::Slow(
+                                                instructions[ip],
+                                                ip_before_execution,
+                                            );
+                                        }
+                                    } else {
+                                        break 'frame_fast FrameExit::Slow(
+                                            instructions[ip],
+                                            ip_before_execution,
+                                        );
+                                    }
+                                } else if allow_inloop_calls {
                                     let target = match &regs[callee_reg as usize] {
-                                        Value::Function(idx) => Some((*idx, None)),
+                                        Value::Function(idx) => {
+                                            let can_stay = !is_cranelift
+                                                || (!has_spike_hook
+                                                    && cl_call_states.get(*idx) == Some(&1));
+                                            can_stay.then_some((*idx, None))
+                                        }
                                         Value::Closure(closure) => {
-                                            Some((closure.function_idx, Some(callee_reg)))
+                                            let can_stay = !is_cranelift
+                                                || !closure.upvalues.is_empty()
+                                                || (!has_spike_hook
+                                                    && cl_call_states.get(closure.function_idx)
+                                                        == Some(&1));
+                                            can_stay.then_some((
+                                                closure.function_idx,
+                                                Some(callee_reg),
+                                            ))
                                         }
                                         _ => None,
                                     };
@@ -2674,11 +3139,43 @@ impl VM {
                                             ip_before_execution,
                                         };
                                     }
+                                    break 'frame_fast FrameExit::Slow(
+                                        instructions[ip],
+                                        ip_before_execution,
+                                    );
+                                } else {
+                                    break 'frame_fast FrameExit::Slow(
+                                        instructions[ip],
+                                        ip_before_execution,
+                                    );
                                 }
-                                break 'frame_fast FrameExit::Slow(
-                                    instructions[ip],
-                                    ip_before_execution,
-                                );
+                                #[cfg(not(feature = "std"))]
+                                {
+                                    if allow_inloop_calls {
+                                        let target = match &regs[callee_reg as usize] {
+                                            Value::Function(idx) => Some((*idx, None)),
+                                            Value::Closure(closure) => {
+                                                Some((closure.function_idx, Some(callee_reg)))
+                                            }
+                                            _ => None,
+                                        };
+                                        if let Some((target_func_idx, closure_reg)) = target {
+                                            let w0 = extra_args[packed.bx() as usize];
+                                            break 'intra FastStep::InLoopCall {
+                                                target_func_idx,
+                                                closure_reg,
+                                                first_arg: (w0 & 0xFF) as u8,
+                                                arg_count: ((w0 >> 8) & 0xFF) as u8,
+                                                dest: ((w0 >> 16) & 0xFF) as u8,
+                                                ip_before_execution,
+                                            };
+                                        }
+                                    }
+                                    break 'frame_fast FrameExit::Slow(
+                                        instructions[ip],
+                                        ip_before_execution,
+                                    );
+                                }
                             }
                             OP_CALL_METHOD => {
                                 let obj_reg = packed.a();
@@ -2706,14 +3203,22 @@ impl VM {
                                             Some(target)
                                         });
                                     if let Some(target_func_idx) = target_opt {
-                                        break 'intra FastStep::InLoopCallMethod {
-                                            target_func_idx,
-                                            obj_reg,
-                                            first_arg,
-                                            arg_count,
-                                            dest,
-                                            ip_before_execution,
-                                        };
+                                        #[cfg(feature = "std")]
+                                        let can_stay = !is_cranelift
+                                            || (!has_spike_hook
+                                                && cl_call_states.get(target_func_idx) == Some(&1));
+                                        #[cfg(not(feature = "std"))]
+                                        let can_stay = true;
+                                        if can_stay {
+                                            break 'intra FastStep::InLoopCallMethod {
+                                                target_func_idx,
+                                                obj_reg,
+                                                first_arg,
+                                                arg_count,
+                                                dest,
+                                                ip_before_execution,
+                                            };
+                                        }
                                     }
                                 }
                                 break 'frame_fast FrameExit::Slow(
@@ -2830,27 +3335,25 @@ impl VM {
                                     if let Some(meta) = call_meta.get_mut(target_func_idx) {
                                         meta.active_depth = meta.active_depth.saturating_add(1);
                                     }
-                                    let (upvalues, shared_upvalues) = if let Some(reg) = closure_reg
+                                    let shared_upvalues = if let Some(reg) = closure_reg
                                         && let Value::Closure(closure) =
                                             &vm_registers[caller_base + reg as usize]
                                         && !closure.upvalues.is_empty()
                                     {
-                                        let (mut values, mut shared): (Vec<Value>, Vec<Upvalue>) =
+                                        let mut shared: Vec<Upvalue> =
                                             closure_upvalue_pool.pop().unwrap_or_default();
                                         #[cfg(all(feature = "std", debug_assertions))]
                                         CLOSURE_UPVALUE_BUFFER_GROWTHS.with(|growths| {
                                             let count = closure.upvalues.len();
                                             growths.set(
                                                 growths.get()
-                                                    + u64::from(values.capacity() < count)
                                                     + u64::from(shared.capacity() < count),
                                             );
                                         });
-                                        values.extend(closure.upvalues.iter().map(Upvalue::get));
                                         shared.extend_from_slice(&closure.upvalues);
-                                        (values, shared)
+                                        shared
                                     } else {
-                                        (Vec::new(), Vec::new())
+                                        Vec::new()
                                     };
                                     call_stack.push(CallFrame {
                                         function_idx: target_func_idx,
@@ -2859,7 +3362,7 @@ impl VM {
                                         reg_count: target_reg_count,
                                         return_dest: Some(dest),
                                         non_plain_mask: callee_non_plain_mask,
-                                        upvalues,
+                                        upvalues: Vec::new(),
                                         shared_upvalues,
                                         saved_registers: None,
                                     });
@@ -2973,11 +3476,13 @@ impl VM {
                                         &vm_registers[callee_base + ret_reg as usize]
                                     };
                                     let meta = &call_meta[cur_func_idx];
-                                    if call_stack.len() <= min_inloop_return_depth
-                                        || (!meta.trusted_signature
-                                            && !meta.return_kind.matches(ret)
-                                            && !(meta.lua_multi_return
-                                                && matches!(ret, Value::Nil)))
+                                    if call_stack.len() <= min_inloop_return_depth {
+                                        break 'frame_fast FrameExit::TopReturn(ret_reg);
+                                    }
+                                    if !meta.trusted_signature
+                                        && !meta.return_kind.matches(ret)
+                                        && !(meta.lua_multi_return
+                                            && matches!(ret, Value::Nil))
                                     {
                                         break 'frame_fast FrameExit::Slow(
                                             instructions[ip_before_execution - 1],
@@ -3005,12 +3510,8 @@ impl VM {
                                     *last_frame_pop_cleanup_iters = cleared;
 
                                     if callee_frame.shared_upvalues.capacity() != 0 {
-                                        callee_frame.upvalues.clear();
                                         callee_frame.shared_upvalues.clear();
-                                        closure_upvalue_pool.push((
-                                            callee_frame.upvalues,
-                                            callee_frame.shared_upvalues,
-                                        ));
+                                        closure_upvalue_pool.push(callee_frame.shared_upvalues);
                                     }
                                     cur_frame_idx = call_stack.len() - 1;
                                     let caller_func_idx = call_stack[cur_frame_idx].function_idx;
@@ -3020,7 +3521,11 @@ impl VM {
                                         let dest_idx = dest as usize;
                                         if !ret_val.is_plain() {
                                             caller_frame.mark_non_plain(dest_idx);
-                                            if cycle_collector.is_enabled() {
+                                            if cycle_collector.is_enabled()
+                                                && !crate::bytecode::value::is_cycle_leaf_value(
+                                                    &ret_val,
+                                                )
+                                            {
                                                 cycle_collector.register_value(&ret_val);
                                                 needs_collect = cycle_collector.should_collect();
                                             }
@@ -3042,6 +3547,9 @@ impl VM {
                     })
                 })();
 
+                #[cfg(feature = "std")]
+                drop(cl_cache_ref);
+
                 if let Some((frame_idx, func_idx, start, end, used)) = prepaid {
                     let pc = self.call_stack[frame_idx].ip;
                     if pc < end {
@@ -3062,6 +3570,18 @@ impl VM {
                         frame_dirty = true;
                         continue 'dispatch;
                     }
+                    FrameExit::TopReturn(value_reg) => {
+                        frame_dirty = true;
+                        let return_value = if value_reg == 255 {
+                            Value::Nil
+                        } else {
+                            self.get_register(value_reg)?.fast_clone()
+                        };
+                        if let Some(finished) = self.finish_return(return_value)? {
+                            return Ok(finished);
+                        }
+                        continue 'dispatch;
+                    }
                     FrameExit::CollectCycles => {
                         self.maybe_collect_cycles();
                         frame_dirty = true;
@@ -3076,6 +3596,7 @@ impl VM {
                     }
                     #[cfg(feature = "std")]
                     FrameExit::TryOsr(target_ip) => {
+                        record_frame_exit_osr();
                         frame_dirty = true;
                         if let Some(outcome) =
                             self.try_enter_osr_at_backedge(cur_func_idx, target_ip)?
@@ -3093,6 +3614,7 @@ impl VM {
                         continue 'dispatch;
                     }
                     FrameExit::Slow(instruction, ip_before_execution) => {
+                        record_frame_exit_slow();
                         frame_dirty = true;
                         (instruction, ip_before_execution)
                     }
@@ -4046,12 +4568,14 @@ impl VM {
                     #[cfg(feature = "std")]
                     if self.backend == crate::vm::VmBackend::Cranelift
                         && self.trace_recorder.is_none()
-                        && let Some(finished) = self.try_run_cranelift_top_frame()?
                     {
-                        if let Some(val) = finished {
-                            return Ok(val);
+                        if let Some(finished) = self.try_run_cranelift_top_frame()? {
+                            if let Some(val) = finished {
+                                return Ok(val);
+                            }
+                            continue 'dispatch;
                         }
-                        continue 'dispatch;
+                        self.record_cranelift_call_probe(callee_idx);
                     }
                     if JIT_ENABLED
                         && self.trace_recorder.is_none()
@@ -4199,6 +4723,7 @@ impl VM {
                             let outcome = native_fn(&args);
                             drop(_vm_guard);
                             drop(_native_guard);
+                            bump_map_mutation_gen();
                             args.clear();
                             if args.capacity() > self.arg_scratch.capacity() {
                                 self.arg_scratch = args;
@@ -4493,11 +5018,18 @@ impl VM {
                         }
                     } else {
                         match &object {
-                            Value::Struct(_) => {
+                            Value::Struct(s) => {
                                 invalidate_key = Self::struct_cache_key(&object);
+                                let was_leaf = s.is_leaf_struct.get();
                                 object
                                     .struct_set_field_rc(&field_name, value)
                                     .map_err(|message| LustError::RuntimeError { message })?;
+                                if !s.is_leaf_struct.get() {
+                                    if was_leaf && self.cycle_collector.is_enabled() {
+                                        self.cycle_collector.register_struct_direct(s);
+                                    }
+                                    self.cycle_collector.record_mutation();
+                                }
                             }
 
                             Value::Map(map) => {
@@ -4508,6 +5040,7 @@ impl VM {
                                     self.budgets.charge_map_entry_estimate()?;
                                 }
                                 map.borrow_mut().insert(key, value);
+                                bump_map_mutation_gen();
                             }
 
                             _ => {
@@ -4579,12 +5112,16 @@ impl VM {
                     match &object {
                         Value::Struct(s) if s.name != "LuaTable" => {
                             invalidate_key = Self::struct_cache_key(&object);
-                            if !crate::vm::cycle::CycleCollector::is_leaf(&value) {
-                                self.cycle_collector.record_mutation();
-                            }
+                            let was_leaf = s.is_leaf_struct.get();
                             object
                                 .struct_set_field_indexed(slot_idx as usize, value)
                                 .map_err(|message| LustError::RuntimeError { message })?;
+                            if !s.is_leaf_struct.get() {
+                                if was_leaf && self.cycle_collector.is_enabled() {
+                                    self.cycle_collector.register_struct_direct(s);
+                                }
+                                self.cycle_collector.record_mutation();
+                            }
                         }
                         Value::Struct(s) => {
                             let field_name = s
@@ -5082,12 +5619,14 @@ impl VM {
                             #[cfg(feature = "std")]
                             if self.backend == crate::vm::VmBackend::Cranelift
                                 && self.trace_recorder.is_none()
-                                && let Some(finished) = self.try_run_cranelift_top_frame()?
                             {
-                                if let Some(val) = finished {
-                                    return Ok(val);
+                                if let Some(finished) = self.try_run_cranelift_top_frame()? {
+                                    if let Some(val) = finished {
+                                        return Ok(val);
+                                    }
+                                    continue 'dispatch;
                                 }
-                                continue 'dispatch;
+                                self.record_cranelift_call_probe(target);
                             }
                             if JIT_ENABLED
                                 && self.trace_recorder.is_none()
@@ -5181,12 +5720,14 @@ impl VM {
                             #[cfg(feature = "std")]
                             if self.backend == crate::vm::VmBackend::Cranelift
                                 && self.trace_recorder.is_none()
-                                && let Some(finished) = self.try_run_cranelift_top_frame()?
                             {
-                                if let Some(val) = finished {
-                                    return Ok(val);
+                                if let Some(finished) = self.try_run_cranelift_top_frame()? {
+                                    if let Some(val) = finished {
+                                        return Ok(val);
+                                    }
+                                    continue 'dispatch;
                                 }
-                                continue 'dispatch;
+                                self.record_cranelift_call_probe(target_func_idx);
                             }
                             break 'method;
                         }
@@ -5267,15 +5808,19 @@ impl VM {
                         .ok_or_else(|| LustError::RuntimeError {
                             message: "Empty call stack".to_string(),
                         })?;
-                    if (upvalue_idx as usize) < frame.upvalues.len() {
-                        let value = frame.upvalues[upvalue_idx as usize].clone();
+                    let idx = upvalue_idx as usize;
+                    if idx < frame.shared_upvalues.len() {
+                        let value = frame.shared_upvalues[idx].get();
+                        self.set_register(dest, value)?;
+                    } else if idx < frame.upvalues.len() {
+                        let value = frame.upvalues[idx].clone();
                         self.set_register(dest, value)?;
                     } else {
                         return Err(LustError::RuntimeError {
                             message: format!(
                                 "Upvalue index {} out of bounds (have {} upvalues)",
                                 upvalue_idx,
-                                frame.upvalues.len()
+                                frame.shared_upvalues.len().max(frame.upvalues.len())
                             ),
                         });
                     }
@@ -5290,17 +5835,19 @@ impl VM {
                                 message: "Empty call stack".to_string(),
                             })?;
                     let idx = upvalue_idx as usize;
-                    if idx < frame.upvalues.len() {
-                        frame.upvalues[idx] = value.clone();
-                        if idx < frame.shared_upvalues.len() {
-                            frame.shared_upvalues[idx].set(value);
+                    if idx < frame.shared_upvalues.len() {
+                        if idx < frame.upvalues.len() {
+                            frame.upvalues[idx] = value.clone();
                         }
+                        frame.shared_upvalues[idx].set(value);
+                    } else if idx < frame.upvalues.len() {
+                        frame.upvalues[idx] = value;
                     } else {
                         return Err(LustError::RuntimeError {
                             message: format!(
                                 "Upvalue index {} out of bounds (have {} upvalues)",
                                 upvalue_idx,
-                                frame.upvalues.len()
+                                frame.shared_upvalues.len().max(frame.upvalues.len())
                             ),
                         });
                     }
@@ -5373,6 +5920,7 @@ impl VM {
                                     self.budgets.charge_map_entry_estimate()?;
                                 }
                                 map.borrow_mut().insert(key, value);
+                                bump_map_mutation_gen();
                             }
 
                             _ => {
@@ -6597,7 +7145,10 @@ impl VM {
     #[inline(always)]
     pub(super) fn set_register(&mut self, reg: Register, value: Value) -> Result<()> {
         let is_non_plain = !value.is_plain();
-        if is_non_plain && self.cycle_collector.is_enabled() {
+        if is_non_plain
+            && self.cycle_collector.is_enabled()
+            && !crate::bytecode::value::is_cycle_leaf_value(&value)
+        {
             self.cycle_collector.register_value(&value);
         }
         let frame = self

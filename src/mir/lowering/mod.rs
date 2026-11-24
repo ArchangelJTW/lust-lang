@@ -79,6 +79,12 @@ enum ConditionBinding {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeQueueMethod {
+    Offer,
+    Take,
+}
+
 pub struct AstLowering<'a> {
     current_fn: &'a mut MirFunction,
     current_block: BlockId,
@@ -100,6 +106,10 @@ pub struct AstLowering<'a> {
     thunk_return_target: Option<(LocalId, BlockId)>,
     lifted_functions: Option<&'a mut Vec<MirFunction>>,
     lambda_counter: Option<&'a mut usize>,
+    lower_native_queue_intrinsics: bool,
+    native_queue_locals: HashSet<LocalId>,
+    native_queue_methods: HashMap<String, (LocalId, NativeQueueMethod)>,
+    string_byte_int_only_locals: HashSet<String>,
 }
 
 impl<'a> AstLowering<'a> {
@@ -146,6 +156,10 @@ impl<'a> AstLowering<'a> {
             thunk_return_target: None,
             lifted_functions,
             lambda_counter,
+            lower_native_queue_intrinsics: false,
+            native_queue_locals: HashSet::new(),
+            native_queue_methods: HashMap::new(),
+            string_byte_int_only_locals: HashSet::new(),
         }
     }
 
@@ -487,6 +501,7 @@ impl<'a> AstLowering<'a> {
                         &enum_defs_ast,
                         Some(&mut lifted_functions),
                         Some(&mut lambda_counter),
+                        false,
                     )?;
                     module.add_function(mir_fn);
                     for op in ops {
@@ -508,6 +523,7 @@ impl<'a> AstLowering<'a> {
                             &enum_defs_ast,
                             Some(&mut lifted_functions),
                             Some(&mut lambda_counter),
+                            false,
                         )?;
                         if !mir_fn.signature.name.contains(':') {
                             mir_fn.signature.name = format!("{}:{}", target_name, method_fn.name);
@@ -539,7 +555,26 @@ impl<'a> AstLowering<'a> {
         owner_struct: Option<&str>,
         struct_defs: &[&StructDef],
     ) -> Result<(MirFunction, Vec<MirStructOp>), MirLowerError> {
-        Self::lower_function_inner(func_def, owner_struct, struct_defs, &[], None, None)
+        Self::lower_function_inner(func_def, owner_struct, struct_defs, &[], None, None, false)
+    }
+
+    pub fn lower_function_with_structs_enums_and_owner(
+        func_def: &FunctionDef,
+        owner_struct: Option<&str>,
+        struct_defs: &[&StructDef],
+        enum_defs: &[&EnumDef],
+        lifted_functions: Option<&mut Vec<MirFunction>>,
+        lambda_counter: Option<&mut usize>,
+    ) -> Result<(MirFunction, Vec<MirStructOp>), MirLowerError> {
+        Self::lower_function_inner(
+            func_def,
+            owner_struct,
+            struct_defs,
+            enum_defs,
+            lifted_functions,
+            lambda_counter,
+            true,
+        )
     }
 
     fn lower_function_inner(
@@ -549,6 +584,7 @@ impl<'a> AstLowering<'a> {
         enum_defs_ast: &[&EnumDef],
         lifted_functions: Option<&mut Vec<MirFunction>>,
         lambda_counter: Option<&mut usize>,
+        lower_native_queue_intrinsics: bool,
     ) -> Result<(MirFunction, Vec<MirStructOp>), MirLowerError> {
         let mut enum_defs_map: HashMap<String, Vec<(String, Vec<MirType>)>> = HashMap::new();
         let mut scalar_enum_map: HashMap<String, (String, Vec<MirType>)> = HashMap::new();
@@ -617,9 +653,10 @@ impl<'a> AstLowering<'a> {
             mir_fn.locals[p_id.0].name = Some(p.name.clone());
         }
 
-        let ops = {
+        let (ops, collected_layouts) = {
             let mut lowering =
                 AstLowering::new_with_module_sink(&mut mir_fn, lifted_functions, lambda_counter);
+            lowering.lower_native_queue_intrinsics = lower_native_queue_intrinsics;
             for def in struct_defs {
                 lowering.register_struct_def(def);
             }
@@ -643,8 +680,15 @@ impl<'a> AstLowering<'a> {
                         Some(Terminator::Return(None, crate::ast::Span::dummy()));
                 }
             }
-            lowering.struct_ops
+            let mut layouts: Vec<MirStructLayout> = lowering
+                .struct_layouts
+                .values()
+                .map(MirStructLayout::from)
+                .collect();
+            layouts.sort_by(|a, b| a.type_name.cmp(&b.type_name));
+            (lowering.struct_ops, layouts)
         };
+        mir_fn.struct_layouts = collected_layouts;
 
         Ok((mir_fn, ops))
     }
@@ -944,13 +988,27 @@ impl<'a> AstLowering<'a> {
 
     fn lower_statements(&mut self, stmts: &[Stmt]) -> Result<(), MirLowerError> {
         for (idx, stmt) in stmts.iter().enumerate() {
+            let remaining = &stmts[idx + 1..];
             if !self.last_map_get_defs.is_empty() {
-                let remaining = &stmts[idx + 1..];
                 for pending in self.last_map_get_defs.values_mut() {
                     let count_in_cur = count_ident_in_stmt(stmt, &pending.var_name);
                     let used_later = stmts_mention_ident(remaining, &pending.var_name);
                     pending.exclusive_in_current_stmt = count_in_cur == 1 && !used_later;
                 }
+            }
+            if let StmtKind::Local {
+                bindings,
+                initializer: Some(inits),
+            } = &stmt.kind
+                && bindings.len() == 1
+                && inits.len() == 1
+                && let Some(ref ann) = bindings[0].type_annotation
+                && is_lua_value_array_type(ann)
+                && is_string_byte_call(&inits[0])
+                && array_local_only_matched_as_int(remaining, &bindings[0].name)
+            {
+                self.string_byte_int_only_locals
+                    .insert(bindings[0].name.clone());
             }
             self.lower_statement(stmt)?;
         }
@@ -1046,18 +1104,45 @@ impl<'a> AstLowering<'a> {
                 }
 
                 let mut init_map_gets: Vec<Option<PendingMapGetCall>> = Vec::new();
+                let mut init_queue_methods: Vec<Option<(LocalId, NativeQueueMethod)>> = Vec::new();
+                let mut int_only_byte_flags: Vec<bool> = Vec::with_capacity(bindings.len());
+                for b in bindings {
+                    int_only_byte_flags.push(self.string_byte_int_only_locals.remove(&b.name));
+                }
                 let init_operands = if let Some(inits) = initializer {
                     let mut ops = Vec::with_capacity(inits.len());
                     for (idx, expr) in inits.iter().enumerate() {
-                        let expected_ty = bindings
-                            .get(idx)
-                            .and_then(|b| b.type_annotation.as_ref())
-                            .map(|t| self.mir_type_for_ast(t));
+                        if self.lower_native_queue_intrinsics
+                            && let ExprKind::FieldAccess { object, field } = &expr.kind
+                            && let ExprKind::Identifier(q_name) = &object.kind
+                            && let Some(q_loc) = self.lookup_var(q_name)
+                            && self.native_queue_locals.contains(&q_loc)
+                            && let Some(kind) = match field.as_str() {
+                                "offer" | "try_offer" => Some(NativeQueueMethod::Offer),
+                                "take" | "try_take" => Some(NativeQueueMethod::Take),
+                                _ => None,
+                            }
+                        {
+                            self.last_map_get_call = None;
+                            ops.push(Operand::Copy(Place::Local(q_loc)));
+                            init_map_gets.push(None);
+                            init_queue_methods.push(Some((q_loc, kind)));
+                            continue;
+                        }
+                        let expected_ty = if int_only_byte_flags.get(idx).copied().unwrap_or(false) {
+                            Some(MirType::Array(Box::new(MirType::Int)))
+                        } else {
+                            bindings
+                                .get(idx)
+                                .and_then(|b| b.type_annotation.as_ref())
+                                .map(|t| self.mir_type_for_ast(t))
+                        };
                         self.last_map_get_call = None;
                         let op = self.lower_expr_with_expected(expr, expected_ty.as_ref())?;
                         let pending_mg = self.last_map_get_call.take();
                         ops.push(op);
                         init_map_gets.push(pending_mg);
+                        init_queue_methods.push(None);
                     }
                     ops
                 } else {
@@ -1072,11 +1157,16 @@ impl<'a> AstLowering<'a> {
                     } else {
                         MirType::Int
                     };
-                    let ty = b
-                        .type_annotation
-                        .as_ref()
-                        .map(|t| self.mir_type_for_ast(t))
-                        .unwrap_or(inferred_ty);
+                    let ty = if int_only_byte_flags.get(idx).copied().unwrap_or(false) {
+                        MirType::Array(Box::new(MirType::Int))
+                    } else if init_queue_methods.get(idx).and_then(|x| *x).is_some() {
+                        MirType::Int
+                    } else {
+                        b.type_annotation
+                            .as_ref()
+                            .map(|t| self.mir_type_for_ast(t))
+                            .unwrap_or(inferred_ty)
+                    };
                     // Part A (`sieve.lust`): when an explicitly annotated `Array<T>` local is initialized
                     // with an empty array literal `[]`, specialize the temporary local and its empty
                     // aggregate from `Array(Unknown)` directly to `Array(T)`.
@@ -1101,6 +1191,8 @@ impl<'a> AstLowering<'a> {
                         }
                     }
                     let is_known = b.type_annotation.is_some()
+                        || int_only_byte_flags.get(idx).copied().unwrap_or(false)
+                        || init_queue_methods.get(idx).and_then(|x| *x).is_some()
                         || (ty == MirType::Int
                             && (!has_init || matches!(init_op, Operand::Constant(MirConstant::Int(_)))));
                     let local_id = self.current_fn.add_local(
@@ -1113,8 +1205,18 @@ impl<'a> AstLowering<'a> {
                         self.known_typed_locals.insert(local_id);
                     }
                     self.insert_var(b.name.clone(), local_id);
+                    if let Some(Some((q_loc, kind))) = init_queue_methods.get(idx) {
+                        self.native_queue_methods.insert(b.name.clone(), (*q_loc, *kind));
+                    } else {
+                        self.native_queue_methods.remove(&b.name);
+                    }
 
                     if let Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)) = &init_op {
+                        if self.native_queue_locals.contains(src)
+                            && init_queue_methods.get(idx).and_then(|x| *x).is_none()
+                        {
+                            self.native_queue_locals.insert(local_id);
+                        }
                         if let Some(names) = self.local_field_names.get(src).cloned() {
                             self.local_field_names.insert(local_id, names);
                         }
@@ -1196,6 +1298,13 @@ impl<'a> AstLowering<'a> {
                                 && p.map_local != Some(*mutated_loc)
                                 && p.key_local != Some(*mutated_loc)
                         });
+                        if let ExprKind::Identifier(name) = &target.kind {
+                            self.native_queue_methods.remove(name);
+                        }
+                        if self.native_queue_locals.remove(mutated_loc) {
+                            self.native_queue_methods
+                                .retain(|_, (ql, _)| *ql != *mutated_loc);
+                        }
                     }
                     self.emit_stmt(Statement::Assign(place, Rvalue::Use(rval_op), stmt.span));
                 }
@@ -2311,8 +2420,63 @@ impl<'a> AstLowering<'a> {
                             );
                         }
 
-                        // 2. Primitive runtime type-tag pattern on `LuaValue` / `unknown`:
-                        //    `if lv is Int(v)` / `Float(v)` / `String(v)` / `Bool(v)` (BENCH-NG-09)
+                        // 2a. Specialized scalar `MirType::Int` scrutinee (e.g. `string.byte`
+                        //     specialized from `Array<LuaValue>` to `Array<int>` in `BENCH-NG-09`).
+                        if enum_name.is_empty()
+                            && bindings.len() <= 1
+                            && scrutinee_ty == Some(MirType::Int)
+                        {
+                            match variant.as_str() {
+                                "Int" => {
+                                    let base_place = if let Some(p) = self.lower_place(scrutinee)? {
+                                        p
+                                    } else {
+                                        let op = self.lower_expr(scrutinee)?;
+                                        let tmp = self.current_fn.add_local(
+                                            None,
+                                            MirType::Int,
+                                            true,
+                                            span,
+                                        );
+                                        self.known_typed_locals.insert(tmp);
+                                        self.emit_stmt(Statement::StorageLive(tmp, span));
+                                        self.emit_stmt(Statement::Assign(
+                                            Place::Local(tmp),
+                                            Rvalue::Use(op),
+                                            span,
+                                        ));
+                                        Place::Local(tmp)
+                                    };
+                                    let mut out_bindings = Vec::new();
+                                    if let Some(crate::ast::Pattern::Identifier(bname)) =
+                                        bindings.first()
+                                    {
+                                        out_bindings.push(ConditionBinding::Place {
+                                            name: bname.clone(),
+                                            ty: MirType::Int,
+                                            place: base_place,
+                                            unwrap_option: false,
+                                        });
+                                    }
+                                    return Ok((
+                                        Operand::Constant(MirConstant::Bool(true)),
+                                        out_bindings,
+                                        None,
+                                    ));
+                                }
+                                "Float" | "String" | "Bool" | "Nil" => {
+                                    return Ok((
+                                        Operand::Constant(MirConstant::Bool(false)),
+                                        Vec::new(),
+                                        None,
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        // 2b. Primitive runtime type-tag pattern on `LuaValue` / `unknown`:
+                        //     `if lv is Int(v)` / `Float(v)` / `String(v)` / `Bool(v)` (BENCH-NG-09)
                         let is_dynamic_scrutinee = matches!(
                             scrutinee_ty.as_ref(),
                             None | Some(MirType::Unknown)
@@ -3542,6 +3706,61 @@ impl<'a> AstLowering<'a> {
                 }
             }
             ExprKind::Call { callee, args, .. } => {
+                // Native integer queue lowering (`BENCH-NG-12` / `NG-W16-5`):
+                // Lower `offer(val)` / `take()` (or `q.offer(val)` / `q.take()`) directly to
+                // `queue.offer_int(q, val)` / `queue.take_int(q)` without `MirType::Unknown`.
+                if self.lower_native_queue_intrinsics {
+                    let native_q_call = match &callee.kind {
+                        ExprKind::Identifier(name) => self.native_queue_methods.get(name).copied(),
+                        ExprKind::FieldAccess { object, field } => {
+                            if let ExprKind::Identifier(q_name) = &object.kind
+                                && let Some(q_loc) = self.lookup_var(q_name)
+                                && self.native_queue_locals.contains(&q_loc)
+                            {
+                                match field.as_str() {
+                                    "offer" | "try_offer" => {
+                                        Some((q_loc, NativeQueueMethod::Offer))
+                                    }
+                                    "take" | "try_take" => Some((q_loc, NativeQueueMethod::Take)),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((q_loc, method)) = native_q_call {
+                        let (intrinsic_callee, mut call_args) = match method {
+                            NativeQueueMethod::Offer => (
+                                "queue.offer_int",
+                                vec![Operand::Copy(Place::Local(q_loc))],
+                            ),
+                            NativeQueueMethod::Take => (
+                                "queue.take_int",
+                                vec![Operand::Copy(Place::Local(q_loc))],
+                            ),
+                        };
+                        for a in args {
+                            call_args.push(self.lower_expr(a)?);
+                        }
+                        self.last_map_get_defs.clear();
+                        let temp = self.current_fn.add_local(None, MirType::Int, true, expr.span);
+                        self.known_typed_locals.insert(temp);
+                        let succ_bb = self.current_fn.new_block();
+                        self.emit_stmt(Statement::StorageLive(temp, expr.span));
+                        self.terminate_block(Terminator::Call {
+                            callee: intrinsic_callee.into(),
+                            args: call_args,
+                            destination: Place::Local(temp),
+                            success: succ_bb,
+                            error: None,
+                            span: expr.span,
+                        });
+                        self.current_block = succ_bb;
+                        return Ok(Operand::Move(Place::Local(temp)));
+                    }
+                }
                 // Direct field-call on a local variable (e.g. `q.offer(x)` or `s.cb(x)`):
                 // resolve field access into a named local and invoke it as a dynamic/closure call.
                 if let ExprKind::FieldAccess { object, field } = &callee.kind {
@@ -3715,6 +3934,33 @@ impl<'a> AstLowering<'a> {
                 for a in args {
                     lowered_args.push(self.lower_expr(a)?);
                 }
+                if self.lower_native_queue_intrinsics
+                    && matches!(
+                        callee_name.as_str(),
+                        "Queue" | "sync.Queue" | "@std/sync.Queue"
+                    )
+                {
+                    let cap_op = lowered_args
+                        .into_iter()
+                        .next()
+                        .unwrap_or(Operand::Constant(MirConstant::Int(64)));
+                    self.last_map_get_defs.clear();
+                    let temp = self.current_fn.add_local(None, MirType::Int, true, expr.span);
+                    self.known_typed_locals.insert(temp);
+                    self.native_queue_locals.insert(temp);
+                    let succ_bb = self.current_fn.new_block();
+                    self.emit_stmt(Statement::StorageLive(temp, expr.span));
+                    self.terminate_block(Terminator::Call {
+                        callee: "queue.new".into(),
+                        args: vec![cap_op],
+                        destination: Place::Local(temp),
+                        success: succ_bb,
+                        error: None,
+                        span: expr.span,
+                    });
+                    self.current_block = succ_bb;
+                    return Ok(Operand::Move(Place::Local(temp)));
+                }
                 let is_map_get = callee_name == "map.get" && lowered_args.len() == 2;
                 let map_get_val_ty = if is_map_get {
                     match self.operand_definite_mir_type(&lowered_args[0]) {
@@ -3732,6 +3978,14 @@ impl<'a> AstLowering<'a> {
                 };
                 let (call_ret_ty, mark_known) = if callee_name == "tostring" {
                     (MirType::String, true)
+                } else if callee_name == "string.byte" {
+                    if let Some(MirType::Array(inner)) = expected_ty {
+                        (MirType::Array(inner.clone()), true)
+                    } else if matches!(expected_ty, Some(MirType::Int)) {
+                        (MirType::Int, true)
+                    } else {
+                        (MirType::Int, false)
+                    }
                 } else if matches!(
                     callee_name.as_str(),
                     "Queue" | "sync.Queue" | "@std/sync.Queue"
@@ -4099,12 +4353,14 @@ impl<'a> AstLowering<'a> {
         let enum_defs = self.enum_defs.clone();
         let scalar_enum_layouts = self.scalar_enum_layouts.clone();
 
-        let nested_ops = {
+        let nested_native_q = self.lower_native_queue_intrinsics;
+        let (nested_ops, nested_layouts) = {
             let mut nested = AstLowering::new_with_module_sink(
                 &mut lambda_fn,
                 self.lifted_functions.as_deref_mut(),
                 self.lambda_counter.as_deref_mut(),
             );
+            nested.lower_native_queue_intrinsics = nested_native_q;
             nested.struct_fields = struct_fields;
             nested.struct_field_types = struct_field_types;
             nested.struct_field_substructs = struct_field_substructs;
@@ -4164,8 +4420,15 @@ impl<'a> AstLowering<'a> {
                     }
                 }
             }
-            nested.struct_ops
+            let mut layouts: Vec<MirStructLayout> = nested
+                .struct_layouts
+                .values()
+                .map(MirStructLayout::from)
+                .collect();
+            layouts.sort_by(|a, b| a.type_name.cmp(&b.type_name));
+            (nested.struct_ops, layouts)
         };
+        lambda_fn.struct_layouts = nested_layouts;
 
         self.struct_ops.extend(nested_ops);
         if let Some(lifted) = self.lifted_functions.as_deref_mut() {
@@ -5392,6 +5655,144 @@ fn count_ident_in_stmt(stmt: &Stmt, target: &str) -> usize {
 
 fn stmts_mention_ident(stmts: &[Stmt], target: &str) -> bool {
     stmts.iter().any(|s| count_ident_in_stmt(s, target) > 0)
+}
+
+fn is_lua_value_array_type(ty: &Type) -> bool {
+    matches!(
+        &ty.kind,
+        TypeKind::Array(inner) if matches!(&inner.kind, TypeKind::Named(name) if name == "LuaValue")
+    )
+}
+
+fn is_string_byte_call(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Paren(inner) => is_string_byte_call(inner),
+        ExprKind::Call { callee, .. } => matches!(
+            AstLowering::call_callee_name(callee).as_deref(),
+            Some("string.byte")
+        ),
+        _ => false,
+    }
+}
+
+fn var_only_matched_as_int_in_stmts(stmts: &[Stmt], var_name: &str) -> bool {
+    let mut saw_match = false;
+    for stmt in stmts {
+        if count_ident_in_stmt(stmt, var_name) == 0 {
+            continue;
+        }
+        match &stmt.kind {
+            StmtKind::If {
+                condition,
+                then_block,
+                elseif_branches,
+                else_block,
+            } => {
+                let mut cond = condition;
+                while let ExprKind::Paren(inner) = &cond.kind {
+                    cond = inner;
+                }
+                let ok_cond = matches!(
+                    &cond.kind,
+                    ExprKind::IsPattern {
+                        expr: scrutinee,
+                        pattern: crate::ast::Pattern::Enum { enum_name, variant, bindings },
+                    } if enum_name.is_empty()
+                        && variant == "Int"
+                        && bindings.len() <= 1
+                        && matches!(&scrutinee.kind, ExprKind::Identifier(n) if n == var_name)
+                );
+                if !ok_cond {
+                    return false;
+                }
+                if stmts_mention_ident(then_block, var_name) {
+                    return false;
+                }
+                for (c, b) in elseif_branches {
+                    if count_ident_in_expr(c, var_name) > 0 || stmts_mention_ident(b, var_name) {
+                        return false;
+                    }
+                }
+                if let Some(eb) = else_block
+                    && stmts_mention_ident(eb, var_name)
+                {
+                    return false;
+                }
+                saw_match = true;
+            }
+            _ => return false,
+        }
+    }
+    saw_match
+}
+
+fn array_local_only_matched_as_int(stmts: &[Stmt], arr_name: &str) -> bool {
+    let mut saw_use = false;
+    for stmt in stmts {
+        if count_ident_in_stmt(stmt, arr_name) == 0 {
+            continue;
+        }
+        match &stmt.kind {
+            StmtKind::If {
+                condition,
+                then_block,
+                elseif_branches,
+                else_block,
+            } => {
+                let mut cond = condition;
+                while let ExprKind::Paren(inner) = &cond.kind {
+                    cond = inner;
+                }
+                let ExprKind::IsPattern {
+                    expr: scrutinee,
+                    pattern:
+                        crate::ast::Pattern::Enum {
+                            enum_name,
+                            variant,
+                            bindings,
+                        },
+                } = &cond.kind
+                else {
+                    return false;
+                };
+                if !enum_name.is_empty()
+                    || (variant != "Ok" && variant != "Some")
+                    || bindings.len() != 1
+                {
+                    return false;
+                }
+                let Some((obj, idx_expr)) = AstLowering::extract_index_operands(scrutinee) else {
+                    return false;
+                };
+                if !matches!(&obj.kind, ExprKind::Identifier(n) if n == arr_name)
+                    || count_ident_in_expr(idx_expr, arr_name) > 0
+                {
+                    return false;
+                }
+                let crate::ast::Pattern::Identifier(elem_var) = &bindings[0] else {
+                    return false;
+                };
+                if stmts_mention_ident(then_block, arr_name)
+                    || !var_only_matched_as_int_in_stmts(then_block, elem_var)
+                {
+                    return false;
+                }
+                for (c, b) in elseif_branches {
+                    if count_ident_in_expr(c, arr_name) > 0 || stmts_mention_ident(b, arr_name) {
+                        return false;
+                    }
+                }
+                if let Some(eb) = else_block
+                    && stmts_mention_ident(eb, arr_name)
+                {
+                    return false;
+                }
+                saw_use = true;
+            }
+            _ => return false,
+        }
+    }
+    saw_use
 }
 
 pub fn mir_type_from_ast(ty: &Type) -> MirType {

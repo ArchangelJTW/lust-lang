@@ -228,6 +228,14 @@ impl Compiler {
         format!("(hoist_f:{bits:x})")
     }
 
+    pub(super) fn hoisted_bool_key(value: bool) -> String {
+        format!("(hoist_b:{value})")
+    }
+
+    pub(super) fn hoisted_fn_key(func_idx: usize) -> String {
+        format!("(hoist_fn:{func_idx})")
+    }
+
     pub(super) fn lookup_hoisted_int_const(&self, value: LustInt) -> Option<Register> {
         if !self.has_hoisted_consts_in_scope() {
             return None;
@@ -245,6 +253,161 @@ impl Compiler {
         }
         let key = Self::hoisted_float_key(value.to_bits());
         self.resolve_local(&key).ok()
+    }
+
+    pub(super) fn lookup_hoisted_bool_const(&self, value: bool) -> Option<Register> {
+        if !self.has_hoisted_consts_in_scope() {
+            return None;
+        }
+        let key = Self::hoisted_bool_key(value);
+        self.resolve_local(&key).ok()
+    }
+
+    pub(super) fn lookup_hoisted_fn_const(&self, func_idx: usize) -> Option<Register> {
+        if !self.has_hoisted_consts_in_scope() {
+            return None;
+        }
+        let key = Self::hoisted_fn_key(func_idx);
+        self.resolve_local(&key).ok()
+    }
+
+    pub(super) fn resolve_direct_fn_ident(&self, name: &str) -> Option<usize> {
+        if self.lookup_effect_thunk(name).is_some()
+            || self.resolve_local(name).is_ok()
+            || self.is_module_level_identifier(name)
+        {
+            return None;
+        }
+        let imported_fn = self
+            .current_module
+            .as_ref()
+            .and_then(|module| self.imports_by_module.get(module))
+            .and_then(|imports| imports.function_aliases.get(name).cloned());
+        let lookup_name = imported_fn.as_deref().unwrap_or(name);
+        self.function_table.get(lookup_name).copied()
+    }
+
+    pub(super) fn resolve_static_dispatch_fn(&self, callee: &Expr) -> Option<usize> {
+        let ExprKind::FieldAccess { object, field } = &callee.kind else {
+            return None;
+        };
+        let ExprKind::Identifier(type_name) = &object.kind else {
+            return None;
+        };
+        let is_module_alias = self
+            .current_module
+            .as_ref()
+            .and_then(|module| self.imports_by_module.get(module))
+            .is_some_and(|imports| {
+                imports.module_aliases.contains_key(type_name)
+                    && !self.is_module_level_identifier(type_name)
+            });
+        let is_local = self.resolve_local(type_name).is_ok();
+        if is_local || !(Self::looks_like_type_name(type_name) || is_module_alias) {
+            return None;
+        }
+        let mut alias_candidate = format!("{}.{}", type_name, field);
+        if let Some(module) = &self.current_module
+            && let Some(imports) = self.imports_by_module.get(module)
+            && let Some(real_mod) = imports.module_aliases.get(type_name)
+        {
+            alias_candidate = format!("{}.{}", real_mod, field);
+        }
+        if let Some(&func_idx) = self.function_table.get(&alias_candidate) {
+            return Some(func_idx);
+        }
+        let resolved_type = self.resolve_type_name(type_name);
+        let resolved_candidate = format!("{}.{}", resolved_type, field);
+        if resolved_candidate != alias_candidate
+            && let Some(&func_idx) = self.function_table.get(&resolved_candidate)
+        {
+            return Some(func_idx);
+        }
+        None
+    }
+
+    fn resolve_struct_type_from_typekind(&self, tk: &TypeKind) -> Option<String> {
+        match tk {
+            TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => {
+                Some(self.resolve_type_name(name))
+            }
+            TypeKind::Ref(inner) | TypeKind::MutRef(inner) => {
+                self.resolve_struct_type_from_typekind(&inner.kind)
+            }
+            _ => None,
+        }
+    }
+
+    fn lookup_struct_def_by_name(&self, struct_name: &str) -> Option<&crate::ast::StructDef> {
+        self.struct_defs.get(struct_name).or_else(|| {
+            struct_name
+                .rsplit('.')
+                .next()
+                .and_then(|simple| self.struct_defs.get(simple))
+        })
+    }
+
+    pub(super) fn resolve_expr_struct_type(&self, expr: &Expr) -> Option<String> {
+        let mut cur = expr;
+        while let ExprKind::Paren(inner) = &cur.kind {
+            cur = inner;
+        }
+        match &cur.kind {
+            ExprKind::Identifier(name) => {
+                let reg = self.resolve_local(name).ok()?;
+                if let Some(tk) = self.get_register_type(reg)
+                    && let Some(resolved) = self.resolve_struct_type_from_typekind(tk)
+                    && resolved != "Self"
+                    && self.lookup_struct_def_by_name(&resolved).is_some()
+                {
+                    return Some(resolved);
+                }
+                if name == "self"
+                    && let Some(func) = self.functions.get(self.current_function)
+                    && func.is_method
+                    && let Some((owner, _)) = func.name.rsplit_once(':')
+                {
+                    return Some(self.resolve_type_name(owner));
+                }
+                None
+            }
+            ExprKind::StructLiteral { name, .. } => Some(self.resolve_type_name(name)),
+            ExprKind::FieldAccess { object, field } => {
+                let owner_name = self.resolve_expr_struct_type(object)?;
+                let def = self.lookup_struct_def_by_name(&owner_name)?;
+                let field_def = def.fields.iter().find(|f| f.name == *field)?;
+                self.resolve_struct_type_from_typekind(&field_def.ty.kind)
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn resolve_struct_field_slot(
+        &self,
+        object: &Expr,
+        field: &str,
+    ) -> Option<(u8, TypeKind)> {
+        let struct_name = self.resolve_expr_struct_type(object)?;
+        if struct_name == "LuaTable" || struct_name.ends_with(".LuaTable") {
+            return None;
+        }
+        let def = self.lookup_struct_def_by_name(&struct_name)?;
+        let idx = def.fields.iter().position(|f| f.name == field)?;
+        let slot = u8::try_from(idx).ok()?;
+        Some((slot, def.fields[idx].ty.kind.clone()))
+    }
+
+    pub(super) fn is_side_effect_free_expr(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Literal(_) | ExprKind::Identifier(_) => true,
+            ExprKind::Paren(inner) | ExprKind::Unary { operand: inner, .. } => {
+                Self::is_side_effect_free_expr(inner)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::is_side_effect_free_expr(left) && Self::is_side_effect_free_expr(right)
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn compile_expr(&mut self, expr: &Expr) -> Result<Register> {
@@ -279,6 +442,9 @@ impl Compiler {
                 }
 
                 Literal::Bool(b) => {
+                    if let Some(hoisted_reg) = self.lookup_hoisted_bool_const(*b) {
+                        return Ok(hoisted_reg);
+                    }
                     let reg = self.allocate_register();
                     self.emit(Instruction::LoadBool(reg, *b), 0);
                     Ok(reg)
@@ -318,6 +484,9 @@ impl Compiler {
                 let lookup_name = imported_fn.clone().unwrap_or_else(|| name.clone());
 
                 if let Some(&func_idx) = self.function_table.get(&lookup_name) {
+                    if let Some(hoisted_reg) = self.lookup_hoisted_fn_const(func_idx) {
+                        return Ok(hoisted_reg);
+                    }
                     let reg = self.allocate_register();
                     let const_idx = self.add_constant(Value::Function(func_idx));
                     self.emit(Instruction::LoadConst(reg, const_idx), 0);
@@ -616,9 +785,16 @@ impl Compiler {
 
                         for static_method_name in &candidates {
                             if let Some(&func_idx) = self.function_table.get(static_method_name) {
-                                let func_reg = self.allocate_register();
-                                let const_idx = self.add_constant(Value::Function(func_idx));
-                                self.emit(Instruction::LoadConst(func_reg, const_idx), 0);
+                                let func_reg = if let Some(hoisted_reg) =
+                                    self.lookup_hoisted_fn_const(func_idx)
+                                {
+                                    hoisted_reg
+                                } else {
+                                    let reg = self.allocate_register();
+                                    let const_idx = self.add_constant(Value::Function(func_idx));
+                                    self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                                    reg
+                                };
                                 let first_arg_reg = if args.is_empty() {
                                     0
                                 } else {
@@ -857,10 +1033,15 @@ impl Compiler {
                     return Ok(result_reg);
                 }
 
+                let field_slot = self.resolve_struct_field_slot(object, field).map(|(s, _)| s);
                 let obj_reg = self.compile_expr(object)?;
-                let field_idx = self.add_string_constant(field);
                 let result_reg = self.allocate_register();
-                self.emit(Instruction::GetField(result_reg, obj_reg, field_idx), 0);
+                if let Some(slot_idx) = field_slot {
+                    self.emit(Instruction::GetFieldSlot(result_reg, obj_reg, slot_idx), 0);
+                } else {
+                    let field_idx = self.add_string_constant(field);
+                    self.emit(Instruction::GetField(result_reg, obj_reg, field_idx), 0);
+                }
                 self.free_register(obj_reg);
                 Ok(result_reg)
             }
@@ -1481,9 +1662,14 @@ impl Compiler {
             }
 
             ExprKind::FieldAccess { object, field } => {
+                let field_slot = self.resolve_struct_field_slot(object, field).map(|(s, _)| s);
                 let object_reg = self.compile_expr(object)?;
-                let field_idx = self.add_string_constant(field);
-                self.emit(Instruction::SetField(object_reg, field_idx, value_reg), 0);
+                if let Some(slot_idx) = field_slot {
+                    self.emit(Instruction::SetFieldSlot(object_reg, slot_idx, value_reg), 0);
+                } else {
+                    let field_idx = self.add_string_constant(field);
+                    self.emit(Instruction::SetField(object_reg, field_idx, value_reg), 0);
+                }
                 self.free_register(object_reg);
             }
 

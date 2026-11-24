@@ -209,6 +209,94 @@ pub enum MirAllocationKind {
 #[cfg(feature = "std")]
 const MAX_INTERNED_STRUCT_TYPE_NAMES: usize = 4096;
 
+#[cfg(feature = "std")]
+const SMALL_BUF_POOL_MAX_WORDS: usize = 6;
+#[cfg(feature = "std")]
+const SMALL_BUF_POOL_BUCKET_CAP: usize = 512;
+
+/// Reserved negative handle range for static 1-byte ASCII strings (`0x00..=0x7F`) and `""`.
+/// Handles `ASCII_HANDLE_BASE - (b as i64)` (`-0x4000_0000` down to `-0x4000_007F`) and
+/// `EMPTY_STR_HANDLE` (`-0x4000_0080`) never collide with `interned_list` handles (`-1, -2, ...`)
+/// in either scoped or default `MirContext`, require zero heap allocation, and work across contexts.
+pub(crate) const ASCII_HANDLE_BASE: i64 = -(1i64 << 30);
+pub(crate) const EMPTY_STR_HANDLE: i64 = ASCII_HANDLE_BASE - 128;
+
+/// Reserved negative handle range for per-`MirContext` bounded dynamic short-string interning
+/// (`-0x2000_0000` down to `-0x2000_0FFF`). Cleared on top-level `clear_to_baselines(0, 0)`.
+pub(crate) const DYN_INTERN_BASE: i64 = -(1i64 << 29);
+pub(crate) const DYN_INTERN_CAP: usize = 4096;
+pub(crate) const DYN_INTERN_MAX_BYTES: usize = 64;
+
+#[cfg(feature = "std")]
+const BUMP_SLAB_WORDS: usize = 8192;
+#[cfg(feature = "std")]
+const BUMP_MAX_WORDS: usize = 64;
+
+#[cfg(feature = "std")]
+#[derive(Debug, Clone)]
+struct BumpAllocEntry {
+    word_off: u16,
+    rec: MirAllocationRecord,
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug)]
+struct BumpSlabMeta {
+    base_addr: usize,
+    end_addr: usize,
+    entries: Vec<BumpAllocEntry>,
+}
+
+#[inline(always)]
+pub(crate) fn is_dyn_intern_handle(handle: i64) -> bool {
+    handle <= DYN_INTERN_BASE && handle > DYN_INTERN_BASE - (DYN_INTERN_CAP as i64)
+}
+
+const ASCII_BYTES: [u8; 128] = {
+    let mut arr = [0u8; 128];
+    let mut i = 0;
+    while i < 128 {
+        arr[i] = i as u8;
+        i += 1;
+    }
+    arr
+};
+
+#[inline(always)]
+pub fn ascii_byte_handle(b: u8) -> i64 {
+    debug_assert!(b < 128);
+    ASCII_HANDLE_BASE - (b as i64)
+}
+
+#[inline(always)]
+pub(crate) fn is_ascii_handle(handle: i64) -> bool {
+    handle <= ASCII_HANDLE_BASE && handle > ASCII_HANDLE_BASE - 128
+}
+
+#[inline(always)]
+pub(crate) fn is_static_str_handle(handle: i64) -> bool {
+    handle == EMPTY_STR_HANDLE || is_ascii_handle(handle)
+}
+
+#[inline(always)]
+pub(crate) fn static_str_from_handle(handle: i64) -> Option<&'static str> {
+    if handle == EMPTY_STR_HANDLE {
+        return Some("");
+    }
+    if is_ascii_handle(handle) {
+        let b = (ASCII_HANDLE_BASE - handle) as usize;
+        return core::str::from_utf8(&ASCII_BYTES[b..b + 1]).ok();
+    }
+    None
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub struct MirIntQueue {
+    pub cap: usize,
+    pub items: alloc::collections::VecDeque<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MirAllocationRecord {
     pub base_ptr: *mut i64,
@@ -228,10 +316,15 @@ pub struct MirContextBaseline {
     pub buffers: usize,
 }
 
+#[cfg_attr(feature = "std", repr(C))]
 #[derive(Debug)]
 pub struct MirContext {
     #[cfg(feature = "std")]
-    gas_fast: GasFastState,
+    pub(crate) gas_fast: GasFastState,
+    #[cfg(feature = "std")]
+    pub last_status: LocalCell<i64>,
+    #[cfg(feature = "std")]
+    pub(crate) gas_slow_result: core::cell::Cell<i64>,
     #[cfg(feature = "std")]
     nested_vm_gas_charged: core::cell::Cell<u64>,
     #[cfg(not(feature = "std"))]
@@ -240,8 +333,6 @@ pub struct MirContext {
     pub memory_used: LocalCell<i64>,
     #[cfg(not(feature = "std"))]
     pub memory_used: AtomicI64,
-    #[cfg(feature = "std")]
-    pub last_status: LocalCell<i64>,
     #[cfg(not(feature = "std"))]
     pub last_status: AtomicI64,
     #[cfg(feature = "std")]
@@ -273,6 +364,12 @@ pub struct MirContext {
     #[cfg(feature = "std")]
     pub interned_list: LocalLock<Vec<alloc::string::String>>,
     #[cfg(feature = "std")]
+    interned_rc_list: LocalLock<Vec<alloc::rc::Rc<alloc::string::String>>>,
+    #[cfg(feature = "std")]
+    pub(crate) dyn_interned_map: LocalLock<hashbrown::HashMap<alloc::string::String, i64>>,
+    #[cfg(feature = "std")]
+    pub(crate) dyn_interned_list: LocalLock<Vec<alloc::rc::Rc<alloc::string::String>>>,
+    #[cfg(feature = "std")]
     pub small_digit_handles: [LocalCell<i64>; SMALL_INT_STRING_COUNT],
     #[cfg(feature = "std")]
     pub struct_fields: LocalLock<hashbrown::HashMap<alloc::string::String, Vec<crate::mir::ir::MirType>>>,
@@ -282,6 +379,16 @@ pub struct MirContext {
     last_struct_type_name: core::cell::RefCell<Option<alloc::rc::Rc<str>>>,
     #[cfg(feature = "std")]
     empty_struct_type_name: alloc::rc::Rc<str>,
+    #[cfg(feature = "std")]
+    small_buf_pool: LocalLock<[Vec<Box<[i64]>>; SMALL_BUF_POOL_MAX_WORDS + 1]>,
+    #[cfg(feature = "std")]
+    bump_slabs: LocalLock<Vec<Box<[core::cell::Cell<i64>]>>>,
+    #[cfg(feature = "std")]
+    bump_slab_meta: LocalLock<Vec<BumpSlabMeta>>,
+    #[cfg(feature = "std")]
+    bump_cursor: core::cell::Cell<(usize, usize)>,
+    #[cfg(feature = "std")]
+    native_queues: LocalLock<Vec<MirIntQueue>>,
     #[cfg(feature = "std")]
     dirty_allocations: core::cell::Cell<bool>,
     #[cfg(feature = "std")]
@@ -293,6 +400,13 @@ pub struct MirContext {
     #[cfg(feature = "std")]
     _not_send_sync: core::marker::PhantomData<*const ()>,
 }
+
+#[cfg(feature = "std")]
+const _: () = {
+    assert!(core::mem::offset_of!(MirContext, gas_fast) == 0);
+    assert!(core::mem::offset_of!(MirContext, last_status) == 16);
+    assert!(core::mem::offset_of!(MirContext, gas_slow_result) == 24);
+};
 
 impl Default for MirContext {
     fn default() -> Self {
@@ -312,9 +426,10 @@ impl MirContext {
     pub fn new() -> Self {
         Self {
             gas_fast: GasFastState::new(1_000_000_000),
+            last_status: LocalCell::new(0),
+            gas_slow_result: core::cell::Cell::new(0),
             nested_vm_gas_charged: core::cell::Cell::new(0),
             memory_used: LocalCell::new(0),
-            last_status: LocalCell::new(0),
             max_memory_limit: LocalCell::new(i64::MAX),
             next_alloc_seq: LocalCell::new(1),
             heap_values: LocalLock::new(Vec::new()),
@@ -326,11 +441,19 @@ impl MirContext {
             borrowed_scope_floors: LocalLock::new(Vec::new()),
             interned_strings: LocalLock::new(hashbrown::HashMap::new()),
             interned_list: LocalLock::new(Vec::new()),
+            interned_rc_list: LocalLock::new(Vec::new()),
+            dyn_interned_map: LocalLock::new(hashbrown::HashMap::new()),
+            dyn_interned_list: LocalLock::new(Vec::new()),
             small_digit_handles: [const { LocalCell::new(0) }; SMALL_INT_STRING_COUNT],
             struct_fields: LocalLock::new(hashbrown::HashMap::new()),
             struct_type_names: LocalLock::new(hashbrown::HashSet::new()),
             last_struct_type_name: core::cell::RefCell::new(None),
             empty_struct_type_name: alloc::rc::Rc::from(""),
+            small_buf_pool: LocalLock::new([const { Vec::new() }; SMALL_BUF_POOL_MAX_WORDS + 1]),
+            bump_slabs: LocalLock::new(Vec::new()),
+            bump_slab_meta: LocalLock::new(Vec::new()),
+            bump_cursor: core::cell::Cell::new((0, 0)),
+            native_queues: LocalLock::new(Vec::new()),
             dirty_allocations: core::cell::Cell::new(false),
             dirty_allocations_count: core::cell::Cell::new(0),
             push_grow_slow_calls: core::cell::Cell::new(0),
@@ -395,7 +518,7 @@ impl MirContext {
 
     #[cfg(feature = "std")]
     #[inline(always)]
-    fn mark_dirty_allocation(&self) {
+    pub(crate) fn mark_dirty_allocation(&self) {
         self.dirty_allocations.set(true);
         self.dirty_allocations_count
             .set(self.dirty_allocations_count.get().saturating_add(1));
@@ -437,19 +560,19 @@ impl MirContext {
     }
 
     pub fn memory_used(&self) -> i64 {
-        self.memory_used.load(Ordering::SeqCst)
+        self.memory_used.load(Ordering::Relaxed)
     }
 
     pub fn last_status(&self) -> i64 {
-        self.last_status.load(Ordering::SeqCst)
+        self.last_status.load(Ordering::Relaxed)
     }
 
     pub fn max_memory_limit(&self) -> i64 {
-        self.max_memory_limit.load(Ordering::SeqCst)
+        self.max_memory_limit.load(Ordering::Relaxed)
     }
 
     pub fn set_status(&self, status: i64) {
-        self.last_status.store(status, Ordering::SeqCst);
+        self.last_status.store(status, Ordering::Relaxed);
     }
 
     #[inline]
@@ -460,7 +583,7 @@ impl MirContext {
         }
         #[cfg(not(feature = "std"))]
         {
-            self.gas_remaining.store(gas, Ordering::SeqCst);
+            self.gas_remaining.store(gas, Ordering::Relaxed);
         }
     }
 
@@ -493,24 +616,24 @@ impl MirContext {
                     return chunk;
                 }
                 self.last_status
-                    .store(MIR_STATUS_ERR_OUT_OF_GAS, Ordering::SeqCst);
+                    .store(MIR_STATUS_ERR_OUT_OF_GAS, Ordering::Relaxed);
             }
             rem_st
         }
         #[cfg(not(feature = "std"))]
         {
             loop {
-                let cur = self.gas_remaining.load(Ordering::SeqCst);
+                let cur = self.gas_remaining.load(Ordering::Relaxed);
                 let (rem, overflowed) = cur.overflowing_sub(amt);
                 let rem_st = if overflowed { i64::MIN } else { rem };
                 if self
                     .gas_remaining
-                    .compare_exchange(cur, rem_st, Ordering::SeqCst, Ordering::SeqCst)
+                    .compare_exchange(cur, rem_st, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
                 {
                     if overflowed || rem_st < 0 {
                         self.last_status
-                            .store(MIR_STATUS_ERR_OUT_OF_GAS, Ordering::SeqCst);
+                            .store(MIR_STATUS_ERR_OUT_OF_GAS, Ordering::Relaxed);
                     }
                     return rem_st;
                 }
@@ -521,9 +644,11 @@ impl MirContext {
     #[cfg(feature = "std")]
     #[inline]
     pub(crate) fn gas_fast_ptr(&self) -> *mut GasFastState {
-        // SAFETY: Every field of `GasFastState` is wrapped in `Cell` (`UnsafeCell`),
-        // and Rust never forms `&mut GasFastState` or `&mut i64` references.
-        core::ptr::addr_of!(self.gas_fast) as *mut GasFastState
+        // SAFETY: `MirContext` is `#[repr(C)]` with `gas_fast` at offset 0 and
+        // `last_status` at offset 16. Both are `Cell`-backed (`UnsafeCell`) and
+        // Rust never forms `&mut` references to those fields, keeping JIT loads/stores
+        // structurally free of Stacked-Borrows aliasing conflicts.
+        core::ptr::from_ref(self) as *mut GasFastState
     }
 
     #[cfg(feature = "std")]
@@ -540,11 +665,11 @@ impl MirContext {
     }
 
     pub fn set_memory_used(&self, bytes: i64) {
-        self.memory_used.store(bytes, Ordering::SeqCst);
+        self.memory_used.store(bytes, Ordering::Relaxed);
     }
 
     pub fn set_max_memory_limit(&self, bytes: i64) {
-        self.max_memory_limit.store(bytes, Ordering::SeqCst);
+        self.max_memory_limit.store(bytes, Ordering::Relaxed);
     }
 
     pub fn handle_count(&self) -> usize {
@@ -576,17 +701,198 @@ impl MirContext {
         }
     }
 
+    #[inline]
+    pub fn intern_or_register_str(&self, s: &str) -> i64 {
+        if s.is_empty() {
+            return EMPTY_STR_HANDLE;
+        }
+        let bytes = s.as_bytes();
+        if bytes.len() == 1 && bytes[0] < 128 {
+            return ascii_byte_handle(bytes[0]);
+        }
+        self.register_handle(crate::bytecode::Value::string(s))
+    }
+
+    #[inline]
+    pub fn intern_or_register_string(&self, s: alloc::string::String) -> i64 {
+        if s.is_empty() {
+            return EMPTY_STR_HANDLE;
+        }
+        let bytes = s.as_bytes();
+        if bytes.len() == 1 && bytes[0] < 128 {
+            return ascii_byte_handle(bytes[0]);
+        }
+        self.register_handle(crate::bytecode::Value::string(s))
+    }
+
+    /// Interns short strings (`<= DYN_INTERN_MAX_BYTES`) into the per-context bounded dynamic
+    /// intern table (or reuses an existing compile-time interned literal handle in `self`),
+    /// eliminating repeated `String` + `Rc` heap allocations in hot split/sub pipelines.
+    #[inline]
+    pub fn intern_short_str_or_register(&self, s: &str) -> i64 {
+        if s.is_empty() {
+            return EMPTY_STR_HANDLE;
+        }
+        let bytes = s.as_bytes();
+        if bytes.len() == 1 && bytes[0] < 128 {
+            return ascii_byte_handle(bytes[0]);
+        }
+        #[cfg(feature = "std")]
+        {
+            if bytes.len() <= DYN_INTERN_MAX_BYTES {
+                if let Some(&h) = self.interned_strings.borrow().get(s) {
+                    return h;
+                }
+                if let Some(&h) = self.dyn_interned_map.borrow().get(s) {
+                    return h;
+                }
+                let mut list = self.dyn_interned_list.borrow_mut();
+                if list.len() < DYN_INTERN_CAP {
+                    let owned = alloc::string::ToString::to_string(s);
+                    let idx = list.len();
+                    let h = DYN_INTERN_BASE - (idx as i64);
+                    list.push(alloc::rc::Rc::new(owned.clone()));
+                    self.dyn_interned_map.borrow_mut().insert(owned, h);
+                    self.mark_dirty_allocation();
+                    return h;
+                }
+            }
+        }
+        self.register_handle(crate::bytecode::Value::string(s))
+    }
+
+    #[inline]
+    pub fn tostring_small_int_handle(&self, v: i64) -> Option<i64> {
+        #[cfg(feature = "std")]
+        {
+            if (0..=9).contains(&v) {
+                return Some(ascii_byte_handle(b'0' + (v as u8)));
+            }
+            if (10..SMALL_INT_STRING_COUNT as i64).contains(&v) {
+                let cached = &self.small_digit_handles[v as usize];
+                let existing = cached.get();
+                if existing != 0 {
+                    return Some(existing);
+                }
+                let h = self.intern_string(format_i64_stack(v, &mut [0; 24]));
+                cached.set(h);
+                return Some(h);
+            }
+            None
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = v;
+            None
+        }
+    }
+
+    /// Borrows the `&str` backing `handle` directly in place with zero `String::clone`
+    /// and zero `Rc::new` allocations. Callers must NOT mutate `heap_values` or
+    /// `interned_list` while inside `f`.
+    #[inline]
+    pub fn with_str_handle<R>(&self, handle: i64, f: impl FnOnce(&str) -> R) -> Option<R> {
+        #[cfg(feature = "std")]
+        {
+            if handle < 0 {
+                if let Some(s) = static_str_from_handle(handle) {
+                    return Some(f(s));
+                }
+                if is_dyn_intern_handle(handle) {
+                    let idx = (DYN_INTERN_BASE - handle) as usize;
+                    let list = self.dyn_interned_list.borrow();
+                    return list.get(idx).map(|rc| f(rc.as_str()));
+                }
+                let idx = usize::try_from(handle.unsigned_abs() - 1).ok()?;
+                {
+                    let list = self.interned_list.borrow();
+                    if let Some(s) = list.get(idx) {
+                        return Some(f(s.as_str()));
+                    }
+                }
+                return DEFAULT_MIR_CONTEXT.with(|d| {
+                    let d_list = d.interned_list.borrow();
+                    d_list.get(idx).map(|s| f(s.as_str()))
+                });
+            }
+            if handle <= 0 {
+                return None;
+            }
+            let idx = (handle - 1) as usize;
+            {
+                let hv = self.heap_values.borrow();
+                if let Some(slot) = hv.get(idx) {
+                    return match slot {
+                        Some(crate::bytecode::Value::String(s)) => Some(f(s.as_str())),
+                        Some(_) => None,
+                        None => {
+                            drop(hv);
+                            DEFAULT_MIR_CONTEXT.with(|d| {
+                                let d_hv = d.heap_values.borrow();
+                                match d_hv.get(idx) {
+                                    Some(Some(crate::bytecode::Value::String(s))) => Some(f(s.as_str())),
+                                    _ => None,
+                                }
+                            })
+                        }
+                    };
+                }
+            }
+            DEFAULT_MIR_CONTEXT.with(|d| {
+                let d_hv = d.heap_values.borrow();
+                match d_hv.get(idx) {
+                    Some(Some(crate::bytecode::Value::String(s))) => Some(f(s.as_str())),
+                    _ => None,
+                }
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = (handle, f);
+            None
+        }
+    }
+
+    /// Borrows two `&str` handles simultaneously with zero clones or allocations.
+    #[inline]
+    pub fn with_str_pair<R>(&self, a: i64, b: i64, f: impl FnOnce(&str, &str) -> R) -> Option<R> {
+        self.with_str_handle(a, |sa| self.with_str_handle(b, |sb| f(sa, sb)))
+            .flatten()
+    }
+
     pub fn get_handle(&self, handle: i64) -> Option<crate::bytecode::Value> {
         #[cfg(feature = "std")]
         {
             if handle < 0 {
-                let idx = usize::try_from(handle.unsigned_abs() - 1).ok()?;
-                let list = self.interned_list.borrow();
-                if let Some(s) = list.get(idx) {
-                    return Some(crate::bytecode::Value::string(s.clone()));
+                if let Some(s) = static_str_from_handle(handle) {
+                    return Some(crate::bytecode::Value::string(s));
                 }
-                drop(list);
+                if is_dyn_intern_handle(handle) {
+                    let idx = (DYN_INTERN_BASE - handle) as usize;
+                    let list = self.dyn_interned_list.borrow();
+                    return list
+                        .get(idx)
+                        .map(|rc| crate::bytecode::Value::String(alloc::rc::Rc::clone(rc)));
+                }
+                let idx = usize::try_from(handle.unsigned_abs() - 1).ok()?;
+                {
+                    let rc_list = self.interned_rc_list.borrow();
+                    if let Some(rc) = rc_list.get(idx) {
+                        return Some(crate::bytecode::Value::String(alloc::rc::Rc::clone(rc)));
+                    }
+                }
+                {
+                    let list = self.interned_list.borrow();
+                    if let Some(s) = list.get(idx) {
+                        return Some(crate::bytecode::Value::string(s.clone()));
+                    }
+                }
                 return DEFAULT_MIR_CONTEXT.with(|d| {
+                    let d_rc = d.interned_rc_list.borrow();
+                    if let Some(rc) = d_rc.get(idx) {
+                        return Some(crate::bytecode::Value::String(alloc::rc::Rc::clone(rc)));
+                    }
+                    drop(d_rc);
                     let d_list = d.interned_list.borrow();
                     d_list.get(idx).map(|s| crate::bytecode::Value::string(s.clone()))
                 });
@@ -615,14 +921,24 @@ impl MirContext {
     pub fn intern_string(&self, s: &str) -> i64 {
         #[cfg(feature = "std")]
         {
+            if s.is_empty() {
+                return EMPTY_STR_HANDLE;
+            }
+            let bytes = s.as_bytes();
+            if bytes.len() == 1 && bytes[0] < 128 {
+                return ascii_byte_handle(bytes[0]);
+            }
             let mut map = self.interned_strings.borrow_mut();
             if let Some(&h) = map.get(s) {
                 return h;
             }
+            let owned = alloc::string::ToString::to_string(s);
             let mut list = self.interned_list.borrow_mut();
-            list.push(alloc::string::ToString::to_string(s));
+            let mut rc_list = self.interned_rc_list.borrow_mut();
+            list.push(owned.clone());
+            rc_list.push(alloc::rc::Rc::new(owned.clone()));
             let h = -(list.len() as i64);
-            map.insert(alloc::string::ToString::to_string(s), h);
+            map.insert(owned, h);
             h
         }
         #[cfg(not(feature = "std"))]
@@ -709,51 +1025,195 @@ impl MirContext {
         }
     }
 
-    /// Allocates an owned struct buffer populated directly with `fields`, interning `name`
-    /// and enforcing the exact `SEC-02` memory budget, `try_reserve_exact` + `DropGuard`
-    /// OOM rollback, and `allocation_records` provenance contract.
+    #[cfg(feature = "std")]
     #[inline]
-    pub fn alloc_struct_with_fields(&self, name: &str, fields: &[i64]) -> *mut i64 {
-        if name.is_empty() {
-            self.last_status.store(
-                crate::effect_abi::LUST_STATUS_ERR_GENERIC as i64,
-                Ordering::SeqCst,
-            );
-            return core::ptr::null_mut();
+    fn take_or_alloc_buffer(&self, size: usize) -> Option<Box<[i64]>> {
+        if size <= SMALL_BUF_POOL_MAX_WORDS {
+            let mut pool = self.small_buf_pool.borrow_mut();
+            if let Some(mut recycled) = pool[size].pop() {
+                recycled.fill(0);
+                return Some(recycled);
+            }
         }
-        let count = fields.len();
-        let Some(size) = count.checked_add(2) else {
-            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+        let mut vec = Vec::<i64>::new();
+        if vec.try_reserve_exact(size).is_err() {
+            return None;
+        }
+        vec.resize(size, 0);
+        Some(vec.into_boxed_slice())
+    }
+
+    #[cfg(feature = "std")]
+    #[inline]
+    fn try_bump_alloc(
+        &self,
+        size: usize,
+        header0: i64,
+        header1: i64,
+        payload: Option<&[i64]>,
+        kind: MirAllocationKind,
+    ) -> Result<*mut i64, MirAllocationKind> {
+        if size == 0 || size > BUMP_MAX_WORDS {
+            return Err(kind);
+        }
+        let mut slabs = self.bump_slabs.borrow_mut();
+        let mut metas = self.bump_slab_meta.borrow_mut();
+        let (mut slab_idx, mut word_off) = self.bump_cursor.get();
+        if slabs.is_empty() || word_off + size > BUMP_SLAB_WORDS {
+            if !slabs.is_empty() && slab_idx + 1 < slabs.len() {
+                slab_idx += 1;
+                word_off = 0;
+            } else {
+                let mut v = Vec::<core::cell::Cell<i64>>::new();
+                if v.try_reserve_exact(BUMP_SLAB_WORDS).is_err() {
+                    return Err(kind);
+                }
+                v.resize_with(BUMP_SLAB_WORDS, || core::cell::Cell::new(0));
+                let slab = v.into_boxed_slice();
+                let base_addr = slab[0].as_ptr() as usize;
+                let end_addr = base_addr + BUMP_SLAB_WORDS * core::mem::size_of::<i64>();
+                slabs.push(slab);
+                metas.push(BumpSlabMeta {
+                    base_addr,
+                    end_addr,
+                    entries: Vec::with_capacity(1024),
+                });
+                slab_idx = slabs.len() - 1;
+                word_off = 0;
+            }
+        }
+        let mut bufs = self.allocated_buffers.borrow_mut();
+        if bufs.try_reserve(1).is_err() || metas[slab_idx].entries.try_reserve(1).is_err() {
+            return Err(kind);
+        }
+        let slab = &slabs[slab_idx];
+        slab[word_off].set(header0);
+        if size > 1 {
+            slab[word_off + 1].set(header1);
+        }
+        match payload {
+            Some(elems) => {
+                for (i, &w) in elems.iter().enumerate() {
+                    slab[word_off + 2 + i].set(w);
+                }
+                for i in elems.len()..(size - 2) {
+                    slab[word_off + 2 + i].set(0);
+                }
+            }
+            None => {
+                for i in 2..size {
+                    slab[word_off + i].set(0);
+                }
+            }
+        }
+        let ptr = slab[word_off].as_ptr();
+        let handle_epoch = self.handle_count();
+        let scope_depth = self.scope_alloc_floors.borrow().len();
+        let seq = self.next_alloc_seq.fetch_add(1, Ordering::Relaxed);
+        let buffer_index = bufs.len();
+        bufs.push((ptr, 0));
+        metas[slab_idx].entries.push(BumpAllocEntry {
+            word_off: word_off as u16,
+            rec: MirAllocationRecord {
+                base_ptr: ptr,
+                word_capacity: size,
+                kind,
+                buffer_index,
+                handle_epoch,
+                alloc_seq: seq,
+                is_ctx_owned: true,
+                read_only_borrowed: false,
+                registered_scope_depth: scope_depth,
+            },
+        });
+        self.bump_cursor.set((slab_idx, word_off + size));
+        drop(bufs);
+        drop(metas);
+        drop(slabs);
+        self.mark_dirty_allocation();
+        Ok(ptr)
+    }
+
+    #[cfg(feature = "std")]
+    #[inline]
+    fn lookup_bump_record(&self, ptr_usize: usize) -> Option<MirAllocationRecord> {
+        let metas = self.bump_slab_meta.borrow();
+        for meta in metas.iter().rev() {
+            if ptr_usize >= meta.base_addr && ptr_usize < meta.end_addr {
+                let byte_off = ptr_usize - meta.base_addr;
+                if byte_off % core::mem::size_of::<i64>() != 0 {
+                    return None;
+                }
+                let word_off = (byte_off / core::mem::size_of::<i64>()) as u16;
+                return meta
+                    .entries
+                    .binary_search_by_key(&word_off, |e| e.word_off)
+                    .ok()
+                    .map(|idx| meta.entries[idx].rec.clone());
+            }
+        }
+        None
+    }
+
+    /// Allocates an owned typed MIR array buffer directly populated with `elems` in one pass
+    /// (zero intermediate `Value::Array`, zero per-element `lust_mir_array_set` HashMap lookups),
+    /// enforcing exact `SEC-02` memory limits and `allocation_records` provenance.
+    #[inline]
+    pub fn alloc_array_with_words(&self, elem_ty: crate::mir::ir::MirType, elems: &[i64]) -> *mut i64 {
+        let count = elems.len();
+        let payload_slots = count.max(1);
+        let Some(size) = payload_slots.checked_add(2) else {
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
             return core::ptr::null_mut();
         };
         let Some(bytes_u) = size.checked_mul(core::mem::size_of::<i64>()) else {
-            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
             return core::ptr::null_mut();
         };
         let Ok(bytes_needed) = i64::try_from(bytes_u) else {
-            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
             return core::ptr::null_mut();
         };
-        let limit = self.max_memory_limit.load(Ordering::SeqCst);
-        let prev = self.memory_used.fetch_add(bytes_needed, Ordering::SeqCst);
+        let limit = self.max_memory_limit.load(Ordering::Relaxed);
+        let prev = self.memory_used.fetch_add(bytes_needed, Ordering::Relaxed);
         if prev.saturating_add(bytes_needed) > limit {
-            self.memory_used.fetch_sub(bytes_needed, Ordering::SeqCst);
-            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            self.memory_used.fetch_sub(bytes_needed, Ordering::Relaxed);
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
             return core::ptr::null_mut();
         }
         let mem_rollback = core::mem::DropGuard::new(bytes_needed, |bytes| {
-            self.memory_used.fetch_sub(bytes, Ordering::SeqCst);
+            self.memory_used.fetch_sub(bytes, Ordering::Relaxed);
         });
-        let mut vec = Vec::<i64>::new();
-        if vec.try_reserve_exact(size).is_err() {
-            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+        let kind = MirAllocationKind::Array(elem_ty);
+        #[cfg(feature = "std")]
+        let kind = match self.try_bump_alloc(size, count as i64, count as i64, Some(elems), kind) {
+            Ok(ptr) => {
+                core::mem::DropGuard::dismiss(mem_rollback);
+                return ptr;
+            }
+            Err(k) => k,
+        };
+        #[cfg(feature = "std")]
+        let Some(mut slice) = self.take_or_alloc_buffer(size)
+        else {
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
             return core::ptr::null_mut();
+        };
+        #[cfg(not(feature = "std"))]
+        let mut slice = {
+            let mut vec = Vec::<i64>::new();
+            if vec.try_reserve_exact(size).is_err() {
+                self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
+                return core::ptr::null_mut();
+            }
+            vec.resize(size, 0);
+            vec.into_boxed_slice()
+        };
+        slice[0] = count as i64;
+        slice[1] = count as i64;
+        if count > 0 {
+            slice[2..2 + count].copy_from_slice(elems);
         }
-        vec.push(count as i64);
-        vec.push(count as i64);
-        vec.extend_from_slice(fields);
-        let slice = vec.into_boxed_slice();
-        let kind = MirAllocationKind::Struct(self.intern_struct_type_name(name));
         let ptr = {
             #[cfg(feature = "std")]
             {
@@ -762,10 +1222,119 @@ impl MirContext {
                 let mut bufs = self.allocated_buffers.borrow_mut();
                 let mut records = self.allocation_records.borrow_mut();
                 if bufs.try_reserve(1).is_err() || records.try_reserve(1).is_err() {
-                    self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                    self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
                     return core::ptr::null_mut();
                 }
-                let seq = self.next_alloc_seq.fetch_add(1, Ordering::SeqCst);
+                let seq = self.next_alloc_seq.fetch_add(1, Ordering::Relaxed);
+                let ptr = Box::into_raw(slice) as *mut i64;
+                let buffer_index = bufs.len();
+                bufs.push((ptr, size));
+                records.insert(
+                    ptr as usize,
+                    MirAllocationRecord {
+                        base_ptr: ptr,
+                        word_capacity: size,
+                        kind,
+                        buffer_index,
+                        handle_epoch,
+                        alloc_seq: seq,
+                        is_ctx_owned: true,
+                        read_only_borrowed: false,
+                        registered_scope_depth: scope_depth,
+                    },
+                );
+                drop(records);
+                drop(bufs);
+                self.mark_dirty_allocation();
+                ptr
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                let _ = kind;
+                Box::into_raw(slice) as *mut i64
+            }
+        };
+        core::mem::DropGuard::dismiss(mem_rollback);
+        ptr
+    }
+
+    /// Allocates an owned struct buffer populated directly with `fields`, interning `name`
+    /// and enforcing the exact `SEC-02` memory budget, `try_reserve_exact` + `DropGuard`
+    /// OOM rollback, and `allocation_records` provenance contract.
+    #[inline]
+    pub fn alloc_struct_with_fields(&self, name: &str, fields: &[i64]) -> *mut i64 {
+        if name.is_empty() {
+            self.last_status.store(
+                crate::effect_abi::LUST_STATUS_ERR_GENERIC as i64,
+                Ordering::Relaxed,
+            );
+            return core::ptr::null_mut();
+        }
+        let count = fields.len();
+        let Some(size) = count.checked_add(2) else {
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
+            return core::ptr::null_mut();
+        };
+        let Some(bytes_u) = size.checked_mul(core::mem::size_of::<i64>()) else {
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
+            return core::ptr::null_mut();
+        };
+        let Ok(bytes_needed) = i64::try_from(bytes_u) else {
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
+            return core::ptr::null_mut();
+        };
+        let limit = self.max_memory_limit.load(Ordering::Relaxed);
+        let prev = self.memory_used.fetch_add(bytes_needed, Ordering::Relaxed);
+        if prev.saturating_add(bytes_needed) > limit {
+            self.memory_used.fetch_sub(bytes_needed, Ordering::Relaxed);
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
+            return core::ptr::null_mut();
+        }
+        let mem_rollback = core::mem::DropGuard::new(bytes_needed, |bytes| {
+            self.memory_used.fetch_sub(bytes, Ordering::Relaxed);
+        });
+        let kind = MirAllocationKind::Struct(self.intern_struct_type_name(name));
+        #[cfg(feature = "std")]
+        let kind = match self.try_bump_alloc(size, count as i64, count as i64, Some(fields), kind) {
+            Ok(ptr) => {
+                core::mem::DropGuard::dismiss(mem_rollback);
+                return ptr;
+            }
+            Err(k) => k,
+        };
+        #[cfg(feature = "std")]
+        let Some(mut slice) = self.take_or_alloc_buffer(size)
+        else {
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
+            return core::ptr::null_mut();
+        };
+        #[cfg(not(feature = "std"))]
+        let mut slice = {
+            let mut vec = Vec::<i64>::new();
+            if vec.try_reserve_exact(size).is_err() {
+                self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
+                return core::ptr::null_mut();
+            }
+            vec.resize(size, 0);
+            vec.into_boxed_slice()
+        };
+        slice[0] = count as i64;
+        slice[1] = count as i64;
+        if count > 0 {
+            slice[2..2 + count].copy_from_slice(fields);
+        }
+        let ptr = {
+            #[cfg(feature = "std")]
+            {
+                let handle_epoch = self.handle_count();
+                let scope_depth = self.scope_alloc_floors.borrow().len();
+                let mut bufs = self.allocated_buffers.borrow_mut();
+                let mut records = self.allocation_records.borrow_mut();
+                if bufs.try_reserve(1).is_err() || records.try_reserve(1).is_err() {
+                    self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
+                    return core::ptr::null_mut();
+                }
+                let seq = self.next_alloc_seq.fetch_add(1, Ordering::Relaxed);
                 let ptr = Box::into_raw(slice) as *mut i64;
                 let buffer_index = bufs.len();
                 bufs.push((ptr, size));
@@ -980,8 +1549,10 @@ impl MirContext {
     pub fn get_allocation_record(&self, ptr_usize: usize) -> Option<MirAllocationRecord> {
         #[cfg(feature = "std")]
         {
-            let records = self.allocation_records.borrow();
-            records.get(&ptr_usize).cloned()
+            if let Some(rec) = self.allocation_records.borrow().get(&ptr_usize).cloned() {
+                return Some(rec);
+            }
+            self.lookup_bump_record(ptr_usize)
         }
         #[cfg(not(feature = "std"))]
         {
@@ -1000,15 +1571,17 @@ impl MirContext {
                 .copied()
                 .unwrap_or(0);
             let buf_floor = self.active_buffer_baseline();
-            let records = self.allocation_records.borrow();
-            records
+            let rec_opt = self
+                .allocation_records
+                .borrow()
                 .get(&ptr_usize)
-                .filter(|rec| {
-                    rec.base_ptr as usize == ptr_usize
-                        && rec.alloc_seq >= seq_floor
-                        && (!rec.is_ctx_owned || rec.buffer_index >= buf_floor)
-                })
                 .cloned()
+                .or_else(|| self.lookup_bump_record(ptr_usize));
+            rec_opt.filter(|rec| {
+                rec.base_ptr as usize == ptr_usize
+                    && rec.alloc_seq >= seq_floor
+                    && (!rec.is_ctx_owned || rec.buffer_index >= buf_floor)
+            })
         }
         #[cfg(not(feature = "std"))]
         {
@@ -1091,7 +1664,27 @@ impl MirContext {
                         true
                     }
                 } else {
-                    false
+                    drop(records);
+                    let mut metas = self.bump_slab_meta.borrow_mut();
+                    let mut found = false;
+                    for meta in metas.iter_mut().rev() {
+                        if ptr_usize >= meta.base_addr && ptr_usize < meta.end_addr {
+                            let byte_off = ptr_usize - meta.base_addr;
+                            if byte_off % core::mem::size_of::<i64>() == 0 {
+                                let word_off = (byte_off / core::mem::size_of::<i64>()) as u16;
+                                if let Ok(idx) =
+                                    meta.entries.binary_search_by_key(&word_off, |e| e.word_off)
+                                {
+                                    if !meta.entries[idx].rec.read_only_borrowed {
+                                        meta.entries[idx].rec.kind = kind;
+                                        found = true;
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    found
                 }
             };
             if updated {
@@ -1144,14 +1737,62 @@ impl MirContext {
                 if effective_handles == 0 && start == 0 && scope_depth == 0 {
                     records.clear();
                     self.borrowed_readonly_stack.borrow_mut().clear();
+                    self.native_queues.borrow_mut().clear();
+                    self.dyn_interned_map.borrow_mut().clear();
+                    self.dyn_interned_list.borrow_mut().clear();
+                    {
+                        let mut slabs = self.bump_slabs.borrow_mut();
+                        let mut metas = self.bump_slab_meta.borrow_mut();
+                        if !metas.is_empty() {
+                            metas[0].entries.clear();
+                            metas.truncate(1);
+                            slabs.truncate(1);
+                        }
+                        self.bump_cursor.set((0, 0));
+                    }
                     self.dirty_allocations.set(false);
                     core::mem::take(&mut *bufs)
                 } else {
                     let items: Vec<(*mut i64, usize)> = bufs.drain(start..).collect();
-                    for &(ptr, _) in &items {
+                    let mut had_slab = false;
+                    for &(ptr, cap) in &items {
                         if !ptr.is_null() {
-                            records.remove(&(ptr as usize));
+                            if cap == 0 {
+                                had_slab = true;
+                            } else {
+                                records.remove(&(ptr as usize));
+                            }
                         }
+                    }
+                    if had_slab {
+                        let mut metas = self.bump_slab_meta.borrow_mut();
+                        let mut slabs = self.bump_slabs.borrow_mut();
+                        while let Some(last_meta) = metas.last_mut() {
+                            while let Some(last_entry) = last_meta.entries.last() {
+                                if last_entry.rec.buffer_index >= start {
+                                    last_meta.entries.pop();
+                                } else {
+                                    break;
+                                }
+                            }
+                            if last_meta.entries.is_empty() && metas.len() > 1 {
+                                metas.pop();
+                                slabs.pop();
+                            } else {
+                                break;
+                            }
+                        }
+                        let new_cursor = if let Some(last_meta) = metas.last() {
+                            let slab_idx = metas.len() - 1;
+                            let next_off = last_meta
+                                .entries
+                                .last()
+                                .map_or(0, |e| (e.word_off as usize) + e.rec.word_capacity);
+                            (slab_idx, next_off)
+                        } else {
+                            (0, 0)
+                        };
+                        self.bump_cursor.set(new_cursor);
                     }
                     if scope_depth > 0
                         && baseline_handles <= handle_floor
@@ -1168,17 +1809,26 @@ impl MirContext {
                         && bufs.is_empty()
                         && records.is_empty()
                         && self.borrowed_readonly_stack.borrow().is_empty()
+                        && self.dyn_interned_list.borrow().is_empty()
                     {
                         self.dirty_allocations.set(false);
                     }
                     items
                 }
             };
+            let mut pool = self.small_buf_pool.borrow_mut();
             for (ptr, cap) in drained {
-                if !ptr.is_null() {
-                    unsafe {
+                if !ptr.is_null() && cap > 0 {
+                    let boxed = unsafe {
                         let slice = core::ptr::slice_from_raw_parts_mut(ptr, cap);
-                        drop(Box::from_raw(slice));
+                        Box::from_raw(slice)
+                    };
+                    if cap <= SMALL_BUF_POOL_MAX_WORDS
+                        && pool[cap].len() < SMALL_BUF_POOL_BUCKET_CAP
+                    {
+                        pool[cap].push(boxed);
+                    } else {
+                        drop(boxed);
                     }
                 }
             }
@@ -1219,7 +1869,11 @@ impl MirContext {
                             return false;
                         }
                         let ptr_addr = ptr as usize;
-                        match records.get(&ptr_addr) {
+                        match records
+                            .get(&ptr_addr)
+                            .cloned()
+                            .or_else(|| self.lookup_bump_record(ptr_addr))
+                        {
                             Some(rec) => rec.handle_epoch >= baseline_handles,
                             None => true,
                         }
@@ -1372,7 +2026,7 @@ pub extern "C" fn lust_mir_gas_slow() -> i64 {
             }
         }
         ctx.last_status
-            .store(MIR_STATUS_ERR_OUT_OF_GAS, Ordering::SeqCst);
+            .store(MIR_STATUS_ERR_OUT_OF_GAS, Ordering::Relaxed);
         MIR_STATUS_ERR_OUT_OF_GAS
     })
 }
@@ -1383,7 +2037,7 @@ pub extern "C" fn lust_mir_set_gas(gas: i64) {
         ctx.set_gas_unbounded(false);
         ctx.set_gas(gas);
         if gas >= 0 {
-            ctx.last_status.store(0, Ordering::SeqCst);
+            ctx.last_status.store(0, Ordering::Relaxed);
         }
     });
 }
@@ -1400,17 +2054,17 @@ pub extern "C" fn lust_mir_charge_gas(amt: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_get_status() -> i64 {
-    with_current_mir_context(|ctx| ctx.last_status.load(Ordering::SeqCst))
+    with_current_mir_context(|ctx| ctx.last_status.load(Ordering::Relaxed))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_set_status(status: i64) {
-    with_current_mir_context(|ctx| ctx.last_status.store(status, Ordering::SeqCst));
+    with_current_mir_context(|ctx| ctx.last_status.store(status, Ordering::Relaxed));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_set_max_memory(bytes: i64) {
-    with_current_mir_context(|ctx| ctx.max_memory_limit.store(bytes, Ordering::SeqCst));
+    with_current_mir_context(|ctx| ctx.max_memory_limit.store(bytes, Ordering::Relaxed));
 }
 
 #[unsafe(no_mangle)]
@@ -1420,13 +2074,13 @@ pub extern "C" fn lust_mir_set_memory_limit(bytes: i64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_get_memory_used() -> i64 {
-    with_current_mir_context(|ctx| ctx.memory_used.load(Ordering::SeqCst))
+    with_current_mir_context(|ctx| ctx.memory_used.load(Ordering::Relaxed))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_track_memory_allocated(bytes: i64) -> i64 {
     with_current_mir_context(|ctx| {
-        ctx.memory_used.fetch_add(bytes, Ordering::SeqCst) + bytes
+        ctx.memory_used.fetch_add(bytes, Ordering::Relaxed) + bytes
     })
 }
 
@@ -1490,36 +2144,53 @@ fn alloc_mir_buffer_in_ctx(ctx: &MirContext, len: i64, kind: MirAllocationKind) 
         count
     };
     let Some(size) = payload_slots.checked_add(2) else {
-        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
         return core::ptr::null_mut();
     };
     let Some(bytes_u) = size.checked_mul(core::mem::size_of::<i64>()) else {
-        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
         return core::ptr::null_mut();
     };
     let Ok(bytes_needed) = i64::try_from(bytes_u) else {
-        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
         return core::ptr::null_mut();
     };
-    let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
-    let prev = ctx.memory_used.fetch_add(bytes_needed, Ordering::SeqCst);
+    let limit = ctx.max_memory_limit.load(Ordering::Relaxed);
+    let prev = ctx.memory_used.fetch_add(bytes_needed, Ordering::Relaxed);
     if prev.saturating_add(bytes_needed) > limit {
-        ctx.memory_used.fetch_sub(bytes_needed, Ordering::SeqCst);
-        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+        ctx.memory_used.fetch_sub(bytes_needed, Ordering::Relaxed);
+        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
         return core::ptr::null_mut();
     }
     let mem_rollback = core::mem::DropGuard::new(bytes_needed, |bytes| {
-        ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
+        ctx.memory_used.fetch_sub(bytes, Ordering::Relaxed);
     });
-    let mut vec = Vec::<i64>::new();
-    if vec.try_reserve_exact(size).is_err() {
-        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+    #[cfg(feature = "std")]
+    let kind = match ctx.try_bump_alloc(size, count as i64, count as i64, None, kind) {
+        Ok(ptr) => {
+            core::mem::DropGuard::dismiss(mem_rollback);
+            return ptr;
+        }
+        Err(k) => k,
+    };
+    #[cfg(feature = "std")]
+    let Some(mut slice) = ctx.take_or_alloc_buffer(size)
+    else {
+        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
         return core::ptr::null_mut();
-    }
-    vec.resize(size, 0);
-    vec[0] = count as i64;
-    vec[1] = count as i64;
-    let slice = vec.into_boxed_slice();
+    };
+    #[cfg(not(feature = "std"))]
+    let mut slice = {
+        let mut vec = Vec::<i64>::new();
+        if vec.try_reserve_exact(size).is_err() {
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
+            return core::ptr::null_mut();
+        }
+        vec.resize(size, 0);
+        vec.into_boxed_slice()
+    };
+    slice[0] = count as i64;
+    slice[1] = count as i64;
     let ptr = {
         #[cfg(feature = "std")]
         {
@@ -1528,10 +2199,10 @@ fn alloc_mir_buffer_in_ctx(ctx: &MirContext, len: i64, kind: MirAllocationKind) 
             let mut bufs = ctx.allocated_buffers.borrow_mut();
             let mut records = ctx.allocation_records.borrow_mut();
             if bufs.try_reserve(1).is_err() || records.try_reserve(1).is_err() {
-                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
                 return core::ptr::null_mut();
             }
-            let seq = ctx.next_alloc_seq.fetch_add(1, Ordering::SeqCst);
+            let seq = ctx.next_alloc_seq.fetch_add(1, Ordering::Relaxed);
             let ptr = Box::into_raw(slice) as *mut i64;
             let buffer_index = bufs.len();
             bufs.push((ptr, size));
@@ -2195,9 +2866,7 @@ pub extern "C" fn lust_mir_print_bool_part(x: i64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_print_string_part(handle: i64) {
     with_current_mir_context(|ctx| {
-        if let Some(crate::bytecode::Value::String(s)) = ctx.get_handle(handle) {
-            write_mir_stdout(s.as_str());
-        }
+        ctx.with_str_handle(handle, write_mir_stdout);
     });
 }
 
@@ -2265,38 +2934,36 @@ pub extern "C" fn lust_mir_rem_float(a: f64, b: f64) -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_string_concat(a_handle: i64, b_handle: i64) -> i64 {
     with_current_mir_context(|ctx| {
-        let s1 = match ctx.get_handle(a_handle) {
-            Some(crate::bytecode::Value::String(s)) => s,
-            _ => return 0,
-        };
-        let s2 = match ctx.get_handle(b_handle) {
-            Some(crate::bytecode::Value::String(s)) => s,
-            _ => return 0,
-        };
-        let Some(total_len) = s1.len().checked_add(s2.len()) else {
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
-            return 0;
-        };
-        let Ok(bytes) = i64::try_from(total_len) else {
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
-            return 0;
-        };
-        let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
-        let prev = ctx.memory_used.fetch_add(bytes, Ordering::SeqCst);
-        if prev.saturating_add(bytes) > limit {
-            ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
-            return 0;
+        let joined: Option<Result<alloc::string::String, ()>> = ctx.with_str_pair(a_handle, b_handle, |s1, s2| {
+            let Some(total_len) = s1.len().checked_add(s2.len()) else {
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
+                return Err(());
+            };
+            let Ok(bytes) = i64::try_from(total_len) else {
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
+                return Err(());
+            };
+            let limit = ctx.max_memory_limit.load(Ordering::Relaxed);
+            let prev = ctx.memory_used.fetch_add(bytes, Ordering::Relaxed);
+            if prev.saturating_add(bytes) > limit {
+                ctx.memory_used.fetch_sub(bytes, Ordering::Relaxed);
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
+                return Err(());
+            }
+            let mut res = alloc::string::String::new();
+            if res.try_reserve_exact(total_len).is_err() {
+                ctx.memory_used.fetch_sub(bytes, Ordering::Relaxed);
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
+                return Err(());
+            }
+            res.push_str(s1);
+            res.push_str(s2);
+            Ok(res)
+        });
+        match joined {
+            Some(Ok(res)) => ctx.register_handle(crate::bytecode::Value::string(res)),
+            _ => 0,
         }
-        let mut res = alloc::string::String::new();
-        if res.try_reserve_exact(total_len).is_err() {
-            ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
-            return 0;
-        }
-        res.push_str(s1.as_str());
-        res.push_str(s2.as_str());
-        ctx.register_handle(crate::bytecode::Value::string(res))
     })
 }
 
@@ -2314,6 +2981,7 @@ pub extern "C" fn lust_mir_string_append_inplace(lhs_handle: i64, rhs_handle: i6
     #[cfg(feature = "std")]
     {
         enum RhsBuf {
+            Static(&'static str),
             Inline([u8; 64], usize),
             Heap(alloc::rc::Rc<alloc::string::String>),
             Owned(alloc::string::String),
@@ -2322,6 +2990,7 @@ pub extern "C" fn lust_mir_string_append_inplace(lhs_handle: i64, rhs_handle: i6
             #[inline(always)]
             fn as_str(&self) -> &str {
                 match self {
+                    RhsBuf::Static(s) => s,
                     RhsBuf::Inline(buf, len) => unsafe {
                         core::str::from_utf8_unchecked(&buf[..*len])
                     },
@@ -2333,25 +3002,21 @@ pub extern "C" fn lust_mir_string_append_inplace(lhs_handle: i64, rhs_handle: i6
 
         let need_cow_fallback = with_current_mir_context(|ctx| {
             let rhs_buf = if rhs_handle < 0 {
-                let idx = ((-rhs_handle) - 1) as usize;
-                let mut found: Option<RhsBuf> = None;
-                {
-                    let list = ctx.interned_list.borrow();
-                    if let Some(s) = list.get(idx) {
-                        let b = s.as_bytes();
-                        if b.len() <= 64 {
-                            let mut arr = [0u8; 64];
-                            arr[..b.len()].copy_from_slice(b);
-                            found = Some(RhsBuf::Inline(arr, b.len()));
-                        } else {
-                            found = Some(RhsBuf::Owned(s.clone()));
-                        }
+                if let Some(s) = static_str_from_handle(rhs_handle) {
+                    RhsBuf::Static(s)
+                } else if is_dyn_intern_handle(rhs_handle) {
+                    let idx = (DYN_INTERN_BASE - rhs_handle) as usize;
+                    let list = ctx.dyn_interned_list.borrow();
+                    match list.get(idx) {
+                        Some(rc) => RhsBuf::Heap(alloc::rc::Rc::clone(rc)),
+                        None => return Some(0),
                     }
-                }
-                if found.is_none() {
-                    DEFAULT_MIR_CONTEXT.with(|d| {
-                        let d_list = d.interned_list.borrow();
-                        if let Some(s) = d_list.get(idx) {
+                } else {
+                    let idx = ((-rhs_handle) - 1) as usize;
+                    let mut found: Option<RhsBuf> = None;
+                    {
+                        let list = ctx.interned_list.borrow();
+                        if let Some(s) = list.get(idx) {
                             let b = s.as_bytes();
                             if b.len() <= 64 {
                                 let mut arr = [0u8; 64];
@@ -2361,11 +3026,26 @@ pub extern "C" fn lust_mir_string_append_inplace(lhs_handle: i64, rhs_handle: i6
                                 found = Some(RhsBuf::Owned(s.clone()));
                             }
                         }
-                    });
-                }
-                match found {
-                    Some(rb) => rb,
-                    None => return Some(0),
+                    }
+                    if found.is_none() {
+                        DEFAULT_MIR_CONTEXT.with(|d| {
+                            let d_list = d.interned_list.borrow();
+                            if let Some(s) = d_list.get(idx) {
+                                let b = s.as_bytes();
+                                if b.len() <= 64 {
+                                    let mut arr = [0u8; 64];
+                                    arr[..b.len()].copy_from_slice(b);
+                                    found = Some(RhsBuf::Inline(arr, b.len()));
+                                } else {
+                                    found = Some(RhsBuf::Owned(s.clone()));
+                                }
+                            }
+                        });
+                    }
+                    match found {
+                        Some(rb) => rb,
+                        None => return Some(0),
+                    }
                 }
             } else {
                 match ctx.get_handle(rhs_handle) {
@@ -2381,19 +3061,19 @@ pub extern "C" fn lust_mir_string_append_inplace(lhs_handle: i64, rhs_handle: i6
                 if alloc::rc::Rc::strong_count(lhs_rc) == 1 {
                     if let Some(lhs_str) = alloc::rc::Rc::get_mut(lhs_rc) {
                         let Ok(rhs_bytes) = i64::try_from(rhs_str.len()) else {
-                            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
                             return Some(0);
                         };
-                        let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
-                        let prev = ctx.memory_used.fetch_add(rhs_bytes, Ordering::SeqCst);
+                        let limit = ctx.max_memory_limit.load(Ordering::Relaxed);
+                        let prev = ctx.memory_used.fetch_add(rhs_bytes, Ordering::Relaxed);
                         if prev.saturating_add(rhs_bytes) > limit {
-                            ctx.memory_used.fetch_sub(rhs_bytes, Ordering::SeqCst);
-                            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                            ctx.memory_used.fetch_sub(rhs_bytes, Ordering::Relaxed);
+                            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
                             return Some(0);
                         }
                         if lhs_str.try_reserve(rhs_str.len()).is_err() {
-                            ctx.memory_used.fetch_sub(rhs_bytes, Ordering::SeqCst);
-                            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                            ctx.memory_used.fetch_sub(rhs_bytes, Ordering::Relaxed);
+                            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
                             return Some(0);
                         }
                         lhs_str.push_str(rhs_str);
@@ -2436,7 +3116,94 @@ pub(crate) fn format_i64_stack(value: i64, buf: &mut [u8; 24]) -> &str {
     core::str::from_utf8(&buf[start..]).expect("integer formatting produces ASCII")
 }
 
-fn charge_handle_bytes(ctx: &MirContext, bytes: usize) -> bool {
+#[cfg(feature = "std")]
+pub(crate) enum MirStrSource {
+    Static(&'static str),
+    Heap(alloc::rc::Rc<alloc::string::String>),
+}
+
+#[cfg(feature = "std")]
+impl MirStrSource {
+    #[inline(always)]
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            MirStrSource::Static(s) => s,
+            MirStrSource::Heap(rc) => rc.as_str(),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl MirContext {
+    /// Resolves a string handle into an owned zero-copy handle (`&'static str` or `Rc<String>`)
+    /// without holding any `RefCell` borrow afterward, allowing callers to safely mutate
+    /// `heap_values` while iterating over the string contents.
+    #[inline]
+    pub(crate) fn resolve_str_source(&self, handle: i64) -> Option<MirStrSource> {
+        if handle < 0 {
+            if let Some(s) = static_str_from_handle(handle) {
+                return Some(MirStrSource::Static(s));
+            }
+            if is_dyn_intern_handle(handle) {
+                let idx = (DYN_INTERN_BASE - handle) as usize;
+                let list = self.dyn_interned_list.borrow();
+                return list
+                    .get(idx)
+                    .map(|rc| MirStrSource::Heap(alloc::rc::Rc::clone(rc)));
+            }
+            let idx = usize::try_from(handle.unsigned_abs() - 1).ok()?;
+            {
+                let rc_list = self.interned_rc_list.borrow();
+                if let Some(rc) = rc_list.get(idx) {
+                    return Some(MirStrSource::Heap(alloc::rc::Rc::clone(rc)));
+                }
+            }
+            return DEFAULT_MIR_CONTEXT.with(|d| {
+                let d_rc = d.interned_rc_list.borrow();
+                d_rc.get(idx)
+                    .map(|rc| MirStrSource::Heap(alloc::rc::Rc::clone(rc)))
+            });
+        }
+        if handle <= 0 {
+            return None;
+        }
+        let idx = (handle - 1) as usize;
+        {
+            let hv = self.heap_values.borrow();
+            if let Some(slot) = hv.get(idx) {
+                return match slot {
+                    Some(crate::bytecode::Value::String(rc)) => {
+                        Some(MirStrSource::Heap(alloc::rc::Rc::clone(rc)))
+                    }
+                    Some(_) => None,
+                    None => {
+                        drop(hv);
+                        DEFAULT_MIR_CONTEXT.with(|d| {
+                            let d_hv = d.heap_values.borrow();
+                            match d_hv.get(idx) {
+                                Some(Some(crate::bytecode::Value::String(rc))) => {
+                                    Some(MirStrSource::Heap(alloc::rc::Rc::clone(rc)))
+                                }
+                                _ => None,
+                            }
+                        })
+                    }
+                };
+            }
+        }
+        DEFAULT_MIR_CONTEXT.with(|d| {
+            let d_hv = d.heap_values.borrow();
+            match d_hv.get(idx) {
+                Some(Some(crate::bytecode::Value::String(rc))) => {
+                    Some(MirStrSource::Heap(alloc::rc::Rc::clone(rc)))
+                }
+                _ => None,
+            }
+        })
+    }
+}
+
+pub(crate) fn charge_handle_bytes(ctx: &MirContext, bytes: usize) -> bool {
     if let Ok(bytes) = i64::try_from(bytes)
         && let Some(total) = ctx.memory_used().checked_add(bytes)
         && total <= ctx.max_memory_limit()
@@ -2461,11 +3228,9 @@ pub extern "C" fn lust_mir_tostring_int(v: i64) -> i64 {
             if !charge_handle_bytes(ctx, digits) {
                 return 0;
             }
-            let cached = &ctx.small_digit_handles[v as usize];
-            if cached.get() == 0 {
-                cached.set(ctx.intern_string(format_i64_stack(v, &mut [0; 24])));
+            if let Some(h) = ctx.tostring_small_int_handle(v) {
+                return h;
             }
-            return cached.get();
         }
         let mut buffer = [0; 24];
         let text = format_i64_stack(v, &mut buffer);
@@ -2481,14 +3246,14 @@ pub extern "C" fn lust_mir_tostring_float(v: f64) -> i64 {
     with_current_mir_context(|ctx| {
         let s = alloc::format!("{}", crate::bytecode::Value::Float(v));
         let Ok(bytes) = i64::try_from(s.len()) else {
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
             return 0;
         };
-        let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
-        let prev = ctx.memory_used.fetch_add(bytes, Ordering::SeqCst);
+        let limit = ctx.max_memory_limit.load(Ordering::Relaxed);
+        let prev = ctx.memory_used.fetch_add(bytes, Ordering::Relaxed);
         if prev.saturating_add(bytes) > limit {
-            ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            ctx.memory_used.fetch_sub(bytes, Ordering::Relaxed);
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
             return 0;
         }
         ctx.register_handle(crate::bytecode::Value::string(s))
@@ -2500,11 +3265,11 @@ pub extern "C" fn lust_mir_tostring_bool(v: i64) -> i64 {
     with_current_mir_context(|ctx| {
         let s = if v != 0 { "true" } else { "false" };
         let bytes = s.len() as i64;
-        let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
-        let prev = ctx.memory_used.fetch_add(bytes, Ordering::SeqCst);
+        let limit = ctx.max_memory_limit.load(Ordering::Relaxed);
+        let prev = ctx.memory_used.fetch_add(bytes, Ordering::Relaxed);
         if prev.saturating_add(bytes) > limit {
-            ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            ctx.memory_used.fetch_sub(bytes, Ordering::Relaxed);
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
             return 0;
         }
         ctx.intern_string(s)
@@ -2513,37 +3278,27 @@ pub extern "C" fn lust_mir_tostring_bool(v: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_string_eq(a_handle: i64, b_handle: i64) -> i64 {
+    // Fast path for static 1-byte ASCII & empty string handles: zero TLS, zero RefCell, zero allocs.
+    if is_static_str_handle(a_handle) && is_static_str_handle(b_handle) {
+        return i64::from(a_handle == b_handle);
+    }
     with_current_mir_context(|ctx| {
-        let s1 = match ctx.get_handle(a_handle) {
-            Some(crate::bytecode::Value::String(s)) => s,
-            _ => return 0,
-        };
-        let s2 = match ctx.get_handle(b_handle) {
-            Some(crate::bytecode::Value::String(s)) => s,
-            _ => return 0,
-        };
-        if *s1 == *s2 { 1 } else { 0 }
+        ctx.with_str_pair(a_handle, b_handle, |s1, s2| i64::from(s1 == s2))
+            .unwrap_or(0)
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_string_len(handle: i64) -> i64 {
-    with_current_mir_context(|ctx| {
-        match ctx.get_handle(handle) {
-            Some(crate::bytecode::Value::String(s)) => s.len() as i64,
-            _ => 0,
-        }
-    })
-}
-
-fn string_handle(ctx: &MirContext, handle: i64) -> Option<alloc::rc::Rc<alloc::string::String>> {
-    match ctx.get_handle(handle) {
-        Some(Value::String(text)) => Some(text),
-        _ => {
-            ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
-            None
-        }
+    if handle == EMPTY_STR_HANDLE {
+        return 0;
     }
+    if is_ascii_handle(handle) {
+        return 1;
+    }
+    with_current_mir_context(|ctx| {
+        ctx.with_str_handle(handle, |s| s.len() as i64).unwrap_or(0)
+    })
 }
 
 fn register_string_results(ctx: &MirContext, values: Vec<Value>) -> i64 {
@@ -2560,40 +3315,94 @@ fn register_string_results(ctx: &MirContext, values: Vec<Value>) -> i64 {
 // Native helper calls use the active MIR context guard. The leading context
 // operand is reserved by the call ABI and is never dereferenced.
 pub extern "C" fn lust_mir_string_sub(_vm_ctx: i64, handle: i64, start: i64, end: i64) -> i64 {
+    enum SubPiece {
+        Static(i64, usize),
+        ShortInline([u8; DYN_INTERN_MAX_BYTES], usize),
+        Owned(alloc::string::String),
+    }
     with_current_mir_context(|ctx| {
-        let Some(text) = string_handle(ctx, handle) else {
+        let piece = ctx.with_str_handle(handle, |text| {
+            let tbytes = text.as_bytes();
+            if start == end && start >= 1 {
+                let idx = (start - 1) as usize;
+                if idx < tbytes.len() && tbytes[idx] < 128 {
+                    return SubPiece::Static(ascii_byte_handle(tbytes[idx]), 1);
+                }
+            }
+            let slice = string_sub_slice(text, start, Some(end));
+            let bytes = slice.as_bytes();
+            if bytes.is_empty() {
+                SubPiece::Static(EMPTY_STR_HANDLE, 0)
+            } else if bytes.len() == 1 && bytes[0] < 128 {
+                SubPiece::Static(ascii_byte_handle(bytes[0]), 1)
+            } else if bytes.len() <= DYN_INTERN_MAX_BYTES {
+                let mut buf = [0u8; DYN_INTERN_MAX_BYTES];
+                buf[..bytes.len()].copy_from_slice(bytes);
+                SubPiece::ShortInline(buf, bytes.len())
+            } else {
+                SubPiece::Owned(slice.into_owned())
+            }
+        });
+        let Some(piece) = piece else {
+            ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
             return 0;
         };
-        let slice = string_sub_slice(&text, start, Some(end));
-        if !charge_handle_bytes(ctx, slice.len()) {
-            return 0;
+        match piece {
+            SubPiece::Static(static_h, len) => {
+                if !charge_handle_bytes(ctx, len) {
+                    return 0;
+                }
+                static_h
+            }
+            SubPiece::ShortInline(buf, len) => {
+                if !charge_handle_bytes(ctx, len) {
+                    return 0;
+                }
+                let Ok(s) = core::str::from_utf8(&buf[..len]) else {
+                    ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                    return 0;
+                };
+                ctx.intern_short_str_or_register(s)
+            }
+            SubPiece::Owned(owned) => {
+                if !charge_handle_bytes(ctx, owned.len()) {
+                    return 0;
+                }
+                ctx.register_handle(Value::string(owned))
+            }
         }
-        ctx.register_handle(Value::string(slice))
     })
 }
 
 /// Returns an array of byte values. An empty range returns a single nil.
 pub extern "C" fn lust_mir_string_byte(_vm_ctx: i64, handle: i64, start: i64, end: i64) -> i64 {
     with_current_mir_context(|ctx| {
-        let Some(text) = string_handle(ctx, handle) else {
+        let Some(values) = ctx.with_str_handle(handle, |text| string_byte_values(text, start, Some(end))) else {
+            ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
             return 0;
         };
-        register_string_results(ctx, string_byte_values(&text, start, Some(end)))
+        register_string_results(ctx, values)
     })
 }
 
 /// Scalar byte lookup for a call that requires an integer result.
 pub extern "C" fn lust_mir_string_byte_at(_vm_ctx: i64, handle: i64, index: i64) -> i64 {
     with_current_mir_context(|ctx| {
-        let Some(text) = string_handle(ctx, handle) else {
-            return 0;
-        };
-        let (start, end) = normalize_range(index, Some(index), text.len());
-        if start == end {
-            ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
-            return 0;
+        let res = ctx.with_str_handle(handle, |text| {
+            let (start, end) = normalize_range(index, Some(index), text.len());
+            if start == end {
+                None
+            } else {
+                Some(i64::from(text.as_bytes()[start]))
+            }
+        });
+        match res {
+            Some(Some(b)) => b,
+            _ => {
+                ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                0
+            }
         }
-        i64::from(text.as_bytes()[start])
     })
 }
 
@@ -2604,20 +3413,14 @@ pub extern "C" fn lust_mir_string_gsub(
     replacement: i64,
 ) -> i64 {
     with_current_mir_context(|ctx| {
-        let Some(text) = string_handle(ctx, handle) else {
-            return 0;
-        };
-        let Some(pattern) = string_handle(ctx, pattern) else {
-            return 0;
-        };
-        let Some(replacement) = string_handle(ctx, replacement) else {
-            return 0;
-        };
-        match string_gsub_fast(&text, &pattern, &replacement) {
-            Ok((output, count)) => {
+        let res = ctx.with_str_pair(handle, pattern, |text, pat| {
+            ctx.with_str_handle(replacement, |repl| string_gsub_fast(text, pat, repl))
+        });
+        match res.flatten() {
+            Some(Ok((output, count))) => {
                 register_string_results(ctx, alloc::vec![Value::string(output), Value::Int(count)])
             }
-            Err(_) => {
+            _ => {
                 ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
                 0
             }
@@ -2634,15 +3437,12 @@ pub extern "C" fn lust_mir_string_find(
     plain: i64,
 ) -> i64 {
     with_current_mir_context(|ctx| {
-        let Some(text) = string_handle(ctx, handle) else {
-            return 0;
-        };
-        let Some(pattern) = string_handle(ctx, pattern) else {
-            return 0;
-        };
-        match string_find_values(&text, &pattern, start, plain != 0) {
-            Ok(values) => register_string_results(ctx, values),
-            Err(_) => {
+        let res = ctx.with_str_pair(handle, pattern, |text, pat| {
+            string_find_values(text, pat, start, plain != 0)
+        });
+        match res {
+            Some(Ok(values)) => register_string_results(ctx, values),
+            _ => {
                 ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
                 0
             }
@@ -2652,13 +3452,11 @@ pub extern "C" fn lust_mir_string_find(
 
 pub extern "C" fn lust_mir_string_split(_vm_ctx: i64, handle: i64, separator: i64) -> i64 {
     with_current_mir_context(|ctx| {
-        let Some(text) = string_handle(ctx, handle) else {
+        let Some(values) = ctx.with_str_pair(handle, separator, string_split_values) else {
+            ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
             return 0;
         };
-        let Some(separator) = string_handle(ctx, separator) else {
-            return 0;
-        };
-        register_string_results(ctx, string_split_values(&text, &separator))
+        register_string_results(ctx, values)
     })
 }
 
@@ -2666,11 +3464,11 @@ pub extern "C" fn lust_mir_string_split(_vm_ctx: i64, handle: i64, separator: i6
 pub extern "C" fn lust_mir_alloc_map() -> i64 {
     with_current_mir_context(|ctx| {
         let bytes = 64;
-        let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
-        let prev = ctx.memory_used.fetch_add(bytes, Ordering::SeqCst);
+        let limit = ctx.max_memory_limit.load(Ordering::Relaxed);
+        let prev = ctx.memory_used.fetch_add(bytes, Ordering::Relaxed);
         if prev.saturating_add(bytes) > limit {
-            ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            ctx.memory_used.fetch_sub(bytes, Ordering::Relaxed);
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::Relaxed);
             return 0;
         }
         ctx.register_handle(crate::bytecode::Value::map(crate::bytecode::LustMap::default()))
@@ -2740,6 +3538,73 @@ fn set_map_entry(ctx: &MirContext, map: &mut crate::bytecode::LustMap, key: Valu
     }
 }
 
+/// Borrowed `&str` key equivalent to `ValueKey(Value::String(_))` for zero-clone `LustMap` lookups.
+struct BorrowedStrKey<'a>(&'a str);
+
+impl core::hash::Hash for BorrowedStrKey<'_> {
+    #[inline(always)]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        4u8.hash(state);
+        self.0.hash(state);
+    }
+}
+
+impl hashbrown::Equivalent<ValueKey> for BorrowedStrKey<'_> {
+    #[inline(always)]
+    fn equivalent(&self, key: &ValueKey) -> bool {
+        match key.owned_values().1 {
+            Value::String(s) => s.as_str() == self.0,
+            Value::Enum(obj) if obj.enum_name == "LuaValue" && obj.variant == "String" => {
+                obj.values
+                    .as_ref()
+                    .and_then(|v| v.first())
+                    .and_then(|v| v.as_string())
+                    == Some(self.0)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn with_map_ref<R>(
+    ctx: &MirContext,
+    map_handle: i64,
+    f: impl FnOnce(&core::cell::RefCell<crate::bytecode::LustMap>) -> R,
+) -> Option<R> {
+    if map_handle <= 0 {
+        return None;
+    }
+    let idx = (map_handle - 1) as usize;
+    {
+        let hv = ctx.heap_values.borrow();
+        if let Some(slot) = hv.get(idx) {
+            return match slot {
+                Some(Value::Map(m)) => Some(f(m)),
+                Some(_) => None,
+                None => {
+                    drop(hv);
+                    DEFAULT_MIR_CONTEXT.with(|d| {
+                        let d_hv = d.heap_values.borrow();
+                        match d_hv.get(idx) {
+                            Some(Some(Value::Map(m))) => Some(f(m)),
+                            _ => None,
+                        }
+                    })
+                }
+            };
+        }
+    }
+    DEFAULT_MIR_CONTEXT.with(|d| {
+        let d_hv = d.heap_values.borrow();
+        match d_hv.get(idx) {
+            Some(Some(Value::Map(m))) => Some(f(m)),
+            _ => None,
+        }
+    })
+}
+
 fn decode_map_operand(ctx: &MirContext, raw: i64, tag: i64) -> Option<Value> {
     let value = match tag {
         0 => Some(Value::Int(raw)),
@@ -2779,13 +3644,77 @@ pub extern "C" fn lust_mir_map_set_typed(
     key_tag: i64,
     val_tag: i64,
 ) -> i64 {
-    with_typed_map(map_handle, key_raw, key_tag, |ctx, map, key| {
-        if let Some(value) = decode_map_operand(ctx, val_raw, val_tag) {
-            set_map_entry(ctx, &mut map.borrow_mut(), key, value);
-        }
-        ctx.last_status()
-    })
-    .unwrap_or(MIR_STATUS_ERR_OUT_OF_BOUNDS)
+    #[cfg(feature = "std")]
+    {
+        with_current_mir_context(|ctx| {
+            // Fast path for occupied string-key updates (zero ValueKey/String/Rc clone)
+            if key_tag == 3 && val_tag <= 2 {
+                let value = match val_tag {
+                    0 => Value::Int(val_raw),
+                    1 => Value::Bool(val_raw != 0),
+                    _ => Value::Float(f64::from_bits(val_raw as u64)),
+                };
+                if let Some(updated) = with_map_ref(ctx, map_handle, |map| {
+                    ctx.with_str_handle(key_raw, |key_str| {
+                        let mut m = map.borrow_mut();
+                        if let Some(slot) = m.get_mut(&BorrowedStrKey(key_str)) {
+                            *slot = value.clone();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                }) {
+                    if updated == Some(true) {
+                        return ctx.last_status();
+                    }
+                }
+            }
+            // Fast path for int/bool/float keys without cloning Rc<RefCell<LustMap>>
+            if key_tag <= 2 && val_tag <= 2 {
+                let key = match key_tag {
+                    0 => ValueKey::from(Value::Int(key_raw)),
+                    1 => ValueKey::from(Value::Bool(key_raw != 0)),
+                    _ => ValueKey::from(Value::Float(f64::from_bits(key_raw as u64))),
+                };
+                let value = match val_tag {
+                    0 => Value::Int(val_raw),
+                    1 => Value::Bool(val_raw != 0),
+                    _ => Value::Float(f64::from_bits(val_raw as u64)),
+                };
+                if with_map_ref(ctx, map_handle, |map| {
+                    set_map_entry(ctx, &mut map.borrow_mut(), key, value);
+                })
+                .is_some()
+                {
+                    return ctx.last_status();
+                }
+                ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                return MIR_STATUS_ERR_OUT_OF_BOUNDS;
+            }
+            let Some(Value::Map(map)) = ctx.get_handle(map_handle) else {
+                ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                return MIR_STATUS_ERR_OUT_OF_BOUNDS;
+            };
+            let Some(key_val) = decode_map_operand(ctx, key_raw, key_tag) else {
+                return MIR_STATUS_ERR_OUT_OF_BOUNDS;
+            };
+            if let Some(value) = decode_map_operand(ctx, val_raw, val_tag) {
+                set_map_entry(ctx, &mut map.borrow_mut(), ValueKey::from(key_val), value);
+            }
+            ctx.last_status()
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        with_typed_map(map_handle, key_raw, key_tag, |ctx, map, key| {
+            if let Some(value) = decode_map_operand(ctx, val_raw, val_tag) {
+                set_map_entry(ctx, &mut map.borrow_mut(), key, value);
+            }
+            ctx.last_status()
+        })
+        .unwrap_or(MIR_STATUS_ERR_OUT_OF_BOUNDS)
+    }
 }
 
 pub extern "C" fn lust_mir_map_get_typed(
@@ -2794,6 +3723,23 @@ pub extern "C" fn lust_mir_map_get_typed(
     key_raw: i64,
     key_tag: i64,
 ) -> i64 {
+    #[cfg(feature = "std")]
+    if key_tag == 3 {
+        let found: Option<Option<Value>> = with_current_mir_context(|ctx| {
+            with_map_ref(ctx, map_handle, |map| {
+                ctx.with_str_handle(key_raw, |key_str| {
+                    map.borrow().get(&BorrowedStrKey(key_str)).cloned()
+                })
+            })
+            .flatten()
+        });
+        if let Some(val_opt) = found {
+            return match val_opt {
+                Some(v) => with_current_mir_context(|ctx| ctx.register_handle(Value::some(v))),
+                None => 0,
+            };
+        }
+    }
     with_typed_map(map_handle, key_raw, key_tag, |ctx, map, key| {
         map.borrow()
             .get(&key)
@@ -2808,6 +3754,39 @@ pub extern "C" fn lust_mir_map_has_typed(
     key_raw: i64,
     key_tag: i64,
 ) -> i64 {
+    #[cfg(feature = "std")]
+    {
+        if key_tag == 3 {
+            let found = with_current_mir_context(|ctx| {
+                with_map_ref(ctx, map_handle, |map| {
+                    ctx.with_str_handle(key_raw, |key_str| {
+                        i64::from(map.borrow().contains_key(&BorrowedStrKey(key_str)))
+                    })
+                })
+                .flatten()
+            });
+            if let Some(v) = found {
+                return v;
+            }
+        } else if key_tag <= 2 {
+            let key = match key_tag {
+                0 => ValueKey::from(Value::Int(key_raw)),
+                1 => ValueKey::from(Value::Bool(key_raw != 0)),
+                _ => ValueKey::from(Value::Float(f64::from_bits(key_raw as u64))),
+            };
+            return with_current_mir_context(|ctx| {
+                match with_map_ref(ctx, map_handle, |map| {
+                    i64::from(map.borrow().contains_key(&key))
+                }) {
+                    Some(v) => v,
+                    None => {
+                        ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                        0
+                    }
+                }
+            });
+        }
+    }
     with_typed_map(map_handle, key_raw, key_tag, |_, map, key| {
         i64::from(map.borrow().contains_key(&key))
     })
@@ -2821,6 +3800,49 @@ pub extern "C" fn lust_mir_map_get_int_unwrap(
     key_tag: i64,
     default_or_trap: i64,
 ) -> i64 {
+    #[cfg(feature = "std")]
+    {
+        if key_tag == 3 {
+            let fast = with_current_mir_context(|ctx| {
+                with_map_ref(ctx, map_handle, |map| {
+                    ctx.with_str_handle(key_raw, |key_str| match map.borrow().get(&BorrowedStrKey(key_str)) {
+                        Some(Value::Int(value)) => *value,
+                        None if default_or_trap != i64::MIN => default_or_trap,
+                        _ => {
+                            ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                            0
+                        }
+                    })
+                })
+                .flatten()
+            });
+            if let Some(v) = fast {
+                return v;
+            }
+        } else if key_tag <= 2 {
+            let key = match key_tag {
+                0 => ValueKey::from(Value::Int(key_raw)),
+                1 => ValueKey::from(Value::Bool(key_raw != 0)),
+                _ => ValueKey::from(Value::Float(f64::from_bits(key_raw as u64))),
+            };
+            return with_current_mir_context(|ctx| {
+                match with_map_ref(ctx, map_handle, |map| match map.borrow().get(&key) {
+                    Some(Value::Int(value)) => *value,
+                    None if default_or_trap != i64::MIN => default_or_trap,
+                    _ => {
+                        ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                        0
+                    }
+                }) {
+                    Some(v) => v,
+                    None => {
+                        ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                        0
+                    }
+                }
+            });
+        }
+    }
     with_typed_map(map_handle, key_raw, key_tag, |ctx, map, key| {
         match map.borrow().get(&key) {
             Some(Value::Int(value)) => *value,
@@ -2923,4 +3945,202 @@ pub extern "C" fn lust_mir_enum_payload_at(_vm_ctx: i64, enum_handle: i64, field
             None => 0,
         }
     })
+}
+
+/// Creates a bounded FIFO integer queue in the active thread-confined `MirContext`.
+/// Returns a positive 1-based queue handle, or `0` on invalid capacity / OOM.
+pub extern "C" fn lust_mir_queue_new(cap: i64) -> i64 {
+    #[cfg(feature = "std")]
+    {
+        with_current_mir_context(|ctx| {
+            if cap < 0 {
+                ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                return 0;
+            }
+            let cap_usize = cap as usize;
+            let bytes_est = cap_usize
+                .saturating_mul(core::mem::size_of::<i64>())
+                .max(64);
+            if !charge_handle_bytes(ctx, bytes_est) {
+                return 0;
+            }
+            let mut items = alloc::collections::VecDeque::new();
+            if items.try_reserve(cap_usize).is_err() {
+                ctx.set_status(MIR_STATUS_ERR_OOM);
+                return 0;
+            }
+            let handle = {
+                let mut queues = ctx.native_queues.borrow_mut();
+                if queues.try_reserve(1).is_err() {
+                    ctx.set_status(MIR_STATUS_ERR_OOM);
+                    return 0;
+                }
+                queues.push(MirIntQueue {
+                    cap: cap_usize,
+                    items,
+                });
+                queues.len() as i64
+            };
+            ctx.mark_dirty_allocation();
+            handle
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = cap;
+        0
+    }
+}
+
+/// Non-blocking offer into a bounded FIFO integer queue.
+/// Returns `1` if enqueued, `0` if full (or on invalid handle, which sets OOB status).
+pub extern "C" fn lust_mir_queue_offer_int(q_handle: i64, val: i64) -> i64 {
+    #[cfg(feature = "std")]
+    {
+        with_current_mir_context(|ctx| {
+            if q_handle <= 0 {
+                ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                return 0;
+            }
+            let idx = (q_handle - 1) as usize;
+            let mut queues = ctx.native_queues.borrow_mut();
+            let Some(q) = queues.get_mut(idx) else {
+                ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                return 0;
+            };
+            if q.cap == 0 || q.items.len() >= q.cap {
+                return 0;
+            }
+            q.items.push_back(val);
+            1
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (q_handle, val);
+        0
+    }
+}
+
+/// Non-blocking take from a bounded FIFO integer queue.
+/// Returns the dequeued integer, or sets `MIR_STATUS_ERR_OUT_OF_BOUNDS` and returns `0` if empty/invalid.
+pub extern "C" fn lust_mir_queue_take_int(q_handle: i64) -> i64 {
+    #[cfg(feature = "std")]
+    {
+        with_current_mir_context(|ctx| {
+            if q_handle <= 0 {
+                ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                return 0;
+            }
+            let idx = (q_handle - 1) as usize;
+            let mut queues = ctx.native_queues.borrow_mut();
+            let Some(q) = queues.get_mut(idx) else {
+                ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                return 0;
+            };
+            match q.items.pop_front() {
+                Some(v) => v,
+                None => {
+                    ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                    0
+                }
+            }
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = q_handle;
+        0
+    }
+}
+
+/// Returns `1` iff `handle` references a `Value::Int` or `LuaValue::Int` in the active `MirContext`.
+pub extern "C" fn lust_mir_unknown_is_int(handle: i64) -> i64 {
+    #[cfg(feature = "std")]
+    {
+        if handle <= 0 {
+            return 0;
+        }
+        let idx = (handle - 1) as usize;
+        with_current_mir_context(|ctx| {
+            let check = |val: &Value| -> bool {
+                match val {
+                    Value::Int(_) => true,
+                    Value::Enum(obj) => obj.enum_name == "LuaValue" && obj.variant == "Int",
+                    _ => false,
+                }
+            };
+            {
+                let hv = ctx.heap_values.borrow();
+                if let Some(Some(v)) = hv.get(idx) {
+                    return i64::from(check(v));
+                }
+            }
+            DEFAULT_MIR_CONTEXT.with(|d| {
+                let d_hv = d.heap_values.borrow();
+                match d_hv.get(idx) {
+                    Some(Some(v)) => i64::from(check(v)),
+                    _ => 0,
+                }
+            })
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = handle;
+        0
+    }
+}
+
+/// Unwraps the integer payload from a `Value::Int` or `LuaValue::Int` handle in the active `MirContext`.
+/// Sets `MIR_STATUS_ERR_OUT_OF_BOUNDS` and returns `0` if `handle` does not hold an integer.
+pub extern "C" fn lust_mir_unknown_unwrap_int(handle: i64) -> i64 {
+    #[cfg(feature = "std")]
+    {
+        if handle <= 0 {
+            with_current_mir_context(|ctx| ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS));
+            return 0;
+        }
+        let idx = (handle - 1) as usize;
+        with_current_mir_context(|ctx| {
+            let extract = |val: &Value| -> Option<i64> {
+                match val {
+                    Value::Int(n) => Some(*n),
+                    Value::Enum(obj) if obj.enum_name == "LuaValue" && obj.variant == "Int" => {
+                        match obj.values.as_ref().and_then(|vals| vals.first()) {
+                            Some(Value::Int(n)) => Some(*n),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            {
+                let hv = ctx.heap_values.borrow();
+                if let Some(Some(v)) = hv.get(idx) {
+                    if let Some(n) = extract(v) {
+                        return n;
+                    }
+                    ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                    return 0;
+                }
+            }
+            let fallback = DEFAULT_MIR_CONTEXT.with(|d| {
+                let d_hv = d.heap_values.borrow();
+                d_hv.get(idx).and_then(|opt| opt.as_ref()).and_then(extract)
+            });
+            match fallback {
+                Some(n) => n,
+                None => {
+                    ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
+                    0
+                }
+            }
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = handle;
+        0
+    }
 }

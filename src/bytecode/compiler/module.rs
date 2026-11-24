@@ -209,6 +209,9 @@ impl Compiler {
             .insert("__script".to_string(), script_func_idx);
         self.functions.push(script_func);
         self.assign_signature_by_name(script_func_idx, "__script");
+        let enum_defs = Self::collect_enum_defs_for_mir(items);
+        let mut lifted_mir_functions: Vec<crate::mir::ir::MirFunction> = Vec::new();
+        let mut lambda_counter: usize = 0;
         let mut pending_mir: Vec<(usize, crate::mir::ir::MirFunction)> = Vec::new();
         let mut func_idx = 0;
         for item in items {
@@ -219,9 +222,14 @@ impl Compiler {
                     for ni in items {
                         match &ni.kind {
                             ItemKind::Function(func_def) => {
-                                if let Some(mir_fn) =
-                                    self.compile_function_with_owner(func_idx, func_def, None)?
-                                {
+                                if let Some(mir_fn) = self.compile_function_with_owner_and_mir_ctx(
+                                    func_idx,
+                                    func_def,
+                                    None,
+                                    &enum_defs,
+                                    &mut lifted_mir_functions,
+                                    &mut lambda_counter,
+                                )? {
                                     pending_mir.push((func_idx, mir_fn));
                                 }
                                 func_idx += 1;
@@ -236,10 +244,13 @@ impl Compiler {
                                     _ => None,
                                 };
                                 for method in &impl_block.methods {
-                                    if let Some(mir_fn) = self.compile_function_with_owner(
+                                    if let Some(mir_fn) = self.compile_function_with_owner_and_mir_ctx(
                                         func_idx,
                                         method,
                                         owner_type.as_deref(),
+                                        &enum_defs,
+                                        &mut lifted_mir_functions,
+                                        &mut lambda_counter,
                                     )? {
                                         pending_mir.push((func_idx, mir_fn));
                                     }
@@ -256,9 +267,14 @@ impl Compiler {
                 }
 
                 ItemKind::Function(func_def) => {
-                    if let Some(mir_fn) =
-                        self.compile_function_with_owner(func_idx, func_def, None)?
-                    {
+                    if let Some(mir_fn) = self.compile_function_with_owner_and_mir_ctx(
+                        func_idx,
+                        func_def,
+                        None,
+                        &enum_defs,
+                        &mut lifted_mir_functions,
+                        &mut lambda_counter,
+                    )? {
                         pending_mir.push((func_idx, mir_fn));
                     }
                     func_idx += 1;
@@ -273,10 +289,13 @@ impl Compiler {
                         _ => None,
                     };
                     for method in &impl_block.methods {
-                        if let Some(mir_fn) = self.compile_function_with_owner(
+                        if let Some(mir_fn) = self.compile_function_with_owner_and_mir_ctx(
                             func_idx,
                             method,
                             owner_type.as_deref(),
+                            &enum_defs,
+                            &mut lifted_mir_functions,
+                            &mut lambda_counter,
                         )? {
                             pending_mir.push((func_idx, mir_fn));
                         }
@@ -306,9 +325,14 @@ impl Compiler {
                 self.current_module = Some(entry.clone());
             }
 
-            if let Some(mir_fn) =
-                self.compile_function_with_owner(script_func_idx, &fake_func, None)?
-            {
+            if let Some(mir_fn) = self.compile_function_with_owner_and_mir_ctx(
+                script_func_idx,
+                &fake_func,
+                None,
+                &enum_defs,
+                &mut lifted_mir_functions,
+                &mut lambda_counter,
+            )? {
                 pending_mir.push((script_func_idx, mir_fn));
             }
             self.assign_signature_by_name(script_func_idx, &fake_func.name);
@@ -316,6 +340,41 @@ impl Compiler {
         }
 
         if self.use_mir {
+            if !lifted_mir_functions.is_empty() {
+                let mut mir_mod = crate::mir::ir::MirModule::new("__cli_module".into());
+                for (_, mir_fn) in &pending_mir {
+                    for layout in &mir_fn.struct_layouts {
+                        mir_mod.register_struct_layout(layout.clone());
+                    }
+                    mir_mod.add_function(mir_fn.clone());
+                }
+                for lifted in &lifted_mir_functions {
+                    for layout in &lifted.struct_layouts {
+                        mir_mod.register_struct_layout(layout.clone());
+                    }
+                    mir_mod.add_function(lifted.clone());
+                }
+                let _ = crate::mir::MirOptimizer::optimize_module_for_jit(
+                    &mut mir_mod,
+                    &crate::mir::opt::JitInlineConfig::default(),
+                );
+                let mut opt_by_name: HashMap<String, crate::mir::ir::MirFunction> = mir_mod
+                    .functions
+                    .into_iter()
+                    .map(|f| (f.signature.name.clone(), f))
+                    .collect();
+                for (_, mir_fn) in &mut pending_mir {
+                    if let Some(opt_fn) = opt_by_name.remove(&mir_fn.signature.name) {
+                        *mir_fn = opt_fn;
+                    }
+                }
+                for lifted in &mut lifted_mir_functions {
+                    if let Some(opt_fn) = opt_by_name.remove(&lifted.signature.name) {
+                        *lifted = opt_fn;
+                    }
+                }
+            }
+
             // In mixed MIR + AST->Bytecode modules (`use_mir && !strict_mir`), keep only the
             // closed call-graph subset of MIR functions whose module-local callees also lowered
             // to MIR. Otherwise a MIR-VM caller would emit `LoadGlobal` / `GetIndex` against an
@@ -324,6 +383,9 @@ impl Compiler {
                 .iter()
                 .map(|(_, f)| f.signature.name.clone())
                 .collect();
+            for lifted in &lifted_mir_functions {
+                valid_mir_names.insert(lifted.signature.name.clone());
+            }
             if !self.strict_mir {
                 loop {
                     let mut dropped = Vec::new();
@@ -352,7 +414,7 @@ impl Compiler {
                 }
             }
 
-            let mir_struct_layouts = self.build_struct_layouts_for_mir();
+            let mir_struct_layouts = self.build_struct_layouts_for_mir(&enum_defs);
             for (f_idx, mir_fn) in pending_mir {
                 if !valid_mir_names.contains(&mir_fn.signature.name) {
                     continue;
@@ -383,9 +445,15 @@ impl Compiler {
                     }
                 }
             }
+            for lifted in lifted_mir_functions {
+                self.mir_functions.push(lifted);
+            }
         } else {
             for (_, mir_fn) in pending_mir {
                 self.mir_functions.push(mir_fn);
+            }
+            for lifted in lifted_mir_functions {
+                self.mir_functions.push(lifted);
             }
         }
 
@@ -477,10 +545,33 @@ impl Compiler {
         }
     }
 
+    fn collect_enum_defs_for_mir(items: &[Item]) -> Vec<crate::ast::EnumDef> {
+        let mut defs: Vec<crate::ast::EnumDef> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        fn walk(items: &[Item], defs: &mut Vec<crate::ast::EnumDef>, seen: &mut HashSet<String>) {
+            for item in items {
+                match &item.kind {
+                    ItemKind::Enum(enum_def) => {
+                        if seen.insert(enum_def.name.clone()) {
+                            defs.push(enum_def.clone());
+                        }
+                    }
+                    ItemKind::Module { items: sub, .. } => {
+                        walk(sub, defs, seen);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        walk(items, &mut defs, &mut seen);
+        defs
+    }
+
     fn build_struct_layouts_for_mir(
         &self,
+        enum_defs: &[crate::ast::EnumDef],
     ) -> HashMap<String, alloc::rc::Rc<crate::bytecode::StructLayout>> {
-        let mut layouts = HashMap::with_capacity(self.struct_defs.len());
+        let mut layouts = HashMap::with_capacity(self.struct_defs.len() + enum_defs.len());
         for (name, def) in &self.struct_defs {
             let field_names: Vec<alloc::rc::Rc<String>> = def
                 .fields
@@ -510,6 +601,72 @@ impl Compiler {
                 weak_targets,
             ));
             layouts.insert(name.clone(), layout);
+        }
+        for enum_def in enum_defs {
+            let synth_name = format!("__Enum_{}", enum_def.name);
+            if layouts.contains_key(&synth_name) || enum_def.variants.is_empty() {
+                continue;
+            }
+            let max_arity = enum_def
+                .variants
+                .iter()
+                .map(|v| v.fields.as_ref().map_or(0, Vec::len))
+                .max()
+                .unwrap_or(0);
+            if max_arity > 4 {
+                continue;
+            }
+            let mut slot_types: Vec<Option<TypeKind>> = vec![None; max_arity];
+            let mut is_scalar = true;
+            for variant in &enum_def.variants {
+                if let Some(fields) = &variant.fields {
+                    for (idx, ty) in fields.iter().enumerate() {
+                        let sk = match &ty.kind {
+                            TypeKind::Int => TypeKind::Int,
+                            TypeKind::Float => TypeKind::Float,
+                            TypeKind::Bool => TypeKind::Bool,
+                            _ => {
+                                is_scalar = false;
+                                break;
+                            }
+                        };
+                        match &slot_types[idx] {
+                            None => slot_types[idx] = Some(sk),
+                            Some(prev) if prev == &sk => {}
+                            Some(_) => {
+                                is_scalar = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !is_scalar {
+                    break;
+                }
+            }
+            if !is_scalar {
+                continue;
+            }
+            let total = 1 + slot_types.len();
+            let mut field_names = Vec::with_capacity(total);
+            let mut field_types = Vec::with_capacity(total);
+            field_names.push(alloc::rc::Rc::new("__tag".to_string()));
+            field_types.push(crate::ast::Type::new(TypeKind::Int, Span::dummy()));
+            for (i, slot) in slot_types.into_iter().enumerate() {
+                field_names.push(alloc::rc::Rc::new(format!("__f{i}")));
+                field_types.push(crate::ast::Type::new(
+                    slot.unwrap_or(TypeKind::Int),
+                    Span::dummy(),
+                ));
+            }
+            let layout = alloc::rc::Rc::new(crate::bytecode::StructLayout::new(
+                synth_name.clone(),
+                field_names,
+                vec![crate::bytecode::FieldStorage::Strong; total],
+                field_types,
+                vec![None; total],
+            ));
+            layouts.insert(synth_name, layout);
         }
         layouts
     }
@@ -683,31 +840,82 @@ impl Compiler {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn compile_function_with_owner(
         &mut self,
         func_idx: usize,
         func_def: &crate::ast::FunctionDef,
         owner_struct: Option<&str>,
     ) -> Result<Option<crate::mir::ir::MirFunction>> {
+        let mut lifted = Vec::new();
+        let mut counter = 0usize;
+        self.compile_function_with_owner_and_mir_ctx(
+            func_idx,
+            func_def,
+            owner_struct,
+            &[],
+            &mut lifted,
+            &mut counter,
+        )
+    }
+
+    pub(super) fn compile_function_with_owner_and_mir_ctx(
+        &mut self,
+        func_idx: usize,
+        func_def: &crate::ast::FunctionDef,
+        owner_struct: Option<&str>,
+        enum_defs: &[crate::ast::EnumDef],
+        lifted_mir_functions: &mut Vec<crate::mir::ir::MirFunction>,
+        lambda_counter: &mut usize,
+    ) -> Result<Option<crate::mir::ir::MirFunction>> {
         let mut lowered_mir: Option<crate::mir::ir::MirFunction> = None;
         if self.use_mir || self.collect_mir {
             let scope_structs = self.collect_struct_defs_for_mir();
             let struct_refs: Vec<&crate::ast::StructDef> = scope_structs.iter().collect();
-            match crate::mir::AstLowering::lower_function_with_structs_and_owner(
+            let enum_refs: Vec<&crate::ast::EnumDef> = enum_defs.iter().collect();
+            let lifted_start = lifted_mir_functions.len();
+            match crate::mir::AstLowering::lower_function_with_structs_enums_and_owner(
                 func_def,
                 owner_struct,
                 &struct_refs,
+                &enum_refs,
+                Some(lifted_mir_functions),
+                Some(lambda_counter),
             ) {
                 Ok((mut mir_fn, _ops)) => {
                     mir_fn.signature.name = self.functions[func_idx].name.clone();
                     self.resolve_mir_struct_types(&mut mir_fn);
                     self.resolve_mir_callees(&mut mir_fn);
+                    let mut lifted_ok = true;
+                    for lifted in &mut lifted_mir_functions[lifted_start..] {
+                        self.resolve_mir_struct_types(lifted);
+                        self.resolve_mir_callees(lifted);
+                        match crate::mir::MirVerifier::verify_fn(lifted) {
+                            Ok(_) => {
+                                crate::mir::MirOptimizer::optimize_function(lifted);
+                            }
+                            Err(errors) => {
+                                lifted_ok = false;
+                                if self.strict_mir {
+                                    return Err(LustError::CompileError(format!(
+                                        "Strict MIR verification failed for lifted function '{}': {:?}",
+                                        lifted.signature.name, errors
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    if !lifted_ok {
+                        lifted_mir_functions.truncate(lifted_start);
+                    }
                     match crate::mir::MirVerifier::verify_fn(&mir_fn) {
-                        Ok(_) => {
+                        Ok(_) if lifted_ok => {
                             crate::mir::MirOptimizer::optimize_function(&mut mir_fn);
                             lowered_mir = Some(mir_fn);
                         }
+                        Ok(_) => {}
                         Err(errors) => {
+                            lifted_mir_functions.truncate(lifted_start);
                             if self.strict_mir {
                                 return Err(LustError::CompileError(format!(
                                     "Strict MIR verification failed for function '{}': {:?}",
@@ -718,6 +926,7 @@ impl Compiler {
                     }
                 }
                 Err(err) => {
+                    lifted_mir_functions.truncate(lifted_start);
                     if self.strict_mir {
                         return Err(LustError::CompileError(format!(
                             "Strict MIR lowering failed for function '{}': {err}",
@@ -744,13 +953,25 @@ impl Compiler {
         };
         if func_def.is_method {
             scope.locals.insert("self".to_string(), (0, false));
+            if let Some(owner) = owner_struct {
+                self.register_type(0, TypeKind::Named(owner.to_string()));
+            }
             self.next_register = 1;
         }
 
         for param in &func_def.params {
             let reg = self.allocate_register();
             scope.locals.insert(param.name.clone(), (reg, false));
-            self.register_type(reg, param.ty.kind.clone());
+            let param_ty = if let Some(owner) = owner_struct
+                && ((param.is_self || param.name == "self")
+                    && matches!(param.ty.kind, TypeKind::Infer | TypeKind::Unknown)
+                    || matches!(&param.ty.kind, TypeKind::Named(n) if n == "Self"))
+            {
+                TypeKind::Named(owner.to_string())
+            } else {
+                param.ty.kind.clone()
+            };
+            self.register_type(reg, param_ty);
         }
 
         self.scopes.push(scope);

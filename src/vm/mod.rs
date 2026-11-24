@@ -60,8 +60,24 @@ pub use self::tasks::{
 };
 pub(crate) use self::tracing::JitCallSite;
 #[cfg(feature = "std")]
+#[derive(Default)]
+pub(crate) struct CraneliftFallbackCache {
+    pub cranelift_gen: u64,
+    pub struct_gen: u64,
+    pub functions_len: usize,
+    /// `true` once every backward-jump target in `func_idx` is recorded in `osr_cold_sites`.
+    pub osr_exhausted_funcs: Vec<bool>,
+    /// Per-`func_idx` fast call state under `VmBackend::Cranelift`:
+    /// `0` = unprobed, `1` = known ineligible / trivial leaf subframe (stay in `'frame_fast`),
+    /// `2` = compiled Cranelift native entry (exit `'frame_fast` to run native code).
+    pub cranelift_call_state: Vec<u8>,
+}
+
+#[cfg(feature = "std")]
 thread_local! {
     static CURRENT_VM_STACK: RefCell<Vec<*mut VM>> = const { RefCell::new(Vec::new()) };
+    static CRANELIFT_FALLBACK_CACHES: RefCell<HashMap<crate::bytecode::value::VmId, Rc<RefCell<CraneliftFallbackCache>>>> =
+        RefCell::new(HashMap::default());
 }
 
 #[cfg(not(feature = "std"))]
@@ -1592,6 +1608,161 @@ impl VM {
             self.osr_engine = None;
             self.osr_backedge_counts.clear();
             self.osr_cold_sites.clear();
+            self.clear_cranelift_fallback_cache();
+        }
+    }
+
+    #[cfg(feature = "std")]
+    pub(super) fn clear_cranelift_fallback_cache(&self) {
+        CRANELIFT_FALLBACK_CACHES.with(|map| {
+            if let Some(entry) = map.borrow().get(&self.id)
+                && let Ok(mut cache) = entry.try_borrow_mut()
+            {
+                cache.osr_exhausted_funcs.clear();
+                cache.cranelift_call_state.clear();
+                cache.cranelift_gen = u64::MAX;
+                cache.struct_gen = u64::MAX;
+                cache.functions_len = 0;
+            }
+        });
+    }
+
+    #[cfg(feature = "std")]
+    pub(super) fn get_synced_cranelift_fallback_cache(
+        &self,
+    ) -> Rc<RefCell<CraneliftFallbackCache>> {
+        let cur_cl_gen = self.cranelift_generation;
+        let cur_struct_gen = self.struct_metadata.generation();
+        let cur_fn_len = self.functions.len();
+        let rc = CRANELIFT_FALLBACK_CACHES.with(|map| {
+            let mut map = map.borrow_mut();
+            Rc::clone(
+                map.entry(self.id)
+                    .or_insert_with(|| Rc::new(RefCell::new(CraneliftFallbackCache::default()))),
+            )
+        });
+        {
+            let mut cache = rc.borrow_mut();
+            if cache.cranelift_gen != cur_cl_gen
+                || cache.struct_gen != cur_struct_gen
+                || cache.functions_len != cur_fn_len
+            {
+                cache.cranelift_gen = cur_cl_gen;
+                cache.struct_gen = cur_struct_gen;
+                cache.functions_len = cur_fn_len;
+                cache.osr_exhausted_funcs.clear();
+                cache.osr_exhausted_funcs.resize(cur_fn_len, false);
+                cache.cranelift_call_state.clear();
+                cache.cranelift_call_state.resize(cur_fn_len, 0);
+            }
+        }
+        rc
+    }
+
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(super) fn is_trivial_leaf_method_fast(func: &Function) -> bool {
+        if !func.is_method || func.chunk.instructions.len() > 24 {
+            return false;
+        }
+        for insn in &func.chunk.instructions {
+            match insn {
+                Instruction::Jump(off)
+                | Instruction::JumpIf(_, off)
+                | Instruction::JumpIfNot(_, off)
+                | Instruction::BranchLtInt(_, _, off)
+                | Instruction::BranchLeInt(_, _, off) => {
+                    if *off < 0 {
+                        return false;
+                    }
+                }
+                Instruction::Call(..) | Instruction::CallMethod(..) | Instruction::Closure(..) => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    #[cfg(feature = "std")]
+    pub(super) fn record_cranelift_call_probe(&mut self, func_idx: usize) {
+        #[cfg(feature = "test-deopt")]
+        if self.test_deopt_spike_hook.is_some() {
+            return;
+        }
+        let current_struct_gen = self.struct_metadata.generation();
+        if self.cranelift_compiled_generation == self.cranelift_generation
+            && self.cranelift_compiled_struct_gen == current_struct_gen
+            && self.cranelift_compiled.is_empty()
+            && self.mir_context_struct_gen != current_struct_gen
+        {
+            self.sync_mir_context_struct_metadata();
+        }
+        let Some(func) = self.functions.get(func_idx) else {
+            return;
+        };
+        let has_compiled = self.cranelift_compiled.contains_key(&func.name)
+            || self
+                .cranelift_fn_cache
+                .get(func_idx)
+                .and_then(|e| e.as_ref())
+                .is_some();
+        let is_deferred_dead = self
+            .cranelift_jit
+            .as_ref()
+            .is_some_and(|jit| jit.is_deferred_dead_helper(&func.name));
+        let stay_in_vm = if func.param_count > 6 || Self::is_trivial_leaf_method_fast(func) {
+            true
+        } else {
+            !has_compiled && !is_deferred_dead
+        };
+        let state = if stay_in_vm { 1u8 } else { 2u8 };
+        let rc = self.get_synced_cranelift_fallback_cache();
+        let mut cache = rc.borrow_mut();
+        if func_idx < cache.cranelift_call_state.len() {
+            cache.cranelift_call_state[func_idx] = state;
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn mark_osr_site_cold_and_check_exhausted(
+        &mut self,
+        func_idx: usize,
+        cold_key: (usize, usize, u64, u64),
+    ) {
+        self.osr_cold_sites.insert(cold_key);
+        let all_cold = self.functions.get(func_idx).is_some_and(|func| {
+            if func.block_entry_pcs.is_empty() {
+                return true;
+            }
+            for (pc, inst) in func.chunk.instructions.iter().enumerate() {
+                let back_off = match *inst {
+                    Instruction::Jump(off)
+                    | Instruction::BranchLtInt(_, _, off)
+                    | Instruction::BranchLeInt(_, _, off)
+                        if off < 0 =>
+                    {
+                        Some(off)
+                    }
+                    _ => None,
+                };
+                if let Some(off) = back_off {
+                    let target = (pc as isize + 1 + off as isize) as usize;
+                    let key = (func_idx, target, cold_key.2, cold_key.3);
+                    if !self.osr_cold_sites.contains(&key) {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+        if all_cold {
+            let rc = self.get_synced_cranelift_fallback_cache();
+            let mut cache = rc.borrow_mut();
+            if func_idx < cache.osr_exhausted_funcs.len() {
+                cache.osr_exhausted_funcs[func_idx] = true;
+            }
         }
     }
 
@@ -1742,6 +1913,7 @@ impl VM {
 
         let cold_key = (func_idx, loop_start_ip, cur_cl_gen, cur_struct_gen);
         if self.osr_cold_sites.contains(&cold_key) {
+            self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
             return Ok(None);
         }
 
@@ -1751,7 +1923,7 @@ impl VM {
             .get(func_idx)
             .is_some_and(|f| !f.block_entry_pcs.is_empty());
         if !has_block_pcs {
-            self.osr_cold_sites.insert(cold_key);
+            self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
             return Ok(None);
         }
 
@@ -1768,11 +1940,11 @@ impl VM {
         // Precondition 5 authoritative lookup: map `loop_start_ip` to unique MIR loop header
         let (func_name, mir_fn, target_block) = {
             let Some(func) = self.functions.get(func_idx) else {
-                self.osr_cold_sites.insert(cold_key);
+                self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
                 return Ok(None);
             };
             let Some(mir_fn) = self.mir_functions.get(&func.name) else {
-                self.osr_cold_sites.insert(cold_key);
+                self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
                 return Ok(None);
             };
             let loop_headers = crate::mir::cranelift_backend::find_loop_headers(&mir_fn.blocks);
@@ -1788,7 +1960,7 @@ impl VM {
                 }
             }
             let Some(target_block) = matched_header.filter(|_| !ambiguous) else {
-                self.osr_cold_sites.insert(cold_key);
+                self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
                 return Ok(None);
             };
             (func.name.clone(), mir_fn.clone(), target_block)
@@ -1806,7 +1978,7 @@ impl VM {
                     crate::vm::osr::GLOBAL_OSR_COUNTERS
                         .fallback_count
                         .fetch_add(1, Ordering::SeqCst);
-                    self.osr_cold_sites.insert(cold_key);
+                    self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
                     return Ok(None);
                 }
             }
@@ -1837,7 +2009,7 @@ impl VM {
                     crate::vm::osr::GLOBAL_OSR_COUNTERS
                         .fallback_count
                         .fetch_add(1, Ordering::SeqCst);
-                    self.osr_cold_sites.insert(cold_key);
+                    self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
                     return Ok(None);
                 }
             }
@@ -1852,7 +2024,7 @@ impl VM {
                     crate::vm::osr::GLOBAL_OSR_COUNTERS
                         .fallback_count
                         .fetch_add(1, Ordering::SeqCst);
-                    self.osr_cold_sites.insert(cold_key);
+                    self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
                     return Ok(None);
                 }
             }
@@ -1963,7 +2135,7 @@ impl VM {
         };
 
         if let Some(sticky) = sticky_err {
-            self.osr_cold_sites.insert(cold_key);
+            self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
             return Err(LustError::RuntimeError {
                 message: format!("Native OSR deopt helper error: {}", sticky),
             });
@@ -1973,7 +2145,7 @@ impl VM {
             if status == MIR_STATUS_DEOPT {
                 // Mark site cold upfront so EVERY deopt path (both clean resume and
                 // fail-closed corrupted/unmapped deopt errors) suppresses future OSR thrashing.
-                self.osr_cold_sites.insert(cold_key);
+                self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
                 crate::vm::osr::GLOBAL_OSR_COUNTERS
                     .deopt_count
                     .fetch_add(1, Ordering::SeqCst);
@@ -2466,6 +2638,13 @@ impl Default for VM {
 
 impl Drop for VM {
     fn drop(&mut self) {
+        #[cfg(feature = "std")]
+        {
+            CRANELIFT_FALLBACK_CACHES.with(|map| {
+                map.borrow_mut().remove(&self.id);
+            });
+            execution::drop_pure_native_cache_for_vm(self.id);
+        }
         // Track A: Immediately release all native host resources with 0 gas and 0 alloc
         self.host_ledger.cleanup_all();
 

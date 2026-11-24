@@ -26,12 +26,20 @@ pub use crate::effects::{
     scope_spawn_child, scope_spawn_future, with_aot_scope, with_provided_service,
 };
 pub use crate::schema::{AotDecimal128, AotObjectId};
-pub use crate::value::{AotClosure, AotEnum, AotKey, AotMap, AotStruct, AotValue};
+pub use crate::value::{
+    AotClosure, AotEnum, AotHash, AotHashMap, AotKey, AotMap, AotRawMap, AotStruct, AotValue,
+    aot_hash_bytes, aot_hash_u64,
+};
 
+use alloc_crate::boxed::Box;
+use alloc_crate::collections::VecDeque;
 use alloc_crate::string::String;
+use core::cmp::Ordering;
 use core::convert::Infallible;
 use core::fmt::{self, Write as _};
+use core::hash::{Hash, Hasher};
 use core::mem::DropGuard;
+use core::ops::Deref;
 
 /// Structured runtime error returned by Lust Rust AOT functions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,6 +512,459 @@ pub fn println_str(text: &str) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(text.as_bytes());
     let _ = out.write_all(b"\n");
+}
+
+#[derive(Clone)]
+enum SmallStrRepr {
+    Inline { len: u8, buf: [u8; 22] },
+    Heap(Box<str>),
+}
+
+/// 100% safe, `#![no_std] + alloc`, 24-byte inline Small String (`SSO`) for Rust AOT.
+///
+/// Strings up to [`AotSmallStr::INLINE_CAP`] (22 UTF-8 bytes) are stored inline inside the
+/// 24-byte value with zero heap allocations and zero budget charges; longer strings fall
+/// back transparently to a heap `Box<str>`.
+#[derive(Clone)]
+pub struct AotSmallStr(SmallStrRepr);
+
+/// Canonical alias for [`AotSmallStr`].
+pub type AotString = AotSmallStr;
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(core::mem::size_of::<AotSmallStr>() == 24);
+
+impl AotSmallStr {
+    /// Maximum UTF-8 byte length stored inline without heap allocation.
+    pub const INLINE_CAP: usize = 22;
+
+    /// Constructs an empty inline [`AotSmallStr`] with zero heap allocation.
+    #[inline]
+    pub const fn new() -> Self {
+        Self(SmallStrRepr::Inline {
+            len: 0,
+            buf: [0u8; Self::INLINE_CAP],
+        })
+    }
+
+    /// Constructs an [`AotSmallStr`] from `&str`, storing `<= 22` bytes inline (0 heap allocs,
+    /// 0 budget charges) and enforcing `alloc` budget on heap fallback (`> 22` bytes).
+    #[inline]
+    pub fn try_from_str(s: &str, alloc: &LustBudgetAlloc) -> Result<Self, AotError> {
+        let bytes = s.as_bytes();
+        let len = bytes.len();
+        if len <= Self::INLINE_CAP {
+            let mut buf = [0u8; Self::INLINE_CAP];
+            if let Some(dst) = buf.get_mut(..len) {
+                dst.copy_from_slice(bytes);
+            }
+            return Ok(Self(SmallStrRepr::Inline {
+                len: len as u8,
+                buf,
+            }));
+        }
+        alloc.try_charge(len)?;
+        let mut owned = String::new();
+        if owned.try_reserve_exact(len).is_err() {
+            alloc.refund(len);
+            return Err(AotError::from_alloc_failure(alloc, len));
+        }
+        owned.push_str(s);
+        Ok(Self(SmallStrRepr::Heap(owned.into_boxed_str())))
+    }
+
+    /// Constructs an [`AotSmallStr`] from `&str` (inline for `<= 22` bytes, heap otherwise).
+    #[inline]
+    pub fn from_str_slice(s: &str) -> Self {
+        let bytes = s.as_bytes();
+        let len = bytes.len();
+        if len <= Self::INLINE_CAP {
+            let mut buf = [0u8; Self::INLINE_CAP];
+            if let Some(dst) = buf.get_mut(..len) {
+                dst.copy_from_slice(bytes);
+            }
+            Self(SmallStrRepr::Inline {
+                len: len as u8,
+                buf,
+            })
+        } else {
+            Self(SmallStrRepr::Heap(Box::from(s)))
+        }
+    }
+
+    #[inline(always)]
+    pub const fn is_inline(&self) -> bool {
+        matches!(self.0, SmallStrRepr::Inline { .. })
+    }
+
+    #[inline(always)]
+    pub const fn is_heap(&self) -> bool {
+        matches!(self.0, SmallStrRepr::Heap(_))
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            SmallStrRepr::Inline { len, .. } => (*len as usize).min(Self::INLINE_CAP),
+            SmallStrRepr::Heap(b) => b.len(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        match &self.0 {
+            SmallStrRepr::Inline { len, buf } => {
+                let n = (*len as usize).min(Self::INLINE_CAP);
+                buf.get(..n).unwrap_or(&[])
+            }
+            SmallStrRepr::Heap(b) => b.as_bytes(),
+        }
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        match &self.0 {
+            SmallStrRepr::Inline { len, buf } => {
+                let n = (*len as usize).min(Self::INLINE_CAP);
+                buf.get(..n)
+                    .and_then(|slice| core::str::from_utf8(slice).ok())
+                    .unwrap_or("")
+            }
+            SmallStrRepr::Heap(b) => b,
+        }
+    }
+
+    /// Appends `extra` in-place when the combined string still fits inline (`<= 22` bytes),
+    /// otherwise promotes to a budget-checked heap string.
+    #[inline]
+    pub fn try_push_str(&mut self, extra: &str, alloc: &LustBudgetAlloc) -> Result<(), AotError> {
+        if extra.is_empty() {
+            return Ok(());
+        }
+        let cur_len = self.len();
+        let new_len = cur_len
+            .checked_add(extra.len())
+            .ok_or_else(|| AotError::from_alloc_failure(alloc, usize::MAX))?;
+        if new_len <= Self::INLINE_CAP {
+            if let SmallStrRepr::Inline { len, buf } = &mut self.0 {
+                if let Some(dst) = buf.get_mut(cur_len..new_len) {
+                    dst.copy_from_slice(extra.as_bytes());
+                    *len = new_len as u8;
+                }
+                return Ok(());
+            }
+        }
+        alloc.try_charge(new_len)?;
+        let mut owned = String::new();
+        if owned.try_reserve_exact(new_len).is_err() {
+            alloc.refund(new_len);
+            return Err(AotError::from_alloc_failure(alloc, new_len));
+        }
+        owned.push_str(self.as_str());
+        owned.push_str(extra);
+        self.0 = SmallStrRepr::Heap(owned.into_boxed_str());
+        Ok(())
+    }
+
+    #[inline]
+    pub fn into_string(self) -> String {
+        match self.0 {
+            SmallStrRepr::Inline { .. } => String::from(self.as_str()),
+            SmallStrRepr::Heap(b) => String::from(b),
+        }
+    }
+}
+
+impl Default for AotSmallStr {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Deref for AotSmallStr {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for AotSmallStr {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<[u8]> for AotSmallStr {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl core::borrow::Borrow<str> for AotSmallStr {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AotHash for AotSmallStr {
+    #[inline]
+    fn aot_hash(&self) -> u64 {
+        self.as_str().aot_hash()
+    }
+}
+
+impl PartialEq for AotSmallStr {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for AotSmallStr {}
+
+impl PartialEq<str> for AotSmallStr {
+    #[inline]
+    fn eq(&self, other: &str) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl PartialEq<&str> for AotSmallStr {
+    #[inline]
+    fn eq(&self, other: &&str) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl PartialEq<String> for AotSmallStr {
+    #[inline]
+    fn eq(&self, other: &String) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl PartialOrd for AotSmallStr {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AotSmallStr {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl Hash for AotSmallStr {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl fmt::Debug for AotSmallStr {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl fmt::Display for AotSmallStr {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&str> for AotSmallStr {
+    #[inline]
+    fn from(s: &str) -> Self {
+        Self::from_str_slice(s)
+    }
+}
+
+impl From<String> for AotSmallStr {
+    #[inline]
+    fn from(s: String) -> Self {
+        if s.len() <= Self::INLINE_CAP {
+            Self::from_str_slice(s.as_str())
+        } else {
+            Self(SmallStrRepr::Heap(s.into_boxed_str()))
+        }
+    }
+}
+
+impl From<Box<str>> for AotSmallStr {
+    #[inline]
+    fn from(b: Box<str>) -> Self {
+        if b.len() <= Self::INLINE_CAP {
+            Self::from_str_slice(&b)
+        } else {
+            Self(SmallStrRepr::Heap(b))
+        }
+    }
+}
+
+impl From<AotSmallStr> for String {
+    #[inline]
+    fn from(s: AotSmallStr) -> Self {
+        s.into_string()
+    }
+}
+
+/// Overflow backpressure strategy for [`AotQueue<T>`], matching `@std/sync.{Queue}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AotQueueStrategy {
+    Suspend,
+    Dropping,
+    Sliding,
+}
+
+/// Typed, zero-boxing bounded FIFO queue wrapping [`VecDeque<T>`] for Rust AOT.
+///
+/// Mirrors `@std/sync.{Queue}` (`BENCH-NG-12`) without `AotValue` or `Rc<dyn Fn>` boxing.
+#[derive(Debug, Clone)]
+pub struct AotQueue<T> {
+    buf: VecDeque<T>,
+    capacity: usize,
+    strategy: AotQueueStrategy,
+    closed: bool,
+}
+
+impl<T> AotQueue<T> {
+    /// Creates an unbounded FIFO queue.
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            buf: VecDeque::new(),
+            capacity: 0,
+            strategy: AotQueueStrategy::Suspend,
+            closed: false,
+        }
+    }
+
+    /// Creates a bounded FIFO queue with `capacity` (`0` = unbounded) and default `"suspend"` strategy.
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_and_strategy(capacity, "suspend")
+    }
+
+    /// Creates a bounded FIFO queue with explicit overflow strategy (`"suspend"`, `"dropping"`, `"sliding"`).
+    #[inline]
+    pub fn with_capacity_and_strategy(capacity: usize, strategy: &str) -> Self {
+        let strat = match strategy {
+            "dropping" => AotQueueStrategy::Dropping,
+            "sliding" => AotQueueStrategy::Sliding,
+            _ => AotQueueStrategy::Suspend,
+        };
+        let mut buf = VecDeque::new();
+        if capacity > 0 {
+            let _ = buf.try_reserve_exact(capacity);
+        }
+        Self {
+            buf,
+            capacity,
+            strategy: strat,
+            closed: false,
+        }
+    }
+
+    /// Enqueues `val` according to the configured capacity and overflow strategy.
+    #[inline]
+    pub fn offer(&mut self, val: T) -> Result<bool, AotError> {
+        if self.closed {
+            return Ok(false);
+        }
+        if self.capacity > 0 && self.buf.len() >= self.capacity {
+            match self.strategy {
+                AotQueueStrategy::Dropping => return Ok(false),
+                AotQueueStrategy::Sliding => {
+                    let _ = self.buf.pop_front();
+                }
+                AotQueueStrategy::Suspend => {
+                    return Err(AotError::UserError(String::from("queue is full")));
+                }
+            }
+        }
+        if self.buf.try_reserve(1).is_err() {
+            return Err(AotError::OutOfMemory {
+                limit_bytes: 0,
+                requested_bytes: core::mem::size_of::<T>(),
+            });
+        }
+        self.buf.push_back(val);
+        Ok(true)
+    }
+
+    /// Alias for [`AotQueue::offer`].
+    #[inline]
+    pub fn try_offer(&mut self, val: T) -> Result<bool, AotError> {
+        self.offer(val)
+    }
+
+    /// Dequeues the oldest element in FIFO order, returning `Err(AotError::UserError)` if empty.
+    #[inline]
+    pub fn take(&mut self) -> Result<T, AotError> {
+        self.buf
+            .pop_front()
+            .ok_or_else(|| AotError::UserError(String::from("queue is empty")))
+    }
+
+    /// Non-failing dequeue returning `None` when empty.
+    #[inline]
+    pub fn try_take(&mut self) -> Option<T> {
+        self.buf.pop_front()
+    }
+
+    /// Returns the number of queued elements as `i64`.
+    #[inline(always)]
+    pub fn len(&self) -> i64 {
+        self.buf.len() as i64
+    }
+
+    /// Returns whether the queue currently holds zero elements.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// Returns the configured capacity (`0` = unbounded).
+    #[inline(always)]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Returns whether [`AotQueue::close`] has been called.
+    #[inline(always)]
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Closes the queue; subsequent [`AotQueue::offer`] calls return `Ok(false)`.
+    #[inline(always)]
+    pub fn close(&mut self) {
+        self.closed = true;
+    }
+}
+
+impl<T> Default for AotQueue<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Panic-free, `unsafe`-free, `#![no_std] + alloc` schema runtime primitives (`NG-W12-4C`).

@@ -209,7 +209,9 @@ fn test_ng_w15_5_in_loop_closure_call_zero_vec_allocations() {
     #[cfg(debug_assertions)]
     {
         assert!(VM::frame_hoist_reload_count() - before.0 < 20);
-        assert_eq!(VM::closure_upvalue_buffer_growths() - before.1, 2);
+        // Wave 16 NG-W16-4 eliminated the duplicate frame.upvalues Vec<Value> buffer
+        // (keeping only frame.shared_upvalues), so warmup buffer growth count is 1.
+        assert_eq!(VM::closure_upvalue_buffer_growths() - before.1, 1);
     }
     assert_release_time("BENCH-NG-04", elapsed, 95);
 }

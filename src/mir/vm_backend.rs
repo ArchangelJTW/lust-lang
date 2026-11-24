@@ -121,6 +121,14 @@ impl<'a> MirToBytecodeCompiler<'a> {
         Self::compile_inner(func, Some(direct_callees), None, None, false)
     }
 
+    pub fn compile_with_direct_callees_and_struct_layouts(
+        func: &'a MirFunction,
+        direct_callees: &'a HashSet<String>,
+        struct_layouts: &'a HashMap<String, Rc<StructLayout>>,
+    ) -> Result<Function, MirVmBackendError> {
+        Self::compile_inner(func, Some(direct_callees), None, Some(struct_layouts), false)
+    }
+
     pub fn compile_with_direct_callee_indices(
         func: &'a MirFunction,
         direct_callee_indices: &'a HashMap<String, usize>,

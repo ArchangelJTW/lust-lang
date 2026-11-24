@@ -1627,10 +1627,23 @@ impl VM {
         direct_callees: &hashbrown::HashSet<String>,
     ) -> Result<()> {
         let name = mir_fn.signature.name.clone();
-        let mut bytecode_fn = crate::mir::vm_backend::MirToBytecodeCompiler::compile_with_direct_callees(
-            &mir_fn,
-            direct_callees,
-        )
+        let struct_layouts: hashbrown::HashMap<String, Rc<StructLayout>> = self
+            .struct_metadata
+            .iter()
+            .map(|(k, info)| (k.clone(), Rc::clone(&info.layout)))
+            .collect();
+        let mut bytecode_fn = if struct_layouts.is_empty() {
+            crate::mir::vm_backend::MirToBytecodeCompiler::compile_with_direct_callees(
+                &mir_fn,
+                direct_callees,
+            )
+        } else {
+            crate::mir::vm_backend::MirToBytecodeCompiler::compile_with_direct_callees_and_struct_layouts(
+                &mir_fn,
+                direct_callees,
+                &struct_layouts,
+            )
+        }
         .map_err(|e| LustError::RuntimeError {
             message: format!("Failed to lower MIR function '{}' to bytecode: {:?}", name, e),
         })?;

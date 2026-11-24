@@ -629,3 +629,72 @@ end
     );
     program.clear_gas_budget();
 }
+
+// =========================================================================
+// Test 4: BENCH-NG-05 Regression (`--backend cranelift` / `use_mir=true`)
+// =========================================================================
+
+#[test]
+fn test_ng_w15_hotfix_ng05_megamorphic_method_ic_cli_backend_cranelift() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    reset_all_state();
+
+    let script_path = suite_v2_path("megamorphic_method_ic.lust");
+
+    // 1. CLI `--backend cranelift` (which enables `use_mir=true` + `cranelift_jit=true`)
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lust"))
+        .arg("run")
+        .arg(&script_path)
+        .arg("--backend")
+        .arg("cranelift")
+        .env_remove("LUST_JIT")
+        .env_remove("LUST_JIT_BACKEND")
+        .env_remove("LUST_BACKEND")
+        .output()
+        .expect("run lust run megamorphic_method_ic.lust --backend cranelift");
+
+    assert!(
+        output.status.success(),
+        "lust run megamorphic_method_ic.lust --backend cranelift failed (status={:?}):\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cli_stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(
+        cli_stdout, "24980750",
+        "BENCH-NG-05 CLI --backend cranelift oracle checksum must match verbatim"
+    );
+
+    // 2. Programmatic `compile_program_with_config` with `use_mir=true` + `cranelift_jit=true`
+    let src = std::fs::read_to_string(&script_path)
+        .expect("read benchmarks/suite_v2/megamorphic_method_ic.lust");
+    let entries = &[EmbeddedModule {
+        module: "main",
+        parent: None,
+        source: Some(&src),
+    }];
+    let program = load_program_from_embedded(entries, "main").expect("load embedded program");
+    let cfg = LustConfig::default()
+        .with_cranelift_jit(true)
+        .with_use_mir(true);
+    let mut vm = compile_program_with_config(program, &cfg)
+        .expect("compile megamorphic_method_ic with use_mir=true + cranelift_jit=true");
+    vm.console = VirtualConsole::captured();
+    vm.call("__script", vec![])
+        .expect("execute __script under use_mir=true + cranelift_jit=true");
+
+    let vm_stdout = String::from_utf8(vm.console.stdout_bytes().to_vec())
+        .expect("utf8 stdout")
+        .trim()
+        .to_string();
+    assert_eq!(
+        vm_stdout, "24980750",
+        "BENCH-NG-05 programmatic use_mir=true + cranelift_jit=true oracle checksum must match verbatim"
+    );
+    assert_eq!(
+        vm.cranelift_entry_count(),
+        0,
+        "sub-frame trivial leaf method guard must hold under use_mir=true + cranelift_jit=true"
+    );
+}

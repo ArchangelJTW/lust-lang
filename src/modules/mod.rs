@@ -176,14 +176,13 @@ pub fn compile_program_with_config(program: Program, config: &LustConfig) -> cra
     // Phase 4: Create VM
     let mut vm = VM::with_config(&config);
     vm.load_functions(functions);
-    for mir_fn in mir_functions {
-        if config.use_mir() {
-            vm.load_mir_function(mir_fn)?;
-        } else {
-            vm.register_mir_candidate(mir_fn);
-        }
-    }
     vm.register_structs(&struct_defs);
+    // `Compiler::compile_module` already compiled eligible MIR functions into `functions`
+    // with struct layouts, field slots, and direct callee indices when `config.use_mir()` is
+    // enabled. Register MIR candidates without overwriting the compiled bytecode.
+    for mir_fn in mir_functions {
+        vm.register_mir_candidate(mir_fn);
+    }
     for (type_name, trait_name) in trait_impls {
         vm.register_trait_impl(type_name, trait_name);
     }

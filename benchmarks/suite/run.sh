@@ -6,18 +6,18 @@
 # slow row reports "timeout" instead of hanging the suite. Every program is
 # run in a private working directory: the suite writes no files, but that
 # keeps a stray one from changing a later run.
-D=$(cd "$(dirname "$0")" && pwd)
-LUST=${1:-"$D/../../target/release/lust"}
+export D=$(cd "$(dirname "$0")" && pwd)
+export LUST=${1:-"$D/../../target/release/lust"}
 RUST_MANIFEST="$D/rust/Cargo.toml"
 RUST_BIN="$D/rust/target/release/suite-rust"
 cargo build --release --manifest-path "$RUST_MANIFEST" >&2
-TIMEOUT=${TIMEOUT:-120}
+export TIMEOUT=${TIMEOUT:-120}
 exec python3 - << 'EOF'
 import os, sys, time, subprocess, tempfile
 from pathlib import Path
 
-suite_dir = Path(os.environ.get("D", "/Users/vedmalex/work/lust-lang/repos/lust-lang-fork/benchmarks/suite"))
-lust_bin = Path(sys.argv[1]) if len(sys.argv) > 1 else suite_dir.parent.parent / "target/release/lust"
+suite_dir = Path(os.environ["D"])
+lust_bin = Path(os.environ["LUST"])
 rust_bin = suite_dir / "rust/target/release/suite-rust"
 
 programs = ["fields", "array", "sieve", "calls", "methods", "strings", "fib", "nested", "floatmath", "tree"]
@@ -35,6 +35,8 @@ with tempfile.TemporaryDirectory(dir="/tmp") as td:
             if res.returncode != 0:
                 return "crash/error", f"<exit {res.returncode}>"
             return f"{dur_ms:6.1f} ms", last_line
+        except FileNotFoundError:
+            return "n/a", ""
         except subprocess.TimeoutExpired:
             return "timeout", "<timeout>"
 
@@ -63,8 +65,8 @@ with tempfile.TemporaryDirectory(dir="/tmp") as td:
         t_lj, o_lj = run_cmd(["luajit", str(suite_dir / f"{prog}.lua")])
         t_lua, o_lua = run_cmd(["lua", str(suite_dir / f"{prog}.lua")])
         
-        outputs = [("rust", o_rust), ("aot", o_aot), ("jit", o_jit), ("luajit", o_lj), ("vm", o_vm), ("lua", o_lua)]
-        reference = outputs[0][1]
+        outputs = [("rust", t_rust, o_rust), ("aot", t_aot, o_aot), ("jit", t_jit, o_jit), ("luajit", t_lj, o_lj), ("vm", t_vm, o_vm), ("lua", t_lua, o_lua)]
+        reference = outputs[0][2]
         def match_val(a, b):
             if a == b:
                 return True
@@ -74,7 +76,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as td:
                 return math.isclose(fa, fb, rel_tol=1e-6)
             except ValueError:
                 return False
-        diff = [name for name, output in outputs[1:] if not match_val(reference, output)]
+        diff = [name for name, timing, output in outputs[1:] if timing != "n/a" and not match_val(reference, output)]
         status = "same" if not diff else "DIFF: rust!=" + ",".join(diff)
         print(f"{prog:<10} {t_rust:>9} {t_aot:>10} {t_lj:>9} {t_jit:>10} {t_vm:>10} {t_lua:>9}   {status}")
 EOF

@@ -1568,7 +1568,7 @@ fn build_command(args: &[String]) {
         is_library,
         opts.max_memory_bytes,
     );
-    let link_libc = runtime_opts.needs_io || runtime_opts.needs_os;
+    let link_libc = runtime_opts.needs_print || runtime_opts.needs_io || runtime_opts.needs_os;
 
     let mut codegen = lust::codegen_zig::ZigCodegen::with_options(runtime_opts);
     let zig_source = match codegen.generate_program(&filtered_items) {
@@ -1935,7 +1935,7 @@ fn run_file_zig_aot(filename: &str) {
         is_library,
         None,
     );
-    let link_libc = runtime_opts.needs_io || runtime_opts.needs_os;
+    let link_libc = runtime_opts.needs_print || runtime_opts.needs_io || runtime_opts.needs_os;
 
     let mut codegen = lust::codegen_zig::ZigCodegen::with_options(runtime_opts);
     let zig_source = match codegen.generate_program(&filtered_items) {

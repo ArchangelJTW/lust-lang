@@ -115,10 +115,23 @@ mod cranelift_aot_object_tests {
                     .parent()
                     .expect("profile dir from CARGO_BIN_EXE_lust")
                     .to_path_buf();
-                let target_dir = profile_dir
+                let mut target_dir = profile_dir
                     .parent()
                     .expect("target dir from profile dir")
                     .to_path_buf();
+                // If CARGO_BIN_EXE_lust is inside `<target_dir>/<triple>/<profile>/`,
+                // step up one more level to `<target_dir>` and pass `--target <triple>`.
+                let cross_triple: Option<String> = if cfg!(all(target_os = "macos", target_arch = "x86_64"))
+                    && target_dir.file_name().and_then(|s| s.to_str()) == Some("x86_64-apple-darwin")
+                {
+                    target_dir = target_dir
+                        .parent()
+                        .expect("root target dir")
+                        .to_path_buf();
+                    Some("x86_64-apple-darwin".to_string())
+                } else {
+                    None
+                };
                 let candidate = profile_dir.join(dylib_filename());
                 if candidate.exists() {
                     return profile_dir;
@@ -133,6 +146,9 @@ mod cranelift_aot_object_tests {
                     .arg("cranelift-aot")
                     .arg("--target-dir")
                     .arg(&target_dir);
+                if let Some(triple) = &cross_triple {
+                    cmd.arg("--target").arg(triple);
+                }
                 if profile_dir.file_name().and_then(|s| s.to_str()) == Some("release") {
                     cmd.arg("--release");
                 }
@@ -186,6 +202,9 @@ mod cranelift_aot_object_tests {
 
         let lib_dir = locate_or_build_liblust_dir();
         let mut cmd = Command::new("cc");
+        if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            cmd.args(["-arch", "x86_64"]);
+        }
         cmd.arg(obj_path)
             .arg(&driver_c)
             .arg(format!("-L{}", lib_dir.display()))
@@ -631,7 +650,11 @@ int main(void) {
         let shim_c_path = tmp.path().join("native_entry_shim.c");
         let shim_exe = tmp.path().join("native_entry_bin");
         fs::write(&shim_c_path, shim_c).expect("write native_entry_shim.c");
-        let cc_out = Command::new("cc")
+        let mut cc_cmd = Command::new("cc");
+        if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            cc_cmd.args(["-arch", "x86_64"]);
+        }
+        let cc_out = cc_cmd
             .arg(&ne_obj)
             .arg(&shim_c_path)
             .arg("-o")

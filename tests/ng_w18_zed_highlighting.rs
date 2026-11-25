@@ -382,9 +382,175 @@ fn test_zed_extension_toml_valid_and_required_fields() {
         rev
     );
 
+    let path = grammar
+        .get("path")
+        .and_then(|v| v.as_str())
+        .expect("[grammars.lust] must specify path");
+    assert_eq!(path, "tree-sitter-lust");
+
+    // Verify the pinned commit ACTUALLY tracks generated parser sources in Git
+    // (not merely existing untracked on disk), so Zed can compile the grammar
+    // without running `tree-sitter generate`.
+    for rel_file in [
+        format!("{}/src/parser.c", path),
+        format!("{}/src/tree_sitter/parser.h", path),
+    ] {
+        let ls_tree = Command::new("git")
+            .args(["ls-tree", rev, "--", &rel_file])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("Failed to execute git ls-tree");
+        assert!(
+            ls_tree.status.success(),
+            "git ls-tree failed for {} at rev {}: {}",
+            rel_file,
+            rev,
+            String::from_utf8_lossy(&ls_tree.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&ls_tree.stdout);
+        let tracked = stdout.lines().any(|line| {
+            line.contains(" blob ") && line.ends_with(&format!("\t{}", rel_file))
+        });
+        assert!(
+            tracked,
+            "[grammars.lust].rev '{}' does not track '{}' in Git (git ls-tree output: {:?})",
+            rev,
+            rel_file,
+            stdout
+        );
+    }
+}
+
+#[test]
+fn test_zed_grammar_compiles_with_wasi_sdk_if_installed() {
+    struct TempDirGuard(PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let ext_path = zed_ext_dir().join("extension.toml");
+    let raw = fs::read_to_string(&ext_path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {}", ext_path.display(), e));
+    let doc: toml::Table = raw
+        .parse()
+        .unwrap_or_else(|e| panic!("Invalid TOML in {}: {}", ext_path.display(), e));
+    let grammar = doc
+        .get("grammars")
+        .and_then(|g| g.get("lust"))
+        .expect("extension.toml must define [grammars.lust]");
+    let rev = grammar
+        .get("rev")
+        .and_then(|v| v.as_str())
+        .expect("[grammars.lust] must specify rev");
+    let grammar_path = grammar
+        .get("path")
+        .and_then(|v| v.as_str())
+        .expect("[grammars.lust] must specify path");
+
+    // Extract parser.c and tree_sitter/parser.h directly from the pinned Git commit
+    // (never trusting untracked files in the working tree).
+    let tmp_root = std::env::temp_dir().join(format!(
+        "lust-zed-grammar-wasi-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_root);
+    let src_dir = tmp_root.join("src");
+    let header_dir = src_dir.join("tree_sitter");
+    fs::create_dir_all(&header_dir).expect("Failed to create temp directory for grammar build");
+    let _guard = TempDirGuard(tmp_root.clone());
+
+    let extract_from_git = |git_rel_path: &str, dest: &Path| {
+        let spec = format!("{}:{}", rev, git_rel_path);
+        let out = Command::new("git")
+            .args(["show", &spec])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap_or_else(|e| panic!("Failed to execute git show {}: {}", spec, e));
+        assert!(
+            out.status.success(),
+            "git show {} failed: {}",
+            spec,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.stdout.is_empty(),
+            "git show {} returned empty content",
+            spec
+        );
+        fs::write(dest, &out.stdout)
+            .unwrap_or_else(|e| panic!("Failed to write {}: {}", dest.display(), e));
+    };
+
+    let parser_c = src_dir.join("parser.c");
+    let parser_h = header_dir.join("parser.h");
+    extract_from_git(&format!("{}/src/parser.c", grammar_path), &parser_c);
+    extract_from_git(
+        &format!("{}/src/tree_sitter/parser.h", grammar_path),
+        &parser_h,
+    );
+
+    let clang_path = std::env::var_os("ZED_WASI_SDK_CLANG")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join("Library/Application Support/Zed/extensions/build/wasi-sdk/bin/clang")
+            })
+        });
+
+    let Some(clang) = clang_path.filter(|p| p.is_file()) else {
+        println!(
+            "SKIP: Zed wasi-sdk clang not installed (verified git show extraction of parser.c and tree_sitter/parser.h from pinned rev {})",
+            rev
+        );
+        return;
+    };
+
+    let wasm_out = tmp_root.join("lust.wasm");
+    let compile = Command::new(&clang)
+        .args([
+            "-fPIC",
+            "-shared",
+            "-Os",
+            "-Wl,--export=tree_sitter_lust",
+            "-Wl,--no-entry",
+            "-Wl,--allow-undefined",
+        ])
+        .arg("-I")
+        .arg(&src_dir)
+        .arg(&parser_c)
+        .arg("-o")
+        .arg(&wasm_out)
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to run {}: {}", clang.display(), e));
+
+    assert!(
+        compile.status.success(),
+        "wasi-sdk clang failed to compile pinned tree-sitter-lust grammar:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let wasm_bytes = fs::read(&wasm_out)
+        .unwrap_or_else(|e| panic!("Failed to read compiled wasm {}: {}", wasm_out.display(), e));
+    assert!(
+        wasm_bytes.len() > 8,
+        "Compiled grammar wasm is unexpectedly small ({} bytes)",
+        wasm_bytes.len()
+    );
     assert_eq!(
-        grammar.get("path").and_then(|v| v.as_str()),
-        Some("tree-sitter-lust")
+        &wasm_bytes[..4],
+        b"\0asm",
+        "Compiled grammar output does not begin with Wasm magic bytes (\\0asm)"
+    );
+    println!(
+        "OK: compiled pinned rev {} tree-sitter-lust grammar to valid Wasm ({} bytes) via {}",
+        rev,
+        wasm_bytes.len(),
+        clang.display()
     );
 }
 

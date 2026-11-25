@@ -13,7 +13,7 @@ repository = "https://github.com/vedmalex/lust-lang"
 # temporarily set `repository = "file:///absolute/path/to/lust-lang"` and update
 # `rev` to your local commit SHA.
 repository = "https://github.com/vedmalex/lust-lang"
-rev = "8d4560344cbe8938377be70f57d9aad0b392c0f9"
+rev = "7013d00abc1b42a73176615685d28e37d85c8caf"
 path = "tree-sitter-lust"
 
 # Optional LSP integration (`lust-analyzer`, built from `crates/lust-analyzer`):

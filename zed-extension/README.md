@@ -19,7 +19,7 @@ Official [Zed](https://zed.dev) language extension for the **Lust** programming 
 4. Select this `zed-extension/` directory.
 5. Open any `.lust` file — Zed will compile the `tree-sitter-lust` grammar and activate highlighting, outline, brackets, and auto-indentation.
 
-> **Local / offline grammar development:** By default, `[grammars.lust]` in [`extension.toml`](extension.toml) references the Git repository at a pinned commit `rev` with `path = "tree-sitter-lust"`. If you are testing uncommitted or unpushed local grammar edits, temporarily point `repository` in `extension.toml` to a local `file://` URL (for example `repository = "file:///Users/you/work/lust-lang/repos/lust-lang-fork"`) and set `rev` to your local commit SHA, then run **`zed: rebuild dev extension`**.
+> **Local / offline grammar development:** By default, `[grammars.lust]` in [`extension.toml`](extension.toml) references `https://github.com/vedmalex/lust-lang` at a pinned commit `rev` with `path = "tree-sitter-lust"`. Note that `rev` must be pushed to `origin` before Zed's remote fetch from `https://github.com/vedmalex/lust-lang` will succeed. If you are testing unpushed local commits, temporarily set `repository = "file:///absolute/path/to/lust-lang-fork"` in `extension.toml`, delete any stale `zed-extension/grammars/` build cache directory, and then run **`zed: install dev extension`** (or **`zed: rebuild dev extension`**).
 
 ## Syncing Grammar & Queries
 
@@ -42,7 +42,7 @@ Whenever [`tree-sitter-lust/grammar.js`](../tree-sitter-lust/grammar.js) is upda
 
 All `.scm` queries are strictly grounded in the current `tree-sitter-lust/src/node-types.json` so Zed loads every query with zero errors.
 
-- **Supported directly by `tree-sitter-lust`**: functions, lambdas, methods (`Type:method`), structs, enums, traits, impls, generics (`<T: Bound>`), modules, `use` imports, `extern` blocks, control flow (`if`/`elseif`/`else`/`while`/`for`/`do`/`return`/`break`/`continue`), `is`/`as`/`?` expressions, patterns, arrays, maps, tuples, numbers (hex/bin/oct/float; numeric underscores are present in `grammar.js` and take effect after running `tree-sitter generate`), strings, booleans, `--` / `#` / `--[[ ... ]]` comments, and `---` doc comments.
+- **Supported directly by `tree-sitter-lust`**: functions, lambdas, methods (`Type:method`), structs, enums, traits, impls, generics (`<T: Bound>`), modules, `use` imports, `extern` blocks, control flow (`if`/`elseif`/`else`/`while`/`for`/`do`/`return`/`break`/`continue`), `is`/`as`/`?` expressions, patterns, arrays, maps, tuples, numbers (hex/bin/oct/float and numeric underscores — `tree-sitter-lust/src/parser.c` is tracked in Git and passes all `numeric_literals` corpus tests), strings, booleans, `--` / `#` / `--[[ ... ]]` comments, and `---` doc comments.
 - **Modern Lust constructs not yet modeled as grammar rules in `tree-sitter-lust`**: `schema`, `service`, `provide`, `handle`, `with`, `effect`, `perform`, `resume`, `defer`, `errdefer`, `scoped`, pipe operator `|>`, and `&mut`. Reserved lexer keywords (`defer`, `errdefer`, `scoped`) are highlighted via identifier-match rules in `highlights.scm`; full AST support will be unlocked once added to `tree-sitter-lust/grammar.js`.
 
 ## Future LSP Integration (`lust-analyzer`)

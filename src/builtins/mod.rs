@@ -3143,11 +3143,12 @@ mod tests {
     #[test]
     fn test_table_functions_registered() {
         let funcs = table_functions();
-        assert_eq!(funcs.len(), 15);
+        assert_eq!(funcs.len(), 22);
         let names: Vec<&str> = funcs.iter().map(|f| f.name).collect();
         assert!(names.contains(&"table.len"));
         assert!(names.contains(&"table.is_empty"));
         assert!(names.contains(&"table.get"));
+        assert!(names.contains(&"table.set"));
         assert!(names.contains(&"table.first"));
         assert!(names.contains(&"table.last"));
         assert!(names.contains(&"table.push"));
@@ -3160,13 +3161,19 @@ mod tests {
         assert!(names.contains(&"table.clear"));
         assert!(names.contains(&"table.contains"));
         assert!(names.contains(&"table.slice"));
+        assert!(names.contains(&"table.map"));
+        assert!(names.contains(&"table.filter"));
+        assert!(names.contains(&"table.reduce"));
+        assert!(names.contains(&"table.iter"));
+        assert!(names.contains(&"table.unpack"));
+        assert!(names.contains(&"table.move"));
     }
 
     #[test]
     fn test_table_module_in_database() {
         let db = builtins();
         let table_mod = db.module("table").expect("table module must exist in builtins");
-        assert_eq!(table_mod.functions().len(), 15);
+        assert_eq!(table_mod.functions().len(), 22);
     }
 
     #[test]

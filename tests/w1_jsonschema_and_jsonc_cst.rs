@@ -229,7 +229,7 @@ fn test_strict_export_fail_closed_on_refine_and_transform() {
             DataValue::String(value) => value.starts_with('A'),
             _ => false,
         }, "Starts with A");
-        
+
 
     let err_refine = schema_refine.to_json_schema().unwrap_err();
     assert!(matches!(err_refine, SchemaExportError::NonPortableConstraint(_)));
@@ -251,7 +251,7 @@ fn test_strict_export_fail_closed_on_refine_and_transform() {
             DataValue::String(value) => DataValue::String(value.to_uppercase()),
             other => other,
         });
-        
+
 
     let err_transform = schema_transform.to_json_schema().unwrap_err();
     assert!(matches!(err_transform, SchemaExportError::NonPortableTransform(_)));

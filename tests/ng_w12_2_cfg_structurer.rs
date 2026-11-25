@@ -1419,4 +1419,3 @@ fn test_negated_while_general_loop_and_nested_labeled_break_continue() {
         }
     }
 }
-

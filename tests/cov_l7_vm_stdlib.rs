@@ -1457,4 +1457,3 @@ fn test_os_and_io_advanced_error_branches() {
     let env_bad = call_map_entry(&mut vm, "os", "get_env", vec![Value::Int(123)]).unwrap();
     assert_eq!(env_bad, Value::err(Value::string("os.get_env(name) requires a string name")));
 }
-

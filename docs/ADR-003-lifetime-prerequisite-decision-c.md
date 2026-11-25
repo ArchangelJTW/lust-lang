@@ -1,10 +1,10 @@
 # ADR-003: RFC §15 Decision C — Static Lifetime Model ('s) and Borrow Prerequisite
 
-**Status:** ACCEPTED / DECIDED  
-**Date:** 2026-11-14  
-**Target:** `lust-rs` 3.5.8 (`repos/lust-lang-fork`, Wave 0 Track 0C `D-LIFE-ADR`)  
-**Deciders:** Project Coordinator / Architecture Review  
-**Consulted:** `RFC_FIRST_CLASS_DATA_FORMATS_AND_SCHEMAS.md` (§4, §15 Decision C), `DEFERRED_DEPENDENCY_TREE.md` (`D-LIFE-ADR`, `D-LIFE`), `AGENTS.md`  
+**Status:** ACCEPTED / DECIDED
+**Date:** 2026-11-14
+**Target:** `lust-rs` 3.5.8 (`repos/lust-lang-fork`, Wave 0 Track 0C `D-LIFE-ADR`)
+**Deciders:** Project Coordinator / Architecture Review
+**Consulted:** `RFC_FIRST_CLASS_DATA_FORMATS_AND_SCHEMAS.md` (§4, §15 Decision C), `DEFERRED_DEPENDENCY_TREE.md` (`D-LIFE-ADR`, `D-LIFE`), `AGENTS.md`
 
 ---
 

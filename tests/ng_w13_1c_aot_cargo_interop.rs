@@ -489,6 +489,7 @@ end
             dependency_dirs: Vec::new(),
         }],
         lto_thin: true,
+        ..RustLinkOptions::default()
     };
     AotCompiler::compile_source_rust_with_rlibs(lust_src, &api_bin, &opts, &links)
         .expect("compile_source_rust_with_rlibs");

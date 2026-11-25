@@ -1665,4 +1665,3 @@ fn test_perf_t4_2_adv4_compile_time_cfg_exit_completeness_verifier_runs() {
         promoted_loop_cfg_verifications()
     );
 }
-

@@ -204,7 +204,7 @@ fn test_mir_lowering_regex_literal_not_unit() {
     }).expect("test_mir function found");
 
     let mir = AstLowering::lower_function(&func).expect("mir lowering should succeed");
-    
+
     // Scan all basic blocks for assignments from regex literal
     let mut found_string_const = false;
     let mut found_unit_fallback = false;

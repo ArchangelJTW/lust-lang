@@ -693,4 +693,3 @@ fn test_adversarial_counterexamples_and_teeth() {
     assert!(format!("{}", err_neg_min_overflow).contains("Integer overflow in pattern negation"),
         "Negation of i64::MIN in pattern must overflow: {}", err_neg_min_overflow);
 }
-

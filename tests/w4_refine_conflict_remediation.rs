@@ -839,5 +839,3 @@ fn test_named_parameter_evidence_propagation_with_params() {
     let out = unsafe { native_fn(23) };
     assert_eq!(out, 123, "Oracle mismatch: expected 123, got {}", out);
 }
-
-

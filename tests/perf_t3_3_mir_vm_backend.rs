@@ -2009,5 +2009,3 @@ fn test_perf_t3_3_adv_unreachable_block_and_cfg_terminator_edge_cases() {
         Value::Int(11)
     );
 }
-
-

@@ -802,11 +802,11 @@ module.exports = grammar({
       /0[bB][01](_?[01])*/,
       // Octal
       /0[oO][0-7](_?[0-7])*/,
-      // Float с точкой и опциональной экспонентой
+      // Float with decimal point and optional exponent
       /[0-9](_?[0-9])*\.[0-9](_?[0-9])*([eE][+-]?[0-9](_?[0-9])*)?/,
-      // Float без точки с экспонентой
+      // Float without decimal point with exponent
       /[0-9](_?[0-9])*[eE][+-]?[0-9](_?[0-9])*/,
-      // Integer с поддержкой подчеркиваний
+      // Integer with underscore separators
       /[0-9](_?[0-9])*/,
     )),
 

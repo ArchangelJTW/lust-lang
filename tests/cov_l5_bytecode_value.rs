@@ -1985,4 +1985,3 @@ fn test_jit_guards_and_method_calls_safe() {
         assert!(format!("{:?}", enum_obj).contains("Enum { enum: \"Status\", variant: \"Ready\""));
     }
 }
-

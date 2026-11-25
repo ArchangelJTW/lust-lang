@@ -2725,14 +2725,3 @@ fn test_execution_lua_userdata_call_and_function_unit_signature() {
     let res = vm.call_value(&lua_val, vec![Value::Int(21)]).expect("invoke __call");
     assert_eq!(res, Value::Int(42));
 }
-
-
-
-
-
-
-
-
-
-
-

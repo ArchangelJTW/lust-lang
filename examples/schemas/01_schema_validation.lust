@@ -123,7 +123,7 @@ suite "Schema Definition & Validation Suite" do
 
     test "optional field constraints and bounds enforcement" do
         local schema = UserProfileSchema.build_default()
-        
+
         -- Age omitted (Option.None) is valid because optional
         local no_age_doc = UserPayload {
             id = 1042,

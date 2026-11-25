@@ -1161,4 +1161,3 @@ fn test_rx_environment_custom_clock_constructor() {
     assert_eq!(env.now_nanos(), 999_999);
     assert!(env.clock().is_virtual());
 }
-

@@ -100,13 +100,13 @@ end
 function main(): ()
     local data = fetch_data("https://example.com")
     assert(data == "response_body")
-    
+
     local tx_ok = process_transaction(101)
     assert(tx_ok == true)
-    
+
     local result = run_pipeline()
     assert(result == 42)
-    
+
     println("Lust Effect System v2.0 syntax validated.")
 end
 

@@ -374,7 +374,3 @@ fn vm04_task_stop_does_not_clear_parent_stack() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("CALLER_ALIVE"), "task.stop must not clear parent call stack; stderr: {}", String::from_utf8_lossy(&output.stderr));
 }
-
-
-
-

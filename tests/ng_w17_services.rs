@@ -1,12 +1,24 @@
+#[cfg(all(feature = "net-services", feature = "svc-reqwest"))]
 #[path = "../src/stdlib/services/reqwest_adapter.rs"]
 mod reqwest_adapter;
+#[cfg(all(feature = "net-services", feature = "svc-sqlx"))]
 #[path = "../src/stdlib/services/sqlx_adapter.rs"]
 mod sqlx_adapter;
 
+#[cfg(all(
+    feature = "net-services",
+    any(feature = "svc-reqwest", feature = "svc-sqlx")
+))]
 use lust::config::LustConfig;
+#[cfg(all(feature = "net-services", feature = "svc-reqwest"))]
 use lust::stdlib::net::CancelToken;
+#[cfg(all(
+    feature = "net-services",
+    any(feature = "svc-reqwest", feature = "svc-sqlx")
+))]
 use std::time::Duration;
 
+#[cfg(all(feature = "net-services", feature = "svc-reqwest"))]
 #[tokio::test]
 async fn adapters_deny_before_connecting() {
     let mut config = LustConfig::default();
@@ -15,6 +27,7 @@ async fn adapters_deny_before_connecting() {
     assert!(matches!(denied, Err(lust::stdlib::net::NetError::CapabilityDenied(_))));
 }
 
+#[cfg(all(feature = "net-services", feature = "svc-reqwest"))]
 #[tokio::test]
 async fn reqwest_uses_deterministic_loopback() {
     use std::{io::{Read, Write}, net::TcpListener, thread};
@@ -30,6 +43,7 @@ async fn reqwest_uses_deterministic_loopback() {
     assert_eq!(status, 200); assert_eq!(body, b"ok"); server.join().unwrap();
 }
 
+#[cfg(all(feature = "net-services", feature = "svc-sqlx"))]
 #[tokio::test]
 async fn sqlx_memory_database_supports_bound_values() {
     let config = LustConfig::default();
@@ -39,6 +53,7 @@ async fn sqlx_memory_database_supports_bound_values() {
     pool.close().await;
 }
 
+#[cfg(all(feature = "net-services", feature = "svc-sqlx"))]
 #[tokio::test]
 async fn sqlx_transaction_rolls_back_on_error() {
     let config = LustConfig::default();
@@ -53,6 +68,7 @@ async fn sqlx_transaction_rolls_back_on_error() {
     assert_eq!(count, 0);
 }
 
+#[cfg(all(feature = "net-services", feature = "svc-sqlx"))]
 #[tokio::test]
 async fn sqlx_connect_timeout_is_reported() {
     let config = LustConfig::default();
@@ -60,6 +76,7 @@ async fn sqlx_connect_timeout_is_reported() {
     assert!(matches!(result, Err(lust::stdlib::net::NetError::Timeout(_))));
 }
 
+#[cfg(all(feature = "net-services", feature = "svc-reqwest"))]
 #[tokio::test]
 async fn reqwest_reports_http_error_status() {
     use std::{io::{Read, Write}, net::TcpListener, thread};
@@ -74,6 +91,7 @@ async fn reqwest_reports_http_error_status() {
     assert_eq!(status, 500); assert_eq!(body, b"bad"); server.join().unwrap();
 }
 
+#[cfg(all(feature = "net-services", feature = "svc-reqwest"))]
 #[tokio::test]
 async fn reqwest_in_flight_cancellation_is_reported() {
     use std::{io::Read, net::TcpListener, thread};

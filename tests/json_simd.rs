@@ -729,4 +729,3 @@ fn test_simd_rejects_invalid_utf8_across_all_dispatches() {
         }
     }
 }
-

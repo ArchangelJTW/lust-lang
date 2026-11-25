@@ -2115,6 +2115,8 @@ mod compiled_semantics_tests {
             assert_eq!(result.as_int(), Some(1));
             assert_eq!(Rc::strong_count(rc), before);
         }
+        // Legacy Dynasm counter assertion: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
         assert!(program.jit_stats().functions_compiled >= 1);
         assert_eq!(value.array_len(), Some(1));
     }
@@ -2182,6 +2184,8 @@ mod compiled_semantics_tests {
         );
     }
 
+    // Legacy Dynasm whole-function JIT test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(feature = "legacy-dynasm")]
     #[test]
     fn b05_recursion_compiles_and_runs() {
         let mut program = program(
@@ -2208,6 +2212,8 @@ mod compiled_semantics_tests {
         );
     }
 
+    // Legacy Dynasm whole-function JIT test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(feature = "legacy-dynasm")]
     #[test]
     fn whole_function_map_callable_in_place_mutation_regression() {
         use crate::bytecode::value::{native_fn, NativeCallResult};

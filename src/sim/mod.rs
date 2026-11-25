@@ -303,4 +303,3 @@ impl Drop for SimModeGuard {
         set_simulated_mode(self.prev);
     }
 }
-

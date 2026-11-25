@@ -245,7 +245,7 @@ fn test_gate_08_probe_replace_all_repeated_scans_charged_under_shared_envelope()
     let re = BoundedRegex::new(r"x").expect("valid regex");
     // Text with repeated 'x' matches interspersed: x...x...x...
     let text = "a".repeat(100) + "x" + &"a".repeat(100) + "x" + &"a".repeat(100) + "x";
-    
+
     // Low-budget tracker where single-pass fits but unmetered repeated scans would exceed
     let mut tracker = RegexWorkTracker::new(text.len(), 1, text.len() * 2).unwrap();
     // Constrain budget so match 1 succeeds (506 units), while repeated scans across all chunks exceed budget
@@ -265,11 +265,11 @@ fn test_gate_08_probe_replace_all_repeated_scans_charged_under_shared_envelope()
 fn test_gate_08_probe_reverse_search_work_charged_before_scan() {
     let re = BoundedRegex::new(r"world").expect("valid regex");
     let text = "hello ".to_string() + &"a".repeat(500) + " world";
-    
+
     let mut tracker = RegexWorkTracker::new(text.len(), 1, 0).unwrap();
     // Constrain budget so forward scan (n) fits, but forward + reverse (n + end) exceeds
     tracker.max_budget = text.len() as u64 + 10;
-    
+
     let res = lust::regex::find_with_tracker(re.plan(), &text, &mut tracker);
     assert!(res.is_err(), "Reverse search exceeding work envelope must fail closed");
     assert!(matches!(res.unwrap_err(), RegexError::BudgetExceeded { .. }));
@@ -281,11 +281,11 @@ fn test_gate_08_probe_opaque_cancellation_unsupported_without_bounded_adapter() 
     let re = BoundedRegex::new(r"a*z").expect("valid regex");
     let cancel_token = Arc::new(AtomicBool::new(false)); // active, not pre-cancelled
     let re_with_cancel = re.with_cancellation(cancel_token);
-    
+
     // Input exceeding POLL_INTERVAL_WORK_UNITS (4096)
     let long_input = "a".repeat(10_000);
     let res = re_with_cancel.is_match(&long_input);
-    
+
     // Per RFC §6.5.2 and Luna plan: opaque DFA crate without instrumented adapter
     // cannot claim cooperative cancellation mid-scan (>4096 bytes) and must return UnsupportedBackendFeature
     assert!(res.is_err());
@@ -332,4 +332,3 @@ fn test_gate_08_probe_replace_all_suffix_scan_budget_preflighted() {
         tracker.bytes_scanned
     );
 }
-

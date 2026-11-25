@@ -237,5 +237,3 @@ pub fn virtual_rx_functions() -> Vec<(&'static str, &'static str)> {
         ("interval", "rx.interval"),
     ]
 }
-
-

@@ -920,4 +920,3 @@ fn test_reverse_copy_chain_over_40_hops() {
         );
     }
 }
-

@@ -1004,6 +1004,11 @@ impl<'a> MirToBytecodeCompiler<'a> {
 
     fn emit_get_field(&mut self, dst: Register, base: &Place, field_idx: usize, line: usize) {
         let base_reg = self.place_to_reg(base);
+        if matches!(self.place_type(base), MirType::Tuple(_)) && field_idx <= u8::MAX as usize {
+            self.chunk
+                .emit(Instruction::TupleGet(dst, base_reg, field_idx as u8), line);
+            return;
+        }
         if self.can_emit_struct_field_slot(base, field_idx) {
             self.chunk
                 .emit(Instruction::GetFieldSlot(dst, base_reg, field_idx as u8), line);

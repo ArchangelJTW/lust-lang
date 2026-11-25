@@ -148,7 +148,7 @@ suite "Binary Document Serialization & Struct Materialization Suite" do
         local binary_bytes = encode_settlement_record(original)
 
         assert(string.len(binary_bytes) >= 40, "Binary payload must exceed 40 bytes")
-        
+
         local view = BinaryView.new(binary_bytes, layout)
         local mat_res = materialize_struct(view)
 

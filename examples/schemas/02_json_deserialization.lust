@@ -160,7 +160,7 @@ impl JsonDecoder
 
             local val_res = self:parse_value()
             if val_res is Err(err) then return Result.Err(err) end
-            
+
             map.set(fields, key, val_res:unwrap())
             table.push(key_order, key)
 

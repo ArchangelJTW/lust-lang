@@ -2049,6 +2049,8 @@ end
                     .unwrap(),
                 Value::Int(5050)
             );
+            // Legacy Dynasm trace counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+            #[cfg(feature = "legacy-dynasm")]
             if jit && cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
                 assert!(program.jit_stats().root_traces_compiled >= 2);
                 assert!(program.jit_stats().native_trace_entries >= 2);
@@ -2771,7 +2773,8 @@ end
         assert_eq!(res_subsequent_call, Value::Int(110));
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn jit_guard_exit_resumes_at_bailout_ip() {
         use crate::jit::TraceId;
@@ -2826,7 +2829,7 @@ end
         ));
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn counting_loop() -> Function {
         let mut function = Function::new("count", 1, false);
         function.set_register_count(5);
@@ -2843,7 +2846,7 @@ end
         function
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn recursive_sum(function_idx: usize) -> Function {
         let mut function = Function::new("sum_down", 1, false);
         function.set_register_count(9);
@@ -2864,7 +2867,7 @@ end
         function
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn loop_calling_recursive_sum() -> Function {
         let mut function = Function::new("sum_in_loop", 1, false);
         function.set_register_count(11);
@@ -2890,7 +2893,7 @@ end
         function
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn nested_counting_loop() -> Function {
         let mut function = Function::new("nested_count", 0, false);
         function.set_register_count(9);
@@ -2918,7 +2921,8 @@ end
         function
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn hot_loop_compiles_executes_and_reuses_its_trace() {
         let mut vm = VM::new();
@@ -2941,7 +2945,8 @@ end
         assert!(second.native_trace_entries > first.native_trace_entries);
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn short_hot_loop_retries_recording_on_a_later_call() {
         let mut vm = VM::new();
@@ -2965,7 +2970,8 @@ end
         assert!(second.native_trace_entries > 0);
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm profiler test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn pure_recursion_is_profiled_without_becoming_a_loop_trace() {
         let mut vm = VM::new();
@@ -2983,7 +2989,8 @@ end
         assert_eq!(stats.native_trace_entries, 0);
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn hot_loop_can_trace_across_an_opaque_recursive_call() {
         let mut vm = VM::new();
@@ -2999,7 +3006,8 @@ end
         assert!(stats.recursive_calls > 0);
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn nested_loop_recording_does_not_mix_enclosing_backedges() {
         let mut vm = VM::new();
@@ -3012,7 +3020,8 @@ end
         assert!(vm.jit_stats().recordings_aborted > 0);
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn jit_struct_fast_path_ordered_and_scrambled() {
         let code = r#"
@@ -3066,7 +3075,8 @@ end
         );
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn jit_struct_value_types_and_nested() {
         let code = r#"
@@ -3283,7 +3293,8 @@ end
         assert_eq!(vm.jit_stats().struct_slow_path_fallbacks, 3);
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm whole-function JIT test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn jit_struct_destination_aliasing_argument_real_jit() {
         use crate::ast::{Span, Type, TypeKind};
@@ -3371,7 +3382,8 @@ end
         assert!(stats2.struct_fast_path_hits > prev_hits, "fast path must be hit in JIT when dest aliases second field");
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn jit_struct_empty_fields_real_jit() {
         let code = r#"
@@ -3401,7 +3413,8 @@ end
         assert!(stats.struct_fast_path_hits > 0, "empty struct must hit fast path in JIT");
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn jit_struct_weak_option_fallback_real_jit() {
         let code = r#"
@@ -3478,9 +3491,13 @@ end
         let res = program.call_raw("main.loop_alloc", vec![Value::Int(150)]).unwrap();
         assert_eq!(res, Value::Int(11175));
 
-        let stats = program.vm().jit_stats();
-        assert!(stats.native_trace_entries > 0, "native JIT trace must execute");
-        assert!(stats.struct_fast_path_hits > 0, "structs must hit fast path");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(stats.native_trace_entries > 0, "native JIT trace must execute");
+            assert!(stats.struct_fast_path_hits > 0, "structs must hit fast path");
+        }
 
         // 1. Verify live Weak handle for JIT-allocated acyclic struct:
         // Demonstrates that acyclic structs are reclaimed immediately via standard Rc refcounting,
@@ -3569,9 +3586,13 @@ end
         let sum = program.call_raw("main.loop_weak_deref", vec![Value::Int(50)]).unwrap();
         assert_eq!(sum, Value::Int(350)); // 50 * 7
 
-        let stats = program.vm().jit_stats();
-        assert!(stats.struct_slow_path_fallbacks > 0, "weak structs must fall back to slow path");
-        assert_eq!(stats.struct_fast_path_hits, 0, "fast path must not be taken for weak structs");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(stats.struct_slow_path_fallbacks > 0, "weak structs must fall back to slow path");
+            assert_eq!(stats.struct_fast_path_hits, 0, "fast path must not be taken for weak structs");
+        }
 
         // 2. Test dropped target: weak reference becomes dead / Option::None
         let dropped_holder = program.call_raw("main.make_dropped", vec![]).unwrap();
@@ -3604,7 +3625,8 @@ end
         }
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn jit_trace_recorder_new_struct_aliasing_and_bailout() {
         use crate::ast::{Span, Type, TypeKind};
@@ -4015,10 +4037,14 @@ end
         vm.load_functions(vec![f]);
 
         let res = vm.call("make_cyclic_pair", vec![Value::Int(30)]).unwrap();
-        let stats = vm.jit_stats();
-        assert!(stats.root_traces_compiled >= 1, "cyclic loop trace must compile in JIT");
-        assert!(stats.native_trace_entries > 0, "native JIT trace must execute");
-        assert!(stats.struct_fast_path_hits > 0, "fast path hits must be recorded");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = vm.jit_stats();
+            assert!(stats.root_traces_compiled >= 1, "cyclic loop trace must compile in JIT");
+            assert!(stats.native_trace_entries > 0, "native JIT trace must execute");
+            assert!(stats.struct_fast_path_hits > 0, "fast path hits must be recorded");
+        }
 
         let (weak_a, weak_b) = if let Value::Struct(ref node_a) = res {
             let weak_a = Rc::downgrade(node_a);
@@ -4143,9 +4169,13 @@ end
             .unwrap();
         let jit_res = jit_prog.call_raw("main.sieve_sub", vec![Value::Int(500)]).unwrap();
 
-        let stats = jit_prog.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1, "JIT must compile root traces for hot loop");
-        assert!(stats.native_trace_entries > 0, "JIT must execute native traces");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = jit_prog.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1, "JIT must compile root traces for hot loop");
+            assert!(stats.native_trace_entries > 0, "JIT must execute native traces");
+        }
 
         // Verify differential: VM and JIT produce identical count!
         assert_eq!(vm_res, jit_res, "VM and JIT results must be strictly identical");
@@ -4195,10 +4225,14 @@ end
         // 119 elements are true, 1 is 99 (not true)
         assert_eq!(res, Value::Int(119));
 
-        let stats = program.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1, "trace must compile for hot boolean loop");
-        assert!(stats.native_trace_entries > 0, "native trace must be entered");
-        assert!(stats.guard_exits > 0, "mixed value must trigger guard exit to interpreter");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1, "trace must compile for hot boolean loop");
+            assert!(stats.native_trace_entries > 0, "native trace must be entered");
+            assert!(stats.guard_exits > 0, "mixed value must trigger guard exit to interpreter");
+        }
 
         // Verify the array preserves both booleans and the mixed integer
         if let Value::Array(ref rc) = arr_val {
@@ -4246,9 +4280,13 @@ end
             .unwrap();
 
         let res = program.call_raw("main.alias_mutation", vec![Value::Int(80)]).unwrap();
-        let stats = program.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1);
-        assert!(stats.native_trace_entries > 0);
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1);
+            assert!(stats.native_trace_entries > 0);
+        }
 
         // Every element of 'a' must have been updated to false via 'b'
         if let Value::Array(ref rc) = res {
@@ -4451,9 +4489,13 @@ end
             .unwrap();
 
         let res = program.call_raw("main.push_many", vec![Value::Int(3000)]).unwrap();
-        let stats = program.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1);
-        assert!(stats.native_trace_entries > 0);
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1);
+            assert!(stats.native_trace_entries > 0);
+        }
 
         if let Value::Array(ref rc) = res {
             let borrowed = rc.borrow();
@@ -4504,9 +4546,13 @@ end
 
         // Push across multiple geometric growth boundaries (cap: 0 -> 4 -> 8 -> ... -> 16384)
         let res = program.call_raw("main.init_sieve", vec![Value::Int(10000)]).unwrap();
-        let stats = program.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1, "sieve push loop must compile root trace");
-        assert!(stats.native_trace_entries > 0, "sieve push loop must execute natively");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1, "sieve push loop must compile root trace");
+            assert!(stats.native_trace_entries > 0, "sieve push loop must execute natively");
+        }
 
         if let Value::Array(ref rc) = res {
             assert_eq!(rc.borrow().len(), 10001);
@@ -4530,7 +4576,8 @@ end
         assert!(format!("{err}").to_lowercase().contains("memory budget"));
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn sieve_002_callable_substitution_defect_red() {
         use crate::config::LustConfig;
@@ -4610,7 +4657,8 @@ end
         }
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn sieve_002_guard_globals_mutable_map_red() {
         use crate::config::LustConfig;
@@ -4748,12 +4796,18 @@ end
         assert_eq!(res_jit, Value::Int(5000));
         assert_eq!(res_jit, res_vm, "JIT and VM results must match exactly");
 
-        let stats = prog_jit.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1, "must compile root trace for array.len");
-        assert!(stats.native_trace_entries > 0, "must execute native trace");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = prog_jit.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1, "must compile root trace for array.len");
+            assert!(stats.native_trace_entries > 0, "must execute native trace");
+        }
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace guard test: Dynasm JIT was retired in favor of Cranelift JIT,
+    // and unshadowed `array.len` now lowers directly to `Instruction::ArrayLen`.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn test_array_len_jit_callable_substitution_guard() {
         use crate::config::LustConfig;
@@ -4788,9 +4842,13 @@ end
             .call_raw("main.sum_len", vec![arr.clone(), Value::Int(1000)])
             .unwrap();
         assert_eq!(res1, Value::Int(3000));
-        let stats = program.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1);
-        assert!(stats.native_trace_entries > 0);
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1);
+            assert!(stats.native_trace_entries > 0);
+        }
 
         // 2. Substitute array.len with custom function returning 42
         let custom_calls = Rc::new(Cell::new(0usize));
@@ -4871,9 +4929,13 @@ end
 
         assert_eq!(res_jit, res_vm, "differential parity between JIT and VM failed");
 
-        let stats = prog_jit.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1);
-        assert!(stats.native_trace_entries > 0);
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = prog_jit.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1);
+            assert!(stats.native_trace_entries > 0);
+        }
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -4924,10 +4986,15 @@ end
         assert_eq!(res_jit1, Value::Int(3000));
         assert_eq!(res_jit1, res_vm1);
 
-        let stats1 = prog_jit.vm().jit_stats();
-        assert!(stats1.root_traces_compiled >= 1, "must compile trace");
-        let entries1 = stats1.native_trace_entries;
-        assert!(entries1 > 0, "must execute native trace");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        let entries1 = {
+            let stats1 = prog_jit.vm().jit_stats();
+            assert!(stats1.root_traces_compiled >= 1, "must compile trace");
+            let entries1 = stats1.native_trace_entries;
+            assert!(entries1 > 0, "must execute native trace");
+            entries1
+        };
 
         // 2. Growth via alias: push 4 elements into arr_alias -> length is now 7
         if let Value::Array(ref rc) = arr_alias {
@@ -4947,12 +5014,15 @@ end
         assert_eq!(res_jit2, Value::Int(7000), "must dynamically reflect growth via alias");
         assert_eq!(res_jit2, res_vm2);
 
-        let stats2 = prog_jit.vm().jit_stats();
-        assert!(
-            stats2.native_trace_entries > entries1,
-            "must continue executing native trace on grown array"
-        );
-        let entries2 = stats2.native_trace_entries;
+        #[cfg(feature = "legacy-dynasm")]
+        let entries2 = {
+            let stats2 = prog_jit.vm().jit_stats();
+            assert!(
+                stats2.native_trace_entries > entries1,
+                "must continue executing native trace on grown array"
+            );
+            stats2.native_trace_entries
+        };
 
         // 3. Shrinkage via alias: pop 5 elements -> length is now 2
         if let Value::Array(ref rc) = arr_alias {
@@ -4972,12 +5042,15 @@ end
         assert_eq!(res_jit3, Value::Int(2000), "must dynamically reflect shrinkage via alias");
         assert_eq!(res_jit3, res_vm3);
 
-        let stats3 = prog_jit.vm().jit_stats();
-        assert!(
-            stats3.native_trace_entries > entries2,
-            "must continue executing native trace on shrunk array"
-        );
-        let entries3 = stats3.native_trace_entries;
+        #[cfg(feature = "legacy-dynasm")]
+        let entries3 = {
+            let stats3 = prog_jit.vm().jit_stats();
+            assert!(
+                stats3.native_trace_entries > entries2,
+                "must continue executing native trace on shrunk array"
+            );
+            stats3.native_trace_entries
+        };
 
         // 4. Shrinkage to empty array: pop remaining 2 elements -> length is now 0
         if let Value::Array(ref rc) = arr_alias {
@@ -4995,11 +5068,14 @@ end
         assert_eq!(res_jit4, Value::Int(0), "empty array length must evaluate to 0");
         assert_eq!(res_jit4, res_vm4);
 
-        let stats4 = prog_jit.vm().jit_stats();
-        assert!(
-            stats4.native_trace_entries > entries3,
-            "must continue executing native trace on empty array"
-        );
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats4 = prog_jit.vm().jit_stats();
+            assert!(
+                stats4.native_trace_entries > entries3,
+                "must continue executing native trace on empty array"
+            );
+        }
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -5077,9 +5153,13 @@ end
 
         assert_eq!(res_jit, res_vm, "JIT with in-loop FFI mutation must match VM interpreter");
 
-        let stats = prog_jit.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1, "must compile trace");
-        assert!(stats.native_trace_entries > 0, "must execute native trace");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = prog_jit.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1, "must compile trace");
+            assert!(stats.native_trace_entries > 0, "must execute native trace");
+        }
         assert_eq!(
             arr_jit.array_len(),
             arr_vm.array_len(),
@@ -5091,8 +5171,11 @@ end
     #[test]
     fn test_array_len_jit_invalid_args_borrow_semantics_guard_bailout() {
         use crate::bytecode::value::jit_array_len_safe;
+        #[cfg(feature = "legacy-dynasm")]
         use crate::config::LustConfig;
+        #[cfg(feature = "legacy-dynasm")]
         use std::cell::Cell;
+        #[cfg(feature = "legacy-dynasm")]
         use std::rc::Rc;
 
         // 1. Invalid arguments and arity directly on stdlib array.len callable
@@ -5182,79 +5265,84 @@ end
             panic!("expected Array");
         }
 
-        // 3. JIT Trace Guard Bailout and effect verification
-        let source = r#"
-            function sum_len_bailout(arr: Array<int>, n: int): int
-                local total = 0
-                local i = 0
-                while i < n do
-                    total = total + array.len(arr)
-                    i = i + 1
+        // 3. Legacy Dynasm JIT Trace Guard Bailout and effect verification
+        // (Dynasm JIT was retired in favor of Cranelift JIT, and unshadowed `array.len`
+        // lowers directly to `Instruction::ArrayLen`.)
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let source = r#"
+                function sum_len_bailout(arr: Array<int>, n: int): int
+                    local total = 0
+                    local i = 0
+                    while i < n do
+                        total = total + array.len(arr)
+                        i = i + 1
+                    end
+                    return total
                 end
-                return total
-            end
-        "#;
+            "#;
 
-        let mut config = LustConfig::default();
-        config.set_jit_enabled(true);
-        let mut program = crate::EmbeddedProgram::builder()
-            .with_config(config)
-            .module("main", source)
-            .entry_module("main")
-            .compile()
-            .unwrap();
+            let mut config = LustConfig::default();
+            config.set_jit_enabled(true);
+            let mut program = crate::EmbeddedProgram::builder()
+                .with_config(config)
+                .module("main", source)
+                .entry_module("main")
+                .compile()
+                .unwrap();
 
-        let arr = Value::array(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)]);
+            let arr = Value::array(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)]);
 
-        // Step A: Warmup and compile loop trace with standard intrinsic array.len
-        let res_warm = program
-            .call_raw("main.sum_len_bailout", vec![arr.clone(), Value::Int(1000)])
-            .unwrap();
-        assert_eq!(res_warm, Value::Int(4000));
+            // Step A: Warmup and compile loop trace with standard intrinsic array.len
+            let res_warm = program
+                .call_raw("main.sum_len_bailout", vec![arr.clone(), Value::Int(1000)])
+                .unwrap();
+            assert_eq!(res_warm, Value::Int(4000));
 
-        let stats_warm = program.vm().jit_stats();
-        assert!(stats_warm.root_traces_compiled >= 1, "must compile root trace");
-        assert!(stats_warm.native_trace_entries > 0, "must enter native trace");
-        let guard_exits_before = stats_warm.guard_exits;
+            let stats_warm = program.vm().jit_stats();
+            assert!(stats_warm.root_traces_compiled >= 1, "must compile root trace");
+            assert!(stats_warm.native_trace_entries > 0, "must enter native trace");
+            let guard_exits_before = stats_warm.guard_exits;
 
-        // Step B: In-place substitution of array.len with custom callable
-        let custom_invocations = Rc::new(Cell::new(0usize));
-        let custom_invocations_clone = custom_invocations.clone();
-        let custom_fn = Value::NativeFunction(crate::bytecode::value::native_fn(move |_args| {
-            custom_invocations_clone.set(custom_invocations_clone.get() + 1);
-            Ok(NativeCallResult::Return(Value::Int(99)))
-        }));
+            // Step B: In-place substitution of array.len with custom callable
+            let custom_invocations = Rc::new(Cell::new(0usize));
+            let custom_invocations_clone = custom_invocations.clone();
+            let custom_fn = Value::NativeFunction(crate::bytecode::value::native_fn(move |_args| {
+                custom_invocations_clone.set(custom_invocations_clone.get() + 1);
+                Ok(NativeCallResult::Return(Value::Int(99)))
+            }));
 
-        let array_global = program.vm().get_global("array").expect("array global");
-        if let Value::Map(ref m) = array_global {
-            m.borrow_mut().insert(crate::bytecode::ValueKey::from("len"), custom_fn);
-        } else {
-            panic!("expected Map");
+            let array_global = program.vm().get_global("array").expect("array global");
+            if let Value::Map(ref m) = array_global {
+                m.borrow_mut().insert(crate::bytecode::ValueKey::from("len"), custom_fn);
+            } else {
+                panic!("expected Map");
+            }
+
+            // Step C: Run again. The compiled trace checks GuardNativeFunction on array.len.
+            // It MUST fail the guard check, trigger a guard bailout, and fall back to interpreter.
+            let res_after_bailout = program
+                .call_raw("main.sum_len_bailout", vec![arr.clone(), Value::Int(1000)])
+                .unwrap();
+
+            assert_eq!(
+                res_after_bailout,
+                Value::Int(99000),
+                "custom callable returning 99 must be executed after guard bailout (99 * 1000)"
+            );
+            assert_eq!(
+                custom_invocations.get(),
+                1000,
+                "custom callable must have been called 1000 times"
+            );
+
+            let stats_after = program.vm().jit_stats();
+            assert!(
+                stats_after.guard_exits > guard_exits_before,
+                "callable substitution MUST increment guard_exits (before: {}, after: {})",
+                guard_exits_before,
+                stats_after.guard_exits
+            );
         }
-
-        // Step C: Run again. The compiled trace checks GuardNativeFunction on array.len.
-        // It MUST fail the guard check, trigger a guard bailout, and fall back to interpreter.
-        let res_after_bailout = program
-            .call_raw("main.sum_len_bailout", vec![arr.clone(), Value::Int(1000)])
-            .unwrap();
-
-        assert_eq!(
-            res_after_bailout,
-            Value::Int(99000),
-            "custom callable returning 99 must be executed after guard bailout (99 * 1000)"
-        );
-        assert_eq!(
-            custom_invocations.get(),
-            1000,
-            "custom callable must have been called 1000 times"
-        );
-
-        let stats_after = program.vm().jit_stats();
-        assert!(
-            stats_after.guard_exits > guard_exits_before,
-            "callable substitution MUST increment guard_exits (before: {}, after: {})",
-            guard_exits_before,
-            stats_after.guard_exits
-        );
     }
 }

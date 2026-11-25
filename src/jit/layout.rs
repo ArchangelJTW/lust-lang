@@ -531,8 +531,12 @@ mod refcount_tests {
                 .expect("churn");
             assert_eq!(total, 500 * (3 + 1 + 1 + 2 + 3 + 1 + 2));
         }
-        let stats = program.jit_stats();
-        assert!(stats.functions_compiled >= 1, "{stats:?}");
+        // Legacy Dynasm counter assertion: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.jit_stats();
+            assert!(stats.functions_compiled >= 1, "{stats:?}");
+        }
         assert_eq!(strong_count_of(&root), before_root);
         assert_eq!(strong_count_of(&leaf_a), before_leaf);
         drop(root);
@@ -637,8 +641,12 @@ mod borrow_tests {
             );
             assert_eq!(strong(&leaf), leaf_before, "leaf count after round {round}");
         }
-        let stats = program.jit_stats();
-        assert!(stats.functions_compiled >= 1, "{stats:?}");
+        // Legacy Dynasm counter assertion: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.jit_stats();
+            assert!(stats.functions_compiled >= 1, "{stats:?}");
+        }
     }
 }
 

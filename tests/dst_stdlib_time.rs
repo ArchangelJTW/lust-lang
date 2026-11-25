@@ -292,4 +292,3 @@ fn test_stdlib_os_sleep_zero_delay_nonblocking() {
         .expect("run_task_with_virtual_time must not hang on os.sleep(0.0)");
     assert_eq!(outcome_e2e, StepOutcome::Completed(Some(Value::Int(99))));
 }
-

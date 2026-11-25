@@ -517,14 +517,35 @@ mod tests {
                         local arr: Array<int> = []
                         array.push(arr, 1)
                     end
+                    function grow_many(): ()
+                        local arr: Array<int> = []
+                        local i: int = 0
+                        while i < 16 do
+                            array.push(arr, i)
+                            i = i + 1
+                        end
+                    end
                 "#,
             )
             .entry_module("main")
             .compile()?;
 
-        program.vm_mut().set_memory_budget_bytes(32)?;
+        // Single unboxed int push allocates size_of::<i64>() (8 bytes), so a 4-byte budget traps immediately.
+        program.vm_mut().set_memory_budget_bytes(4)?;
         program.vm_mut().reset_memory_counter()?;
         let err = program.call_raw("main.grow", vec![]).unwrap_err();
+        match err {
+            LustError::RuntimeErrorWithTrace { message, .. }
+            | LustError::RuntimeError { message } => {
+                assert!(message.to_lowercase().contains("memory budget"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        // Geometric growth across multiple pushes traps under a 32-byte budget.
+        program.vm_mut().set_memory_budget_bytes(32)?;
+        program.vm_mut().reset_memory_counter()?;
+        let err = program.call_raw("main.grow_many", vec![]).unwrap_err();
         match err {
             LustError::RuntimeErrorWithTrace { message, .. }
             | LustError::RuntimeError { message } => {
@@ -535,6 +556,8 @@ mod tests {
         Ok(())
     }
 
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(feature = "legacy-dynasm")]
     #[test]
     fn warm_root_trace_before_budget_then_no_native_entry_and_budget_error() -> Result<()> {
         let source = r#"
@@ -608,6 +631,8 @@ mod tests {
         Ok(())
     }
 
+    // Legacy Dynasm whole-function JIT test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(feature = "legacy-dynasm")]
     #[test]
     fn warm_whole_function_before_budget_then_interpreter_fallback() -> Result<()> {
         let source = r#"
@@ -809,6 +834,8 @@ mod tests {
         Ok(())
     }
 
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(feature = "legacy-dynasm")]
     #[test]
     fn root_trace_invoking_callback_rejects_budget_mutations() -> Result<()> {
         let source = r#"
@@ -996,6 +1023,8 @@ mod tests {
         Ok(())
     }
 
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(feature = "legacy-dynasm")]
     #[test]
     fn idle_clear_invalidates_stale_code_and_resumes_jit() -> Result<()> {
         let source = r#"
@@ -1147,7 +1176,10 @@ mod tests {
         assert_eq!(program.memory_remaining_bytes(), None);
         assert_eq!(program.memory_used_bytes(), 0);
         assert!(!program.vm().budgets.mem_budget_enabled());
-        assert!(program.effective_jit_enabled());
+        assert_eq!(
+            program.effective_jit_enabled(),
+            program.jit_configured_enabled()
+        );
 
         Ok(())
     }

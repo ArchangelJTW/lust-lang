@@ -866,10 +866,17 @@ impl<'a> AstLowering<'a> {
         //    check per-local field names and declared local type.
         let base_ty: Option<&MirType> = match base_place {
             Place::Local(loc) => {
+                let loc_ty = self.current_fn.locals.get(loc.0).map(|l| &l.ty);
                 if let Some(names) = self.local_field_names.get(loc) {
-                    return names.iter().position(|n| n == field);
+                    if let Some(pos) = names.iter().position(|n| n == field) {
+                        return Some(pos);
+                    }
+                    // Allow tuple locals (e.g. `t._0`) to fall through to Step 3 tuple resolution.
+                    if !matches!(loc_ty, Some(MirType::Tuple(_))) {
+                        return None;
+                    }
                 }
-                self.current_fn.locals.get(loc.0).map(|l| &l.ty)
+                loc_ty
             }
             Place::Index(inner, _) => {
                 if let Place::Local(loc) = &**inner {

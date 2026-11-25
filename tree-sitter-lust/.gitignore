@@ -1,5 +1,6 @@
 # Generated files
-src/
+# Note: `src/` is intentionally tracked in Git so Zed and other editors can
+# compile `src/parser.c` directly without invoking `tree-sitter-cli`.
 node_modules/
 build/
 *.node

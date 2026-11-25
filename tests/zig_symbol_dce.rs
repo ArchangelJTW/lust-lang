@@ -28,6 +28,7 @@ fn run_zig_source(zig_src: &str) {
 
     let output = Command::new("zig")
         .arg("run")
+        .arg("-lc")
         .arg(&zig_path)
         .output()
         .expect("zig run invocation");

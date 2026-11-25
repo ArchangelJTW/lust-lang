@@ -2225,17 +2225,133 @@ fn build_command(args: &[String]) {
                 }
             };
 
-        match lust::codegen_zig::aot::compile_mir_to_object_file(
+        let wants_object_only = target_bin
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("o") || e.eq_ignore_ascii_case("obj"));
+
+        if wants_object_only {
+            match lust::codegen_zig::aot::compile_mir_to_object_file(
+                &mir_module,
+                &target_bin,
+                opts.target_triple.as_deref(),
+            ) {
+                Ok(obj) => {
+                    println!("Successfully built Cranelift AOT object: {}", obj.display());
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    process::exit(1);
+                }
+            }
+        }
+
+        let obj_path = target_bin.with_extension("cranelift_aot.o");
+        if let Err(e) = lust::codegen_zig::aot::compile_mir_to_object_file(
             &mir_module,
-            &target_bin,
+            &obj_path,
             opts.target_triple.as_deref(),
         ) {
-            Ok(obj) => {
-                println!("Successfully built Cranelift AOT object: {}", obj.display());
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+
+        let dylib_name = if cfg!(target_os = "macos") {
+            "liblust.dylib"
+        } else if cfg!(target_os = "windows") {
+            "lust.dll"
+        } else {
+            "liblust.so"
+        };
+        let lib_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+            .filter(|dir| dir.join(dylib_name).exists())
+            .or_else(|| {
+                let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                [manifest.join("target/release"), manifest.join("target/debug")]
+                    .into_iter()
+                    .find(|dir| dir.join(dylib_name).exists())
+            });
+        let Some(lib_dir) = lib_dir else {
+            let _ = std::fs::remove_file(&obj_path);
+            eprintln!(
+                "Error: could not locate {} next to lust executable or in target/{{release,debug}} for cranelift-aot linking",
+                dylib_name
+            );
+            process::exit(1);
+        };
+
+        let has_raw_main = mir_module.functions.iter().any(|f| f.signature.name == "main");
+        let mod_main_name = mir_module
+            .functions
+            .iter()
+            .find(|f| f.signature.name.ends_with(".main"))
+            .map(|f| f.signature.name.as_str());
+        let entry_shim_c = if !has_raw_main && let Some(mod_main) = mod_main_name {
+            let sym = if cfg!(target_os = "macos") {
+                format!("_{mod_main}")
+            } else {
+                mod_main.to_string()
+            };
+            let shim_path = target_bin.with_extension("cranelift_entry.c");
+            let shim_src = format!(
+                "#include <stdint.h>\nextern int64_t lust_entry(void) __asm__(\"{sym}\");\nint main(void) {{ (void)lust_entry(); return 0; }}\n"
+            );
+            if let Err(e) = std::fs::write(&shim_path, shim_src) {
+                let _ = std::fs::remove_file(&obj_path);
+                eprintln!("Failed to write cranelift-aot entry shim: {}", e);
+                process::exit(1);
+            }
+            Some(shim_path)
+        } else {
+            None
+        };
+
+        let mut cc_cmd = std::process::Command::new("cc");
+        if cfg!(all(target_os = "macos", target_arch = "x86_64"))
+            && opts.target_triple.as_deref().is_none_or(|t| t.starts_with("x86_64"))
+        {
+            cc_cmd.args(["-arch", "x86_64"]);
+        }
+        cc_cmd.arg(&obj_path);
+        if let Some(ref shim_path) = entry_shim_c {
+            cc_cmd.arg(shim_path);
+        }
+        cc_cmd
+            .arg(format!("-L{}", lib_dir.display()))
+            .arg("-llust");
+        if !cfg!(target_os = "windows") {
+            cc_cmd
+                .arg(format!("-Wl,-rpath,{}", lib_dir.display()))
+                .arg("-lm");
+        }
+        cc_cmd.arg("-o").arg(&target_bin);
+
+        let link_out = cc_cmd.output();
+        let _ = std::fs::remove_file(&obj_path);
+        if let Some(ref shim_path) = entry_shim_c {
+            let _ = std::fs::remove_file(shim_path);
+        }
+        match link_out {
+            Ok(out) if out.status.success() => {
+                println!(
+                    "Successfully built Cranelift AOT executable: {}",
+                    target_bin.display()
+                );
                 return;
             }
+            Ok(out) => {
+                eprintln!(
+                    "Cranelift AOT link failed (exit {:?}):\n{}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                process::exit(1);
+            }
             Err(e) => {
-                eprintln!("{}", e);
+                eprintln!("Failed to invoke host linker 'cc': {}", e);
                 process::exit(1);
             }
         }

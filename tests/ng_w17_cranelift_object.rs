@@ -465,6 +465,34 @@ end
             String::from_utf8_lossy(&cli_res.stdout),
             String::from_utf8_lossy(&cli_res.stderr)
         );
+
+        // Also verify CLI `lust build --backend cranelift-aot -o <exe>` auto-links a runnable binary.
+        let _ = locate_or_build_liblust_dir();
+        let cli_exe = tmp.path().join("cli_emit_exe");
+        let cli_exe_res = Command::new(lust_bin())
+            .arg("build")
+            .arg(&cli_script)
+            .arg("--backend")
+            .arg("cranelift-aot")
+            .arg("-o")
+            .arg(&cli_exe)
+            .output()
+            .expect("invoke lust build --backend cranelift-aot executable");
+        assert!(
+            cli_exe_res.status.success(),
+            "CLI executable `lust build --backend cranelift-aot` failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&cli_exe_res.stdout),
+            String::from_utf8_lossy(&cli_exe_res.stderr)
+        );
+        assert!(cli_exe.exists(), "CLI must write linked executable");
+        let run_cli_exe = run_in_watchdog(&cli_exe, &[], Duration::from_secs(5));
+        assert!(!run_cli_exe.timed_out);
+        assert_eq!(run_cli_exe.exit_code, Some(0));
+        assert_eq!(
+            String::from_utf8_lossy(&run_cli_exe.stdout),
+            "55\n80\n9\n37\n172\ttrue0\n",
+            "CLI auto-linked cranelift-aot executable must match expected parity output"
+        );
         let cli_bytes = fs::read(&cli_obj).expect("read CLI-emitted .o");
         verify_object_has_exported_text_symbols_and_relocs(
             &cli_bytes,

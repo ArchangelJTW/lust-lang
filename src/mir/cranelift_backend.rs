@@ -1,7 +1,7 @@
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 pub use jit_engine::MirCraneliftBackendError;
 
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 pub mod jit_engine {
     use crate::mir::ir::*;
     pub use crate::mir::runtime_helpers::*;

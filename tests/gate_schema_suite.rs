@@ -517,6 +517,7 @@ fn test_gate_schema_04_opt_in_dce_authority() {
 // ============================================================================
 // Gate-SCHEMA-05: Backend/effect/cost parity
 // ============================================================================
+#[cfg(feature = "cranelift")]
 #[test]
 fn test_gate_schema_05_backend_effect_cost_parity() {
     use lust::ast::ItemKind;
@@ -861,6 +862,7 @@ fn compile_gate05_vm(items: &[lust::ast::Item]) -> lust::vm::VM {
 // Gate-05 focused tests
 // ----------------------------------------------------------------------------
 
+#[cfg(feature = "cranelift")]
 #[test]
 fn test_gate_schema_05_uninvoked_thunk_is_lazy() {
     use lust::bytecode::Value;
@@ -991,6 +993,7 @@ fn test_gate_schema_05_uninvoked_thunk_is_lazy() {
     );
 }
 
+#[cfg(feature = "cranelift")]
 #[test]
 fn test_gate_schema_05_capture_snapshot() {
     use lust::bytecode::Value;
@@ -1053,6 +1056,7 @@ fn test_gate_schema_05_capture_snapshot() {
     }
 }
 
+#[cfg(feature = "cranelift")]
 #[test]
 fn test_gate_schema_05_thunk_return_resumes_caller() {
     use lust::bytecode::Value;
@@ -1103,6 +1107,7 @@ fn test_gate_schema_05_thunk_return_resumes_caller() {
     assert_eq!(vm_res, clif_res, "Both backends must agree on resumed result 12");
 }
 
+#[cfg(feature = "cranelift")]
 #[test]
 fn test_gate_schema_05_repeated_invocation_reruns_body() {
     use lust::bytecode::Value;
@@ -1910,6 +1915,7 @@ end
 // ============================================================================
 // Gate-SCHEMA-11: Callable semantics
 // ============================================================================
+#[cfg(feature = "cranelift")]
 #[test]
 fn test_gate_schema_11_callable_semantics() {
     use lust::ast::{Expr, ExprKind, Span};

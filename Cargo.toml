@@ -53,12 +53,18 @@ std = [
   "dep:regex",
   "dep:regex-automata",
   "dep:rand",
+]
+# Optional Cranelift MIR JIT backend
+cranelift = [
+  "std",
   "dep:cranelift-codegen",
   "dep:cranelift-frontend",
   "dep:cranelift-jit",
   "dep:cranelift-module",
   "dep:cranelift-native",
 ]
+# Optional mimalloc global allocator for the CLI binary
+mimalloc = ["dep:mimalloc"]
 # JIT for riscv32 targets. Enables `std` because dynasmrt requires it
 # (memmap2, std::sync). Requires a std-capable runtime (e.g. Linux/RISC-V).
 # Floats require the RV32F extension.
@@ -160,7 +166,7 @@ esp-println = { version = "0.18.0", optional = true, features = [
   "log-04",
 ] }
 log = { version = "0.4", optional = true }
-mimalloc = { version = "0.1.52", default-features = false }
+mimalloc = { version = "0.1.52", default-features = false, optional = true }
 
 [build-dependencies]
 dynasm = "5.1.0"
@@ -175,10 +181,10 @@ web-sys = { version = "0.3.105", features = ["console"] }
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
 
 [profile.release]
-strip = false
+strip = "symbols"
 lto = "fat"
 opt-level = 3
-debug = 1
+debug = 0
 overflow-checks = false
 panic = "abort"
 codegen-units = 1

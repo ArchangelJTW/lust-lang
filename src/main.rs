@@ -1,5 +1,5 @@
 #![cfg(feature = "std")]
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "mimalloc", not(target_arch = "wasm32")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

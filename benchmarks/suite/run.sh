@@ -40,22 +40,37 @@ with tempfile.TemporaryDirectory(dir="/tmp") as td:
         except subprocess.TimeoutExpired:
             return "timeout", "<timeout>"
 
+    c_bins = {}
+    print("Building Lust C11 AOT binaries (--backend c --release-fast)...", file=sys.stderr)
+    for prog in programs:
+        bin_path = Path(td) / f"{prog}_c"
+        res = subprocess.run([str(lust_bin), "build", str(suite_dir / f"{prog}.lust"), "--backend", "c", "-o", str(bin_path), "--release-fast"], capture_output=True, text=True)
+        if res.returncode == 0:
+            c_bins[prog] = bin_path
+            subprocess.run([str(bin_path)], capture_output=True)
+        else:
+            print(f"Failed to build C11 AOT for {prog}: {res.stderr}", file=sys.stderr)
+
     aot_bins = {}
-    print("Building Lust AOT binaries (--release-fast)...", file=sys.stderr)
+    print("Building Lust Zig AOT binaries (--backend zig --release-fast)...", file=sys.stderr)
     for prog in programs:
         bin_path = Path(td) / f"{prog}_aot"
-        res = subprocess.run([str(lust_bin), "build", str(suite_dir / f"{prog}.lust"), "-o", str(bin_path), "--release-fast"], capture_output=True, text=True)
+        res = subprocess.run([str(lust_bin), "build", str(suite_dir / f"{prog}.lust"), "--backend", "zig", "-o", str(bin_path), "--release-fast"], capture_output=True, text=True)
         if res.returncode == 0:
             aot_bins[prog] = bin_path
             # One warmup execution to prime dyld / code signing cache
             subprocess.run([str(bin_path)], capture_output=True)
         else:
-            print(f"Failed to build AOT for {prog}: {res.stderr}", file=sys.stderr)
+            print(f"Failed to build Zig AOT for {prog}: {res.stderr}", file=sys.stderr)
 
-    print(f"{'program':<10} {'rust':>9} {'lust-aot':>10} {'luajit':>9} {'lust-jit':>10} {'lust-vm':>10} {'lua':>9}   outputs")
+    print(f"{'program':<10} {'rust':>9} {'lust-c':>10} {'lust-zig':>10} {'luajit':>9} {'lust-jit':>10} {'lust-vm':>10} {'lua':>9}   outputs")
 
     for prog in programs:
         t_rust, o_rust = run_cmd([str(rust_bin), prog])
+        if prog in c_bins:
+            t_c, o_c = run_cmd([str(c_bins[prog])])
+        else:
+            t_c, o_c = "n/a", ""
         if prog in aot_bins:
             t_aot, o_aot = run_cmd([str(aot_bins[prog])])
         else:
@@ -65,7 +80,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as td:
         t_lj, o_lj = run_cmd(["luajit", str(suite_dir / f"{prog}.lua")])
         t_lua, o_lua = run_cmd(["lua", str(suite_dir / f"{prog}.lua")])
         
-        outputs = [("rust", t_rust, o_rust), ("aot", t_aot, o_aot), ("jit", t_jit, o_jit), ("luajit", t_lj, o_lj), ("vm", t_vm, o_vm), ("lua", t_lua, o_lua)]
+        outputs = [("rust", t_rust, o_rust), ("c", t_c, o_c), ("zig", t_aot, o_aot), ("jit", t_jit, o_jit), ("luajit", t_lj, o_lj), ("vm", t_vm, o_vm), ("lua", t_lua, o_lua)]
         reference = outputs[0][2]
         def match_val(a, b):
             if a == b:
@@ -78,5 +93,5 @@ with tempfile.TemporaryDirectory(dir="/tmp") as td:
                 return False
         diff = [name for name, timing, output in outputs[1:] if timing != "n/a" and not match_val(reference, output)]
         status = "same" if not diff else "DIFF: rust!=" + ",".join(diff)
-        print(f"{prog:<10} {t_rust:>9} {t_aot:>10} {t_lj:>9} {t_jit:>10} {t_vm:>10} {t_lua:>9}   {status}")
+        print(f"{prog:<10} {t_rust:>9} {t_c:>10} {t_aot:>10} {t_lj:>9} {t_jit:>10} {t_vm:>10} {t_lua:>9}   {status}")
 EOF

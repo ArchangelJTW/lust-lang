@@ -1562,6 +1562,54 @@ fn build_command(args: &[String]) {
             | lust::codegen_zig::BuildTargetKind::StaticLibrary
     );
 
+    if backend_lc == "c" && !is_library {
+        let filtered_items = if opts.tree_shake {
+            lust::codegen_zig::tree_shake_items(&all_items, false)
+        } else {
+            all_items.clone()
+        };
+        let mut codegen = lust::codegen_c::CCodegen::new();
+        let c_source = match codegen.generate_program(&filtered_items) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("C AOT codegen error: {}", e);
+                process::exit(1);
+            }
+        };
+        let c_file = entry_path.with_extension("c");
+        if let Err(e) = fs::write(&c_file, &c_source) {
+            eprintln!("Error writing {}: {}", c_file.display(), e);
+            process::exit(1);
+        }
+        if emit_c {
+            println!("Successfully emitted C source: {}", c_file.display());
+            return;
+        }
+        let stem = entry_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("lust_out");
+        let target_bin = output_bin.unwrap_or_else(|| {
+            let parent = entry_path.parent().unwrap_or_else(|| Path::new("."));
+            if cfg!(target_os = "windows") {
+                parent.join(format!("{stem}.exe"))
+            } else {
+                parent.join(stem)
+            }
+        });
+        match lust::codegen_c::compile_c_executable(&c_file, &target_bin, &opts.release_mode, opts.strip) {
+            Ok(bin) => {
+                let _ = fs::remove_file(&c_file);
+                println!("Successfully built C AOT artifact: {}", bin.display());
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        }
+        return;
+    }
+
     if backend_lc == "c" || backend_lc == "mir-c" {
         let stem = entry_path
             .file_stem()

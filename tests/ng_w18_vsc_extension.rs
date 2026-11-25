@@ -150,23 +150,28 @@ fn test_vsc_grammar_node_oracle_passes() {
     let script = vsc_ext_dir().join("test-grammar.mjs");
     assert!(script.is_file(), "Missing {}", script.display());
 
-    let output = Command::new("node")
-        .arg(&script)
-        .current_dir(vsc_ext_dir())
-        .output();
-
-    match output {
-        Ok(out) => {
-            assert!(
-                out.status.success(),
-                "node test-grammar.mjs failed:\nstdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
+    for runtime in ["node", "bun"] {
+        match Command::new(runtime)
+            .arg(&script)
+            .current_dir(vsc_ext_dir())
+            .output()
+        {
+            Ok(out) => {
+                assert!(
+                    out.status.success(),
+                    "{} test-grammar.mjs failed:\nstdout:\n{}\nstderr:\n{}",
+                    runtime,
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                return;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => panic!("Failed to launch {} test-grammar.mjs: {}", runtime, err),
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            panic!("node runtime is required to run vsc-extension/test-grammar.mjs");
-        }
-        Err(err) => panic!("Failed to launch node test-grammar.mjs: {}", err),
     }
+
+    println!(
+        "SKIP: neither `node` nor `bun` runtime found in PATH; skipping vsc-extension/test-grammar.mjs"
+    );
 }

@@ -123,6 +123,8 @@ fn collect_bounded_reader(
 fn platform_mode_label() -> &'static str {
     if cfg!(target_os = "macos") {
         "darwin-posix-baseline"
+    } else if cfg!(target_os = "linux") {
+        "linux-s-sandbox"
     } else {
         "unix-posix-baseline"
     }
@@ -153,12 +155,44 @@ pub fn run_sandboxed(policy: &SandboxPolicy) -> Result<SandboxOutcome, SandboxEr
         cmd.stdin(Stdio::null());
     }
 
-    let mut prepared = configure_posix_pre_exec(&mut cmd, &policy.limits)
-        .map_err(SandboxError::Spawn)?;
+    #[cfg(target_os = "linux")]
+    let cgroup_guard = if policy.isolation.require_linux_cgroups_v2 {
+        Some(crate::sandbox::linux::CgroupGuard::create(&policy.limits)?)
+    } else {
+        crate::sandbox::linux::CgroupGuard::try_create(&policy.limits)
+    };
+
+    #[cfg(target_os = "linux")]
+    let cgroup_procs_file = match cgroup_guard {
+        Some(ref cg) => match cg.open_procs_file() {
+            Ok(f) => Some(f),
+            Err(e) if policy.isolation.require_linux_cgroups_v2 => return Err(e),
+            Err(_) => None,
+        },
+        None => None,
+    };
+
+    #[cfg(target_os = "linux")]
+    let linux_cfg = Some(crate::sandbox::linux::LinuxPreExecConfig::from_policy(
+        policy,
+        cgroup_procs_file
+            .as_ref()
+            .map_or(-1, |f| std::os::fd::AsRawFd::as_raw_fd(f)),
+    ));
+
+    let mut prepared = configure_posix_pre_exec(
+        &mut cmd,
+        &policy.limits,
+        #[cfg(target_os = "linux")]
+        linux_cfg,
+    )
+    .map_err(SandboxError::Spawn)?;
 
     let total_start = Instant::now();
     let spawn_res = cmd.spawn();
     prepared.finish_parent_spawn();
+    #[cfg(target_os = "linux")]
+    drop(cgroup_procs_file);
 
     let mut child = spawn_res.map_err(SandboxError::Spawn)?;
     let rlimits = prepared.read_rlimit_report();
@@ -202,6 +236,10 @@ pub fn run_sandboxed(policy: &SandboxPolicy) -> Result<SandboxOutcome, SandboxEr
                     cancelled = is_cancelled;
                     // Ignore ESRCH if the child raced to exit right before killpg.
                     let _ = kill_process_group(child_pid);
+                    #[cfg(target_os = "linux")]
+                    if let Some(ref cg) = cgroup_guard {
+                        let _ = cg.kill_all();
+                    }
                     break child
                         .wait()
                         .map_err(|e| SandboxError::Supervisor(format!("wait failed: {e}")))?;
@@ -210,11 +248,20 @@ pub fn run_sandboxed(policy: &SandboxPolicy) -> Result<SandboxOutcome, SandboxEr
             }
             Err(e) => {
                 let _ = kill_process_group(child_pid);
+                #[cfg(target_os = "linux")]
+                if let Some(ref cg) = cgroup_guard {
+                    let _ = cg.kill_all();
+                }
                 let _ = child.wait();
                 return Err(SandboxError::Supervisor(format!("try_wait failed: {e}")));
             }
         }
     };
+
+    #[cfg(target_os = "linux")]
+    if let Some(cg) = cgroup_guard {
+        cg.cleanup();
+    }
 
     let drain_deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
     let (stdout_cap, stdout_drain_timed_out) =

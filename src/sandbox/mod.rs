@@ -8,6 +8,8 @@
 //! non-Linux targets rather than silently downgrading.
 
 pub mod darwin;
+#[cfg(target_os = "linux")]
+pub mod linux;
 pub mod policy;
 pub mod supervisor;
 

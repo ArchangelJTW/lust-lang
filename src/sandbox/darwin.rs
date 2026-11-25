@@ -345,6 +345,7 @@ impl RawRlimitWire {
 pub(crate) fn configure_posix_pre_exec(
     cmd: &mut Command,
     limits: &SandboxLimits,
+    #[cfg(target_os = "linux")] linux_cfg: Option<crate::sandbox::linux::LinuxPreExecConfig>,
 ) -> io::Result<PreparedPosixFork> {
     // Precompute max_fd and raw C rlimit structs BEFORE spawn() (no syscalls needing heap in pre_exec).
     let raw_max = unsafe { sysconf(sys_consts::SC_OPEN_MAX) };
@@ -445,6 +446,13 @@ pub(crate) fn configure_posix_pre_exec(
                 if flags >= 0 && (flags & sys_consts::FD_CLOEXEC) == 0 {
                     let _ = close(fd);
                 }
+            }
+
+            #[cfg(target_os = "linux")]
+            if let Some(ref cfg) = linux_cfg
+                && let Err(errno) = crate::sandbox::linux::apply_linux_pre_exec(cfg)
+            {
+                return Err(io::Error::from_raw_os_error(errno));
             }
 
             Ok(())

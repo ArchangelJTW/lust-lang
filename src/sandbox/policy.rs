@@ -99,20 +99,42 @@ impl SandboxPolicy {
             )));
         }
 
-        if self.isolation.require_linux_cgroups_v2 {
-            return Err(SandboxError::UnsupportedIsolation(
-                "Linux cgroups v2 isolation is unavailable on this baseline".into(),
-            ));
+        #[cfg(not(target_os = "linux"))]
+        {
+            if self.isolation.require_linux_cgroups_v2 {
+                return Err(SandboxError::UnsupportedIsolation(
+                    "Linux cgroups v2 isolation is unavailable on this baseline".into(),
+                ));
+            }
+            if self.isolation.require_seccomp {
+                return Err(SandboxError::UnsupportedIsolation(
+                    "Linux seccomp-bpf isolation is unavailable on this baseline".into(),
+                ));
+            }
+            if self.isolation.require_net_namespace {
+                return Err(SandboxError::UnsupportedIsolation(
+                    "Linux network namespace isolation is unavailable on this baseline".into(),
+                ));
+            }
         }
-        if self.isolation.require_seccomp {
-            return Err(SandboxError::UnsupportedIsolation(
-                "Linux seccomp-bpf isolation is unavailable on this baseline".into(),
-            ));
-        }
-        if self.isolation.require_net_namespace {
-            return Err(SandboxError::UnsupportedIsolation(
-                "Linux network namespace isolation is unavailable on this baseline".into(),
-            ));
+
+        #[cfg(target_os = "linux")]
+        {
+            if self.isolation.require_linux_cgroups_v2
+                && let Err(reason) = crate::sandbox::linux::probe_cgroups_v2()
+            {
+                return Err(SandboxError::UnsupportedIsolation(reason));
+            }
+            if self.isolation.require_seccomp
+                && let Err(reason) = crate::sandbox::linux::probe_seccomp()
+            {
+                return Err(SandboxError::UnsupportedIsolation(reason));
+            }
+            if self.isolation.require_net_namespace
+                && let Err(reason) = crate::sandbox::linux::probe_net_namespace()
+            {
+                return Err(SandboxError::UnsupportedIsolation(reason));
+            }
         }
 
         Ok(())

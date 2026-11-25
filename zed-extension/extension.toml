@@ -1,0 +1,26 @@
+id = "lust"
+name = "Lust"
+description = "Lust programming language syntax highlighting and editor support for Zed"
+version = "0.1.0"
+schema_version = 1
+authors = ["Lust Language Contributors"]
+repository = "https://github.com/vedmalex/lust-lang"
+
+[grammars.lust]
+# Points to the Lust repository containing `tree-sitter-lust/` (fork of
+# https://github.com/ArchangelJTW/lust-lang).
+# For offline/local development in Zed (`zed: install dev extension`), you can
+# temporarily set `repository = "file:///absolute/path/to/lust-lang"` and update
+# `rev` to your local commit SHA.
+repository = "https://github.com/vedmalex/lust-lang"
+rev = "8d4560344cbe8938377be70f57d9aad0b392c0f9"
+path = "tree-sitter-lust"
+
+# Optional LSP integration (`lust-analyzer`, built from `crates/lust-analyzer`):
+# Zed requires a Wasm extension library (`Cargo.toml` + `src/lib.rs` using
+# `zed_extension_api::Extension::language_server_command`) to launch custom
+# language servers. Once a Wasm entrypoint is added, uncomment:
+#
+# [language_servers.lust-analyzer]
+# name = "Lust Analyzer"
+# languages = ["Lust"]

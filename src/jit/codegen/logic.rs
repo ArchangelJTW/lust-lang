@@ -180,7 +180,7 @@ impl JitCompiler {
                 ; jmp >truthiness_ready
                 ; generic_truthiness:
                 ; lea rdi, [r12 + cond_offset]
-                ; mov rax, QWORD jit_value_is_truthy as _
+                ; mov rax, QWORD jit_value_is_truthy as *const () as _
                 ; call rax
                 ; truthiness_ready:
                 ; test al, al
@@ -213,6 +213,53 @@ impl JitCompiler {
             _ => {
                 return Err(crate::LustError::RuntimeError {
                     message: "Select with unsupported or mismatched types".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn compile_select_bit_zero(
+        &mut self,
+        dest: u8,
+        src: u8,
+        mask: u64,
+        on_zero: &Value,
+        on_nonzero: &Value,
+    ) -> Result<()> {
+        self.operand_rax(src);
+        let mask_i64 = mask as i64;
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov rbx, QWORD mask_i64
+            ; test rax, rbx
+        );
+        match (on_zero, on_nonzero) {
+            (Value::Int(z), Value::Int(nz)) => {
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; mov rdx, QWORD *nz as _
+                    ; mov rcx, QWORD *z as _
+                    ; cmovz rdx, rcx
+                    ; mov rax, rdx
+                );
+                self.store_from_rax(dest, 2);
+            }
+            (Value::Bool(z), Value::Bool(nz)) => {
+                let z_val = *z as i64;
+                let nz_val = *nz as i64;
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; mov rdx, QWORD nz_val as _
+                    ; mov rcx, QWORD z_val as _
+                    ; cmovz rdx, rcx
+                    ; mov rax, rdx
+                );
+                self.store_from_rax(dest, 1);
+            }
+            _ => {
+                return Err(crate::LustError::RuntimeError {
+                    message: "SelectBitZero with unsupported types".to_string(),
                 });
             }
         }

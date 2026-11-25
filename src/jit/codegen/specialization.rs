@@ -1,7 +1,31 @@
 use super::*;
 use crate::bytecode::value::JitVecSlot;
 use crate::jit::trace::{Operand, SpecializedOpKind};
-use crate::number::LustInt;
+use crate::number::{LustFloat, LustInt};
+
+fn vec_kind(layout: &SpecializedLayout) -> Option<VecKind> {
+    match layout {
+        SpecializedLayout::Vec {
+            element_layout,
+            element_size,
+        } => match &**element_layout {
+            SpecializedLayout::Scalar { size: 1, .. } => Some(VecKind::Bool),
+            SpecializedLayout::Scalar {
+                size,
+                is_float: false,
+                ..
+            } if *size == core::mem::size_of::<LustInt>() => Some(VecKind::Int),
+            SpecializedLayout::Scalar {
+                size,
+                is_float: true,
+                ..
+            } if *size == core::mem::size_of::<LustFloat>() => Some(VecKind::Float),
+            _ if *element_size == 1 => Some(VecKind::Bool),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 impl JitCompiler {
     /// Compile Unbox operation - convert Value to specialized representation
@@ -10,29 +34,23 @@ impl JitCompiler {
         specialized_id: usize,
         source_reg: u8,
         layout: &SpecializedLayout,
+        guard_index: &mut i32,
+        guards: &mut Vec<Guard>,
     ) -> Result<()> {
-        match layout {
-            SpecializedLayout::Vec { element_layout, .. } => {
-                // Check if it's Vec<LustInt>
-                if matches!(**element_layout, SpecializedLayout::Scalar { size, .. } if size == core::mem::size_of::<LustInt>())
-                {
-                    self.compile_unbox_array_int(specialized_id, source_reg)?;
-                } else {
-                    return Err(crate::LustError::RuntimeError {
-                        message: format!(
-                            "Unbox not yet implemented for Vec with element type {:?}",
-                            element_layout
-                        ),
-                    });
-                }
+        match vec_kind(layout) {
+            Some(VecKind::Int) => {
+                self.compile_unbox_array(specialized_id, source_reg, VecKind::Int, guard_index, guards)
             }
-            _ => {
-                return Err(crate::LustError::RuntimeError {
-                    message: format!("Unbox not yet implemented for layout {:?}", layout),
-                });
+            Some(VecKind::Bool) => {
+                self.compile_unbox_array(specialized_id, source_reg, VecKind::Bool, guard_index, guards)
             }
+            Some(VecKind::Float) => {
+                self.compile_unbox_array(specialized_id, source_reg, VecKind::Float, guard_index, guards)
+            }
+            None => Err(crate::LustError::RuntimeError {
+                message: format!("Unbox not yet implemented for layout {:?}", layout),
+            }),
         }
-        Ok(())
     }
 
     /// Compile Rebox operation - convert specialized representation back to Value
@@ -42,28 +60,12 @@ impl JitCompiler {
         specialized_id: usize,
         layout: &SpecializedLayout,
     ) -> Result<()> {
-        match layout {
-            SpecializedLayout::Vec { element_layout, .. } => {
-                // Check if it's Vec<LustInt>
-                if matches!(**element_layout, SpecializedLayout::Scalar { size, .. } if size == core::mem::size_of::<LustInt>())
-                {
-                    self.compile_rebox_array_int(dest_reg, specialized_id)?;
-                } else {
-                    return Err(crate::LustError::RuntimeError {
-                        message: format!(
-                            "Rebox not yet implemented for Vec with element type {:?}",
-                            element_layout
-                        ),
-                    });
-                }
-            }
-            _ => {
-                return Err(crate::LustError::RuntimeError {
-                    message: format!("Rebox not yet implemented for layout {:?}", layout),
-                });
-            }
+        match vec_kind(layout) {
+            Some(kind) => self.compile_rebox_array(dest_reg, specialized_id, kind),
+            None => Err(crate::LustError::RuntimeError {
+                message: format!("Rebox not yet implemented for layout {:?}", layout),
+            }),
         }
-        Ok(())
     }
 
     /// Compile specialized operation
@@ -81,7 +83,16 @@ impl JitCompiler {
                 }
                 match (&operands[0], &operands[1]) {
                     (Operand::Specialized(vec_id), Operand::Register(value_reg)) => {
-                        self.compile_vec_int_push(*vec_id, *value_reg)?;
+                        let kind = self
+                            .specialized_values
+                            .get(vec_id)
+                            .map(|s| s.kind)
+                            .unwrap_or(VecKind::Int);
+                        match kind {
+                            VecKind::Int => self.compile_vec_int_push(*vec_id, *value_reg)?,
+                            VecKind::Bool => self.compile_vec_bool_push(*vec_id, *value_reg)?,
+                            VecKind::Float => self.compile_vec_float_push(*vec_id, *value_reg)?,
+                        }
                     }
                     _ => {
                         return Err(crate::LustError::RuntimeError {
@@ -98,11 +109,84 @@ impl JitCompiler {
                 }
                 match (&operands[0], &operands[1]) {
                     (Operand::Specialized(vec_id), Operand::Register(dest_reg)) => {
-                        self.compile_vec_int_len(*vec_id, *dest_reg)?;
+                        self.compile_vec_len(*vec_id, *dest_reg)?;
                     }
                     _ => {
                         return Err(crate::LustError::RuntimeError {
                             message: "VecLen operands must be (Specialized, Register)".into(),
+                        });
+                    }
+                }
+            }
+            SpecializedOpKind::VecGet => {
+                if operands.len() != 3 {
+                    return Err(crate::LustError::RuntimeError {
+                        message: "VecGet requires 3 operands (dest_reg, vec_id, index)".into(),
+                    });
+                }
+                match (&operands[0], &operands[1], &operands[2]) {
+                    (
+                        Operand::Register(dest_reg),
+                        Operand::Specialized(vec_id),
+                        Operand::Register(index_reg),
+                    ) => {
+                        self.compile_vec_get(*dest_reg, *vec_id, *index_reg)?;
+                    }
+                    _ => {
+                        return Err(crate::LustError::RuntimeError {
+                            message: "VecGet operands must be (Register, Specialized, Register)"
+                                .into(),
+                        });
+                    }
+                }
+            }
+            SpecializedOpKind::VecSet => {
+                if operands.len() != 3 {
+                    return Err(crate::LustError::RuntimeError {
+                        message: "VecSet requires 3 operands (vec_id, index, value)".into(),
+                    });
+                }
+                match (&operands[0], &operands[1], &operands[2]) {
+                    (
+                        Operand::Specialized(vec_id),
+                        Operand::Register(index_reg),
+                        Operand::Register(value_reg),
+                    ) => {
+                        self.compile_vec_set(*vec_id, *index_reg, *value_reg)?;
+                    }
+                    _ => {
+                        return Err(crate::LustError::RuntimeError {
+                            message: "VecSet operands must be (Specialized, Register, Register)"
+                                .into(),
+                        });
+                    }
+                }
+            }
+            SpecializedOpKind::VecIndexOk => {
+                if operands.len() != 4 {
+                    return Err(crate::LustError::RuntimeError {
+                        message: "VecIndexOk requires 4 operands (value_dest, condition_dest, vec_id, index)"
+                            .into(),
+                    });
+                }
+                match (&operands[0], &operands[1], &operands[2], &operands[3]) {
+                    (
+                        Operand::Register(value_dest),
+                        Operand::Register(condition_dest),
+                        Operand::Specialized(vec_id),
+                        Operand::Register(index_reg),
+                    ) => {
+                        self.compile_vec_index_ok(
+                            *value_dest,
+                            *condition_dest,
+                            *vec_id,
+                            *index_reg,
+                        )?;
+                    }
+                    _ => {
+                        return Err(crate::LustError::RuntimeError {
+                            message: "VecIndexOk operands must be (Register, Register, Specialized, Register)"
+                                .into(),
                         });
                     }
                 }
@@ -116,37 +200,58 @@ impl JitCompiler {
         Ok(())
     }
 
-    /// Unbox Array<int> - convert Rc<RefCell<Vec<Value>>> to Vec<LustInt> on stack
-    fn compile_unbox_array_int(&mut self, specialized_id: usize, source_reg: u8) -> Result<()> {
+    /// Unbox Array<T> - convert Rc<RefCell<Vec<Value>>> to Vec<T> on stack
+    fn compile_unbox_array(
+        &mut self,
+        specialized_id: usize,
+        source_reg: u8,
+        kind: VecKind,
+        guard_index: &mut i32,
+        guards: &mut Vec<Guard>,
+    ) -> Result<()> {
         jit::log(|| {
             format!(
-                "📦 JIT: Unboxing Array<int> from reg {} to specialized #{}",
-                source_reg, specialized_id
+                "📦 JIT: Unboxing Array<{:?}> from reg {} to specialized #{}",
+                kind, source_reg, specialized_id
             )
         });
 
-        // One slot per specialized id: an unrolled body unboxes the same id
-        // once per copy, and every copy must fill the slot the rebox reads
-        // (a fresh slot per copy left all but the last one unreleased).
         let stack_offset = match self.specialized_values.get(&specialized_id) {
             Some(existing) => existing.stack_offset,
             None => {
                 let stack_offset = self.allocate_specialized_stack(32, 8);
-                self.specialized_values
-                    .insert(specialized_id, SpecializedValue { stack_offset });
+                self.specialized_values.insert(
+                    specialized_id,
+                    SpecializedValue { stack_offset, kind },
+                );
                 stack_offset
             }
         };
 
         let reg_offset = (source_reg as i32) * mem::size_of::<Value>() as i32;
 
-        // jit_unbox_array_int(array_ptr, slot): the helper releases whatever
-        // the slot held (an earlier unbox in an unrolled iteration) and leaves
-        // it empty on failure, so the postamble's rebox is a no-op then.
         unsafe extern "C" {
             fn jit_unbox_array_int(array_value_ptr: *const Value, slot: *mut JitVecSlot) -> u8;
+            fn jit_unbox_array_bool(array_value_ptr: *const Value, slot: *mut JitVecSlot) -> u8;
+            fn jit_unbox_array_float(array_value_ptr: *const Value, slot: *mut JitVecSlot) -> u8;
         }
-        let unbox_fn = jit_unbox_array_int as *const ();
+        let unbox_fn: *const () = match kind {
+            VecKind::Int => jit_unbox_array_int as *const (),
+            VecKind::Bool => jit_unbox_array_bool as *const (),
+            VecKind::Float => jit_unbox_array_float as *const (),
+        };
+
+        let guard_idx = *guard_index as usize;
+        *guard_index += 1;
+        guards.push(Guard {
+            index: guard_idx,
+            bailout_ip: self.guard_bailout_ip(),
+            kind: GuardKind::Plain {
+                register: source_reg,
+            },
+            fail_count: 0,
+        });
+        let guard_return_value = (guard_idx + 1) as i32;
 
         dynasm!(self.ops
             ; .arch x64
@@ -155,18 +260,28 @@ impl JitCompiler {
             ; mov rax, QWORD unbox_fn as i64
             ; call rax
             ; test al, al
-            ; jz >fail
+            ; jnz >unbox_ok
+        );
+        self.emit_guard_exit(guard_return_value);
+        dynasm!(self.ops
+            ; .arch x64
+            ; unbox_ok:
         );
 
         Ok(())
     }
 
-    /// Rebox Array<int> - convert Vec<LustInt> back to Rc<RefCell<Vec<Value>>>
-    fn compile_rebox_array_int(&mut self, dest_reg: u8, specialized_id: usize) -> Result<()> {
+    /// Rebox Array<T> - convert Vec<T> back to Rc<RefCell<Vec<Value>>>
+    fn compile_rebox_array(
+        &mut self,
+        dest_reg: u8,
+        specialized_id: usize,
+        kind: VecKind,
+    ) -> Result<()> {
         jit::log(|| {
             format!(
-                "📦 JIT: Reboxing specialized #{} to Array<int> in reg {}",
-                specialized_id, dest_reg
+                "📦 JIT: Reboxing specialized #{} to Array<{:?}> in reg {}",
+                specialized_id, kind, dest_reg
             )
         });
 
@@ -178,15 +293,18 @@ impl JitCompiler {
             })?;
 
         let stack_offset = spec_value.stack_offset;
-
-        // jit_rebox_array_int(slot): publishes into the array the slot was
-        // unboxed from and empties the slot. `dest_reg` is where the recorder
-        // last saw that array; the value itself is found through the slot.
         let _ = dest_reg;
+
         unsafe extern "C" {
             fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8;
+            fn jit_rebox_array_bool(slot: *mut JitVecSlot) -> u8;
+            fn jit_rebox_array_float(slot: *mut JitVecSlot) -> u8;
         }
-        let rebox_fn = jit_rebox_array_int as *const ();
+        let rebox_fn: *const () = match kind {
+            VecKind::Int => jit_rebox_array_int as *const (),
+            VecKind::Bool => jit_rebox_array_bool as *const (),
+            VecKind::Float => jit_rebox_array_float as *const (),
+        };
 
         dynasm!(self.ops
             ; .arch x64
@@ -204,7 +322,7 @@ impl JitCompiler {
     fn compile_vec_int_push(&mut self, vec_id: usize, value_reg: u8) -> Result<()> {
         jit::log(|| {
             format!(
-                "⚡ JIT: Specialized push to vec #{} from reg {}",
+                "⚡ JIT: Specialized int push to vec #{} from reg {}",
                 vec_id, value_reg
             )
         });
@@ -217,9 +335,8 @@ impl JitCompiler {
                 })?;
 
         let stack_offset = spec_value.stack_offset;
-        let value_offset = (value_reg as i32) * mem::size_of::<Value>() as i32 + 8; // +8 to skip tag, get int value
+        let value_offset = (value_reg as i32) * mem::size_of::<Value>() as i32 + 8;
 
-        // Call jit_vec_int_push(vec_ptr_addr, len_addr, cap_addr, value)
         unsafe extern "C" {
             fn jit_vec_int_push(
                 vec_ptr: *mut *mut LustInt,
@@ -232,23 +349,12 @@ impl JitCompiler {
 
         dynasm!(self.ops
             ; .arch x64
-            // Arg 1: address of vec_ptr (on stack)
             ; lea rdi, [rbp + stack_offset]
-
-            // Arg 2: address of vec_len (on stack)
             ; lea rsi, [rbp + stack_offset + 8]
-
-            // Arg 3: address of vec_cap (on stack)
             ; lea rdx, [rbp + stack_offset + 16]
-
-            // Arg 4: value (LustInt from register)
             ; mov rcx, [r12 + value_offset]
-
-            // Call helper
             ; mov rax, QWORD push_fn as i64
             ; call rax
-
-            // Check return value
             ; test al, al
             ; jz >fail
         );
@@ -256,8 +362,256 @@ impl JitCompiler {
         Ok(())
     }
 
-    /// Get length of specialized Vec<int>
-    fn compile_vec_int_len(&mut self, vec_id: usize, dest_reg: u8) -> Result<()> {
+    /// Specialized push for Vec<bool>
+    fn compile_vec_bool_push(&mut self, vec_id: usize, value_reg: u8) -> Result<()> {
+        jit::log(|| {
+            format!(
+                "⚡ JIT: Specialized bool push to vec #{} from reg {}",
+                vec_id, value_reg
+            )
+        });
+
+        let spec_value =
+            self.specialized_values
+                .get(&vec_id)
+                .ok_or_else(|| crate::LustError::RuntimeError {
+                    message: format!("Specialized vec #{} not found", vec_id),
+                })?;
+
+        let stack_offset = spec_value.stack_offset;
+        let value_offset = (value_reg as i32) * mem::size_of::<Value>() as i32 + 8;
+
+        unsafe extern "C" {
+            fn jit_vec_bool_push(
+                vec_ptr: *mut *mut u8,
+                vec_len: *mut usize,
+                vec_cap: *mut usize,
+                value: u8,
+            ) -> u8;
+        }
+        let push_fn = jit_vec_bool_push as *const ();
+
+        dynasm!(self.ops
+            ; .arch x64
+            ; lea rdi, [rbp + stack_offset]
+            ; lea rsi, [rbp + stack_offset + 8]
+            ; lea rdx, [rbp + stack_offset + 16]
+            ; movzx ecx, BYTE [r12 + value_offset]
+            ; mov rax, QWORD push_fn as i64
+            ; call rax
+            ; test al, al
+            ; jz >fail
+        );
+
+        Ok(())
+    }
+
+    /// Specialized push for Vec<LustFloat>
+    fn compile_vec_float_push(&mut self, vec_id: usize, value_reg: u8) -> Result<()> {
+        jit::log(|| {
+            format!(
+                "⚡ JIT: Specialized float push to vec #{} from reg {}",
+                vec_id, value_reg
+            )
+        });
+
+        let spec_value =
+            self.specialized_values
+                .get(&vec_id)
+                .ok_or_else(|| crate::LustError::RuntimeError {
+                    message: format!("Specialized vec #{} not found", vec_id),
+                })?;
+
+        let stack_offset = spec_value.stack_offset;
+        let value_offset = (value_reg as i32) * mem::size_of::<Value>() as i32 + 8;
+
+        unsafe extern "C" {
+            fn jit_vec_float_push(
+                vec_ptr: *mut *mut LustFloat,
+                vec_len: *mut usize,
+                vec_cap: *mut usize,
+                value: LustFloat,
+            ) -> u8;
+        }
+        let push_fn = jit_vec_float_push as *const ();
+
+        dynasm!(self.ops
+            ; .arch x64
+            ; lea rdi, [rbp + stack_offset]
+            ; lea rsi, [rbp + stack_offset + 8]
+            ; lea rdx, [rbp + stack_offset + 16]
+            ; movsd xmm0, [r12 + value_offset]
+            ; mov rax, QWORD push_fn as i64
+            ; call rax
+            ; test al, al
+            ; jz >fail
+        );
+
+        Ok(())
+    }
+
+    /// Specialized element load (VecGet)
+    fn compile_vec_get(&mut self, dest_reg: u8, vec_id: usize, index_reg: u8) -> Result<()> {
+        let specialized = self.specialized_values.get(&vec_id).cloned().ok_or_else(|| {
+            crate::LustError::RuntimeError {
+                message: format!("Specialized vec #{} not found", vec_id),
+            }
+        })?;
+        let stack_offset = specialized.stack_offset;
+        let idx_offset = (index_reg as i32) * mem::size_of::<Value>() as i32 + 8;
+
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov rcx, [r12 + idx_offset]
+            ; cmp rcx, [rbp + stack_offset + 8]
+            ; jae >fail
+            ; mov rdx, [rbp + stack_offset]
+        );
+
+        match specialized.kind {
+            VecKind::Bool => {
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; movzx eax, BYTE [rdx + rcx]
+                );
+                self.store_from_rax(dest_reg, ValueTag::Bool.as_u8());
+            }
+            VecKind::Int => {
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; mov rax, [rdx + rcx*8]
+                );
+                self.store_from_rax(dest_reg, ValueTag::Int.as_u8());
+            }
+            VecKind::Float => {
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; movsd xmm0, [rdx + rcx*8]
+                );
+                self.store_xmm0_as_float(dest_reg);
+            }
+        }
+        Ok(())
+    }
+
+    /// Specialized element store (VecSet)
+    fn compile_vec_set(&mut self, vec_id: usize, index_reg: u8, value_reg: u8) -> Result<()> {
+        let specialized = self.specialized_values.get(&vec_id).cloned().ok_or_else(|| {
+            crate::LustError::RuntimeError {
+                message: format!("Specialized vec #{} not found", vec_id),
+            }
+        })?;
+        let stack_offset = specialized.stack_offset;
+        let idx_offset = (index_reg as i32) * mem::size_of::<Value>() as i32 + 8;
+        let val_offset = (value_reg as i32) * mem::size_of::<Value>() as i32 + 8;
+
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov rcx, [r12 + idx_offset]
+            ; cmp rcx, [rbp + stack_offset + 8]
+            ; jae >fail
+            ; mov rdx, [rbp + stack_offset]
+        );
+
+        match specialized.kind {
+            VecKind::Bool => {
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; mov al, BYTE [r12 + val_offset]
+                    ; mov BYTE [rdx + rcx], al
+                );
+            }
+            VecKind::Int | VecKind::Float => {
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; mov rax, [r12 + val_offset]
+                    ; mov [rdx + rcx*8], rax
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Specialized element load with bounds check (VecIndexOk)
+    fn compile_vec_index_ok(
+        &mut self,
+        value_dest: u8,
+        condition_dest: u8,
+        vec_id: usize,
+        index_reg: u8,
+    ) -> Result<()> {
+        let specialized = self.specialized_values.get(&vec_id).cloned().ok_or_else(|| {
+            crate::LustError::RuntimeError {
+                message: format!("Specialized vec #{} not found", vec_id),
+            }
+        })?;
+        let stack_offset = specialized.stack_offset;
+        let idx_offset = (index_reg as i32) * mem::size_of::<Value>() as i32 + 8;
+
+        let out_of_range = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov rcx, [r12 + idx_offset]
+            ; cmp rcx, [rbp + stack_offset + 8]
+            ; jae => out_of_range
+            ; mov rdx, [rbp + stack_offset]
+        );
+
+        match specialized.kind {
+            VecKind::Bool => {
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; movzx eax, BYTE [rdx + rcx]
+                );
+                self.store_from_rax(value_dest, ValueTag::Bool.as_u8());
+            }
+            VecKind::Int => {
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; mov rax, [rdx + rcx*8]
+                );
+                self.store_from_rax(value_dest, ValueTag::Int.as_u8());
+            }
+            VecKind::Float => {
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; movsd xmm0, [rdx + rcx*8]
+                );
+                self.store_xmm0_as_float(value_dest);
+            }
+        }
+
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov eax, 1
+        );
+        self.store_from_rax(condition_dest, ValueTag::Bool.as_u8());
+
+        dynasm!(self.ops
+            ; .arch x64
+            ; jmp => done
+            ; => out_of_range
+        );
+        self.compile_load_const(value_dest, &Value::Nil)?;
+        dynasm!(self.ops
+            ; .arch x64
+            ; xor eax, eax
+        );
+        self.store_from_rax(condition_dest, ValueTag::Bool.as_u8());
+
+        dynasm!(self.ops
+            ; .arch x64
+            ; => done
+        );
+        self.hot_rax = None;
+        self.hot_xmm0 = None;
+        Ok(())
+    }
+
+    /// Get length of specialized Vec<T>
+    fn compile_vec_len(&mut self, vec_id: usize, dest_reg: u8) -> Result<()> {
         jit::log(|| {
             format!(
                 "⚡ JIT: Specialized len of vec #{} to reg {}",
@@ -275,10 +629,9 @@ impl JitCompiler {
         let stack_offset = spec_value.stack_offset;
         dynasm!(self.ops
             ; .arch x64
-            // Read vec_len from JIT stack
             ; mov rax, [rbp + stack_offset + 8]
         );
-        self.store_from_rax(dest_reg, 2);
+        self.store_from_rax(dest_reg, ValueTag::Int.as_u8());
 
         Ok(())
     }
@@ -289,33 +642,17 @@ impl JitCompiler {
         specialized_id: usize,
         layout: &SpecializedLayout,
     ) -> Result<()> {
-        match layout {
-            SpecializedLayout::Vec { element_layout, .. } => {
-                // Check if it's Vec<LustInt>
-                if matches!(**element_layout, SpecializedLayout::Scalar { size, .. } if size == core::mem::size_of::<LustInt>())
-                {
-                    self.compile_drop_vec_int(specialized_id)?;
-                } else {
-                    return Err(crate::LustError::RuntimeError {
-                        message: format!(
-                            "Drop not yet implemented for Vec with element type {:?}",
-                            element_layout
-                        ),
-                    });
-                }
-            }
-            _ => {
-                return Err(crate::LustError::RuntimeError {
-                    message: format!("Drop not yet implemented for layout {:?}", layout),
-                });
-            }
+        match vec_kind(layout) {
+            Some(kind) => self.compile_drop_vec(specialized_id, kind),
+            None => Err(crate::LustError::RuntimeError {
+                message: format!("Drop not yet implemented for layout {:?}", layout),
+            }),
         }
-        Ok(())
     }
 
-    /// Drop Vec<LustInt> without reboxing
-    fn compile_drop_vec_int(&mut self, vec_id: usize) -> Result<()> {
-        jit::log(|| format!("🗑️  JIT: Dropping specialized vec #{}", vec_id));
+    /// Drop Vec<T> without reboxing
+    fn compile_drop_vec(&mut self, vec_id: usize, kind: VecKind) -> Result<()> {
+        jit::log(|| format!("🗑️  JIT: Dropping specialized {:?} vec #{}", kind, vec_id));
 
         let spec_value =
             self.specialized_values
@@ -328,8 +665,14 @@ impl JitCompiler {
 
         unsafe extern "C" {
             fn jit_drop_vec_int(slot: *mut JitVecSlot);
+            fn jit_drop_vec_bool(slot: *mut JitVecSlot);
+            fn jit_drop_vec_float(slot: *mut JitVecSlot);
         }
-        let drop_fn = jit_drop_vec_int as *const ();
+        let drop_fn: *const () = match kind {
+            VecKind::Int => jit_drop_vec_int as *const (),
+            VecKind::Bool => jit_drop_vec_bool as *const (),
+            VecKind::Float => jit_drop_vec_float as *const (),
+        };
 
         dynasm!(self.ops
             ; .arch x64
@@ -344,13 +687,6 @@ impl JitCompiler {
     /// Allocate stack space for specialized values
     /// Returns the offset from rbp (negative value)
     fn allocate_specialized_stack(&mut self, _size: usize, _align: usize) -> i32 {
-        // Stack layout after prologue:
-        // [rbp - 8]: rbx, [rbp - 16]: r12, [rbp - 24]: r13, [rbp - 32]: r14, [rbp - 40]: r15
-        // Allocated space: [rbp - 41] to [rbp - (40 + stack_size)]
-        //
-        // SPECIALIZED_BASE_OFFSET keeps every slot below the saved registers
-        // Vec needs ptr, len, cap = 24 bytes
-        // Each additional specialized value uses 32 bytes (24 for data + 8 padding for alignment)
         let allocation_offset = self.specialized_values.len() as i32 * SPECIALIZED_SLOT_SIZE;
         SPECIALIZED_BASE_OFFSET - allocation_offset
     }

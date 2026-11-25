@@ -434,7 +434,12 @@ pub(crate) fn identifier_completions(
                 }
             }
 
-            ItemKind::Script(_) | ItemKind::Impl(_) | ItemKind::Use { .. } | ItemKind::Service(_) => {}
+            ItemKind::Script(_)
+            | ItemKind::Impl(_)
+            | ItemKind::Use { .. }
+            | ItemKind::Service(_)
+            | ItemKind::Test(_)
+            | ItemKind::Suite(_) => {}
         }
     }
 

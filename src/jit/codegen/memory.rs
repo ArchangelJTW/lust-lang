@@ -1251,7 +1251,7 @@ impl JitCompiler {
             ; mov rsi, QWORD name_ptr as usize as _
             ; mov rdx, QWORD name_len as _
             ; lea rcx, [r12 + src_offset]
-            ; mov rax, QWORD jit_set_global_safe as usize as _
+            ; mov rax, QWORD jit_set_global_safe as *const () as usize as _
             ; call rax
             ; test al, al
             ; jz >fail

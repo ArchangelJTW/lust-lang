@@ -279,11 +279,11 @@ impl Parser {
         let expr = self.parse_term()?;
         if self.check(TokenKind::DoubleDot) {
             if !Self::is_string_like_expr(&expr) {
-                let next_is_string = self
+                let next_is_number = self
                     .peek_ahead(1)
-                    .map(|next| matches!(next.kind, TokenKind::String))
+                    .map(|next| matches!(next.kind, TokenKind::Integer | TokenKind::Float))
                     .unwrap_or(false);
-                if !next_is_string {
+                if next_is_number {
                     return Ok(expr);
                 }
             }

@@ -584,19 +584,19 @@ impl JitCompiler {
                 TraceOp::SelectBitZero {
                     dest,
                     src,
-                    mask: _,
+                    mask,
                     on_zero,
                     on_nonzero,
                 } => {
-                    self.compile_select(*dest, *src, on_zero, on_nonzero)?;
+                    self.compile_select_bit_zero(*dest, *src, *mask, on_zero, on_nonzero)?;
                 }
 
                 TraceOp::ModImm { dest, src, divisor } => {
-                    let lhs_offset = reg_offset(*src);
                     let div = *divisor;
+                    self.hot_rax_in = None;
+                    self.load_to_rax(*src);
                     dynasm!(self.ops
                         ; .arch x64
-                        ; mov rax, [r12 + lhs_offset + 8]
                         ; mov rbx, QWORD div
                     );
                     self.emit_int_mod();
@@ -1162,7 +1162,7 @@ impl JitCompiler {
                     source_reg,
                     layout,
                 } => {
-                    self.compile_unbox(*specialized_id, *source_reg, layout)?;
+                    self.compile_unbox(*specialized_id, *source_reg, layout, guard_index, guards)?;
                 }
 
                 TraceOp::Rebox {
@@ -1762,6 +1762,7 @@ impl JitCompiler {
             TraceOp::Select { cond, .. } => *cond == register,
             TraceOp::SelectBitZero { src, .. } => *src == register,
             TraceOp::ModImm { src, .. } => *src == register,
+            TraceOp::StoreGlobal { src, .. } => *src == register,
             TraceOp::Return { value } => *value == Some(register),
             TraceOp::Unbox { source_reg, .. } => *source_reg == register,
             TraceOp::SpecializedOp { operands, .. } => operands.iter().any(|operand| {
@@ -2049,6 +2050,10 @@ impl JitCompiler {
             TraceOp::ModImm { dest, .. } => {
                 set(&mut self.scalar_registers, *dest, Some(ValueType::Int));
             }
+            TraceOp::ConditionalHammock { acc_dest, .. } => {
+                set(&mut self.scalar_registers, *acc_dest, Some(ValueType::Int));
+            }
+            TraceOp::StoreGlobal { .. } => {}
         }
     }
 

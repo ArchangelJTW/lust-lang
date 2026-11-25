@@ -38,10 +38,19 @@ mod memory;
 mod registers;
 mod specialization;
 mod values;
+/// Element representation for specialized `Vec` slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VecKind {
+    Int,
+    Bool,
+    Float,
+}
+
 /// Tracks a specialized value in the JIT trace
 #[derive(Debug, Clone)]
 pub(super) struct SpecializedValue {
     pub stack_offset: i32,
+    pub kind: VecKind,
 }
 
 pub struct JitCompiler {

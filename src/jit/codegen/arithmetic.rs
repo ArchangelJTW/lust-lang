@@ -426,7 +426,7 @@ impl JitCompiler {
     /// `x % -1` is 0 for every dividend, and taking that path also avoids
     /// the #DE that `idiv` would raise for `MIN % -1` (see
     /// `emit_int_div`).
-    fn emit_int_mod(&mut self) {
+    pub(super) fn emit_int_mod(&mut self) {
         dynasm!(self.ops
             ; .arch x64
             ; test rbx, rbx

@@ -4,13 +4,16 @@ exclude = ["examples/rust-extension/extensions/**", "tree-sitter-lust"]
 
 [package]
 name = "lust-rs"
-version = "3.5.8"
+version = "3.5.9"
 edition = "2024"
 include = [
   "/src/**",
   "/include/**",
   "/examples/embed.rs",
+  "/examples/effects/*.rs",
   "/benchmarks/numeric.rs",
+  "/benchmarks/effects_bench.rs",
+  "/benchmarks/test_framework_bench.rs",
   "/build.rs",
   "/Cargo.toml",
   "/README.md",

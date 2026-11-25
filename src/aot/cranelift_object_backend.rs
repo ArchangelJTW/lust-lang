@@ -16,8 +16,9 @@ use crate::error::{LustError, Result};
 use crate::mir::cranelift_backend::CraneliftJitCompiler;
 #[cfg(feature = "cranelift-aot")]
 use crate::mir::cranelift_backend::CraneliftObjectCompiler;
-use crate::mir::ir::{MirModule, Terminator};
-use crate::mir::opt::MirOptimizer;
+use crate::mir::ir::{MirModule, MirStructLayout, Terminator};
+use crate::mir::opt::{MirOptimizer, ScalarReplacementOfAggregates};
+use crate::mir::verifier::MirVerifier;
 
 /// Canonical diagnostic message returned when `--backend cranelift-aot` is requested without
 /// the `cranelift-aot` feature enabled.
@@ -78,6 +79,52 @@ fn canonicalize_module_callees(module: &mut MirModule) {
                 && let Some(Some(qualified)) = suffix_map.get(callee.as_str())
             {
                 *callee = qualified.clone();
+            }
+        }
+    }
+}
+
+fn optimize_module_for_cranelift_aot(module: &mut MirModule) {
+    MirOptimizer::optimize_module(module);
+
+    let mut struct_layouts: hashbrown::HashMap<String, MirStructLayout> =
+        hashbrown::HashMap::new();
+    let mut conflicting: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+    let mut record_layout = |layout: &MirStructLayout| {
+        if conflicting.contains(&layout.type_name) {
+            return;
+        }
+        match struct_layouts.get(&layout.type_name) {
+            Some(existing) if existing != layout => {
+                struct_layouts.remove(&layout.type_name);
+                conflicting.insert(layout.type_name.clone());
+            }
+            Some(_) => {}
+            None => {
+                struct_layouts.insert(layout.type_name.clone(), layout.clone());
+            }
+        }
+    };
+    for layout in &module.struct_layouts {
+        record_layout(layout);
+    }
+    for func in &module.functions {
+        for layout in &func.struct_layouts {
+            record_layout(layout);
+        }
+    }
+
+    if !struct_layouts.is_empty() {
+        for func in &mut module.functions {
+            if !func.cleanup_blocks.is_empty() {
+                continue;
+            }
+            let pre_sroa = func.clone();
+            if ScalarReplacementOfAggregates::run_on_function(func, &struct_layouts) {
+                MirOptimizer::optimize_function(func);
+                if MirVerifier::verify_fn(func).is_err() {
+                    *func = pre_sroa;
+                }
             }
         }
     }
@@ -293,7 +340,7 @@ pub fn compile_mir_to_object_bytes(
 
     let mut opt_module = module.clone();
     canonicalize_module_callees(&mut opt_module);
-    MirOptimizer::optimize_module(&mut opt_module);
+    optimize_module_for_cranelift_aot(&mut opt_module);
 
     let (isa, resolved_triple) = build_object_target_isa(target_triple)?;
     let binary_format = format!("{:?}", isa.triple().binary_format);

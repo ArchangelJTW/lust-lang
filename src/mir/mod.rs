@@ -4,6 +4,8 @@ pub mod opt;
 pub mod verifier;
 pub mod vm_backend;
 #[cfg(feature = "std")]
+pub mod c_backend;
+#[cfg(feature = "std")]
 pub mod c_header_gen;
 #[cfg(feature = "cranelift")]
 pub mod cranelift_backend;
@@ -17,6 +19,8 @@ pub use lowering::*;
 pub use opt::*;
 pub use verifier::*;
 pub use vm_backend::*;
+#[cfg(feature = "std")]
+pub use c_backend::*;
 #[cfg(feature = "std")]
 pub use c_header_gen::*;
 #[cfg(feature = "cranelift")]

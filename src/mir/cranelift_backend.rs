@@ -15,7 +15,8 @@ pub use jit_engine::{
     lust_mir_enum_payload_at, lust_mir_enum_tag, lust_mir_floordiv_float, lust_mir_floordiv_int,
     lust_mir_gas_fast_ptr, lust_mir_gas_slow, lust_mir_get_gas,
     lust_mir_get_memory_used, lust_mir_get_status, lust_mir_ic_dispatch, lust_mir_ic_miss,
-    lust_mir_ic_probe, lust_mir_init_deopt, lust_mir_init_deopt_at_terminator, lust_mir_map_get,
+    lust_mir_ic_probe, lust_mir_init_deopt, lust_mir_init_deopt_at_terminator,
+    lust_mir_intern_static_bytes, lust_mir_map_get,
     lust_mir_map_get_int_unwrap, lust_mir_map_get_typed, lust_mir_map_has_typed, lust_mir_map_len,
     lust_mir_map_set, lust_mir_map_set_typed, lust_mir_max_int, lust_mir_min_int,
     lust_mir_pow_float, lust_mir_pow_int, lust_mir_print_bool_part, lust_mir_print_float_part,
@@ -1244,6 +1245,7 @@ pub mod jit_engine {
     ///   - `>= 0`: armed `quantum_rem` (`0` or `max_q`)
     ///   - `MIR_STATUS_DEOPT` (`-100`): deopt requested at this safepoint
     ///   - `-1`: non-deopt error (e.g. `OutOfGas` / `Interrupted`; status already stored)
+    #[unsafe(no_mangle)]
     pub extern "C" fn lust_mir_quantized_refill_slow(amt: i64, max_q: i64) -> i64 {
         let mut allow_arm = true;
         let sp_slow_needed = SAFEPOINT_STATE.with(|state_cell| {
@@ -1665,7 +1667,8 @@ pub mod jit_engine {
         ptr as i64
     }
 
-    extern "C" fn lust_mir_clif_string_gsub(
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lust_mir_clif_string_gsub(
         _vm_ctx: i64,
         handle: i64,
         pattern: i64,
@@ -1744,7 +1747,8 @@ pub mod jit_engine {
         })
     }
 
-    extern "C" fn lust_mir_clif_string_split(
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lust_mir_clif_string_split(
         vm_ctx: i64,
         handle: i64,
         separator: i64,
@@ -1898,7 +1902,8 @@ pub mod jit_engine {
         next_id
     }
 
-    extern "C" fn lust_mir_clif_unknown_type_id(obj: i64) -> i64 {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lust_mir_clif_unknown_type_id(obj: i64) -> i64 {
         if obj == 0 {
             return 0;
         }
@@ -1914,7 +1919,8 @@ pub mod jit_engine {
         })
     }
 
-    extern "C" fn lust_mir_clif_unknown_get_field_fallback(obj: i64, field_handle: i64) -> i64 {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lust_mir_clif_unknown_get_field_fallback(obj: i64, field_handle: i64) -> i64 {
         with_current_mir_context(|ctx| {
             let Some(field_name) = ctx.with_str_handle(field_handle, |s| s.to_string()) else {
                 ctx.set_status(MIR_STATUS_ERR_OUT_OF_BOUNDS);
@@ -1947,7 +1953,8 @@ pub mod jit_engine {
         })
     }
 
-    extern "C" fn lust_mir_clif_string_sub_byte_array(
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lust_mir_clif_string_sub_byte_array(
         base_handle: i64,
         sub_start: i64,
         sub_end: i64,
@@ -1978,7 +1985,8 @@ pub mod jit_engine {
         })
     }
 
-    extern "C" fn lust_mir_clif_string_byte(
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lust_mir_clif_string_byte(
         vm_ctx: i64,
         handle: i64,
         start: i64,
@@ -2028,7 +2036,8 @@ pub mod jit_engine {
         materialize_handle_array_to_mir_ptr(arr_handle, elem_tag)
     }
 
-    extern "C" fn lust_mir_clif_string_find(
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lust_mir_clif_string_find(
         vm_ctx: i64,
         handle: i64,
         pattern: i64,
@@ -6234,6 +6243,7 @@ pub mod jit_engine {
         "lust_mir_alloc_array_typed",
         "lust_mir_alloc_cflat_struct",
         "lust_mir_alloc_enum",
+        "lust_mir_alloc_enum2",
         "lust_mir_alloc_map",
         "lust_mir_alloc_struct",
         "lust_mir_alloc_struct_named",
@@ -6246,9 +6256,17 @@ pub mod jit_engine {
         "lust_mir_array_set",
         "lust_mir_charge_gas",
         "lust_mir_clamp_int",
+        "lust_mir_clif_string_byte",
+        "lust_mir_clif_string_find",
+        "lust_mir_clif_string_gsub",
+        "lust_mir_clif_string_split",
+        "lust_mir_clif_string_sub_byte_array",
+        "lust_mir_clif_unknown_get_field_fallback",
+        "lust_mir_clif_unknown_type_id",
         "lust_mir_div_int",
         "lust_mir_enter_native_callee",
         "lust_mir_enum_payload",
+        "lust_mir_enum_payload_at",
         "lust_mir_enum_tag",
         "lust_mir_exit_native_callee",
         "lust_mir_floordiv_float",
@@ -6263,10 +6281,15 @@ pub mod jit_engine {
         "lust_mir_ic_probe",
         "lust_mir_init_deopt",
         "lust_mir_init_deopt_at_terminator",
+        "lust_mir_intern_static_bytes",
         "lust_mir_is_simd_scalar_forced",
         "lust_mir_map_get",
+        "lust_mir_map_get_int_unwrap",
+        "lust_mir_map_get_typed",
+        "lust_mir_map_has_typed",
         "lust_mir_map_len",
         "lust_mir_map_set",
+        "lust_mir_map_set_typed",
         "lust_mir_max_int",
         "lust_mir_min_int",
         "lust_mir_pow_float",
@@ -6278,6 +6301,10 @@ pub mod jit_engine {
         "lust_mir_print_nl",
         "lust_mir_print_sep",
         "lust_mir_print_string_part",
+        "lust_mir_quantized_refill_slow",
+        "lust_mir_queue_new",
+        "lust_mir_queue_offer_int",
+        "lust_mir_queue_take_int",
         "lust_mir_record_deopt",
         "lust_mir_record_deopt_local",
         "lust_mir_record_native_entry",
@@ -6293,15 +6320,23 @@ pub mod jit_engine {
         "lust_mir_set_memory_limit",
         "lust_mir_set_status",
         "lust_mir_string_append_inplace",
+        "lust_mir_string_byte",
+        "lust_mir_string_byte_at",
         "lust_mir_string_concat",
         "lust_mir_string_eq",
+        "lust_mir_string_find",
+        "lust_mir_string_gsub",
         "lust_mir_string_len",
+        "lust_mir_string_split",
+        "lust_mir_string_sub",
         "lust_mir_struct_decode_binary",
         "lust_mir_struct_decode_contiguous",
         "lust_mir_tostring_bool",
         "lust_mir_tostring_float",
         "lust_mir_tostring_int",
         "lust_mir_track_memory_allocated",
+        "lust_mir_unknown_is_int",
+        "lust_mir_unknown_unwrap_int",
     ];
 
     /// Returns `true` iff `name` is an exported C-ABI MIR runtime helper symbol.
@@ -6437,6 +6472,7 @@ pub mod jit_engine {
                     "lust_mir_string_append_inplace" => Some(lust_mir_string_append_inplace as *const u8),
                     "lust_mir_string_eq" => Some(lust_mir_string_eq as *const u8),
                     "lust_mir_string_len" => Some(lust_mir_string_len as *const u8),
+                    "lust_mir_intern_static_bytes" => Some(lust_mir_intern_static_bytes as *const u8),
                     "lust_mir_string_sub" => Some(lust_mir_string_sub as *const u8),
                     "lust_mir_string_byte" => Some(lust_mir_string_byte as *const u8),
                     "lust_mir_string_byte_at" => Some(lust_mir_string_byte_at as *const u8),
@@ -7981,6 +8017,31 @@ pub mod jit_engine {
                                     | CanonicalTypeTag::DateTimeUtc => Ok(MirType::Int),
                                     CanonicalTypeTag::Float64 => Ok(MirType::Float),
                                     CanonicalTypeTag::StringSlice => Ok(MirType::String),
+                                    CanonicalTypeTag::NestedStruct(nested_id) => {
+                                        struct_layouts
+                                            .values()
+                                            .find(|l| l.type_id == nested_id)
+                                            .map(|l| {
+                                                let inner = MirType::Struct(l.type_name.clone());
+                                                if field.is_optional || field.is_nullable {
+                                                    MirType::Option(Box::new(inner))
+                                                } else {
+                                                    inner
+                                                }
+                                            })
+                                            .or_else(|| {
+                                                with_current_mir_context(|ctx| {
+                                                    ctx.get_struct_field_type(&name, *field_idx)
+                                                })
+                                            })
+                                            .ok_or_else(|| MirCraneliftBackendError::InvalidSimdCall {
+                                                callee: callee.to_string(),
+                                                reason: format!(
+                                                    "Unsupported struct field tag '{:?}' at '{name}.{field_idx}'",
+                                                    field.tag
+                                                ),
+                                            })
+                                    }
                                     other => with_current_mir_context(|ctx| {
                                         ctx.get_struct_field_type(&name, *field_idx)
                                     })
@@ -8499,18 +8560,68 @@ pub mod jit_engine {
                 None
             };
 
-            // Pre-declare read-only data symbols for struct type names in AOT mode so
-            // emitted Mach-O/ELF code uses real relocations instead of host heap pointers.
+            // Pre-declare read-only data symbols for struct type names and static string
+            // constants in AOT mode so emitted Mach-O/ELF code uses real relocations
+            // instead of host heap pointers.
             let mut aot_struct_name_data: Vec<(String, DataId, usize)> = Vec::new();
+            let mut aot_str_const_data: Vec<(String, DataId, usize)> = Vec::new();
+            let mut aot_intern_static_bytes_callee: Option<FuncId> = None;
             if self.aot_mode {
                 let mut seen_names: Vec<String> = Vec::new();
+                let mut seen_strings: Vec<String> = Vec::new();
+                let mut push_op_str = |op: &Operand| {
+                    if let Operand::Constant(MirConstant::String(s)) = op
+                        && !s.is_empty()
+                    {
+                        seen_strings.push(s.clone());
+                    }
+                };
                 for block in &mir_fn.blocks {
                     for stmt in &block.statements {
-                        if let Statement::Assign(_, Rvalue::Aggregate(MirType::Struct(name), _), _) =
-                            stmt
-                            && !name.is_empty()
-                        {
-                            seen_names.push(name.clone());
+                        if let Statement::Assign(_, rvalue, _) = stmt {
+                            match rvalue {
+                                Rvalue::Aggregate(MirType::Struct(name), ops) => {
+                                    if !name.is_empty() {
+                                        seen_names.push(name.clone());
+                                    }
+                                    for op in ops {
+                                        push_op_str(op);
+                                    }
+                                }
+                                Rvalue::Aggregate(_, ops) => {
+                                    for op in ops {
+                                        push_op_str(op);
+                                    }
+                                }
+                                Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => {
+                                    push_op_str(op);
+                                }
+                                Rvalue::BinaryOp(_, lhs, rhs) => {
+                                    push_op_str(lhs);
+                                    push_op_str(rhs);
+                                }
+                                Rvalue::Closure { captures, .. } => {
+                                    for (_, op, _) in captures {
+                                        push_op_str(op);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(term) = &block.terminator {
+                        match term {
+                            Terminator::Cond { cond, .. }
+                            | Terminator::Switch { discr: cond, .. }
+                            | Terminator::Raise(cond, _) => push_op_str(cond),
+                            Terminator::Call { args, .. } => {
+                                for arg in args {
+                                    push_op_str(arg);
+                                }
+                            }
+                            Terminator::Return(Some(op), _) => push_op_str(op),
+                            Terminator::Return(None, _)
+                            | Terminator::Goto(_, _)
+                            | Terminator::Unreachable(_) => {}
                         }
                     }
                 }
@@ -8521,6 +8632,29 @@ pub mod jit_engine {
                         self.ensure_aot_rodata_symbol("__lust_struct_name", name.as_bytes())?;
                     let len = name.len();
                     aot_struct_name_data.push((name, data_id, len));
+                }
+                seen_strings.sort();
+                seen_strings.dedup();
+                for s in seen_strings {
+                    let data_id =
+                        self.ensure_aot_rodata_symbol("__lust_str_const", s.as_bytes())?;
+                    let len = s.len();
+                    aot_str_const_data.push((s, data_id, len));
+                }
+                if !aot_str_const_data.is_empty() {
+                    let mut sig_intern = self.module.make_signature();
+                    sig_intern.params.push(AbiParam::new(types::I64));
+                    sig_intern.params.push(AbiParam::new(types::I64));
+                    sig_intern.returns.push(AbiParam::new(types::I64));
+                    let callee_id = self
+                        .module
+                        .declare_function(
+                            "lust_mir_intern_static_bytes",
+                            Linkage::Import,
+                            &sig_intern,
+                        )
+                        .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+                    aot_intern_static_bytes_callee = Some(callee_id);
                 }
             }
 
@@ -8810,6 +8944,19 @@ pub mod jit_engine {
                 } else {
                     None
                 };
+                let mut aot_str_const_gvs: hashbrown::HashMap<String, (GlobalValue, usize)> =
+                    hashbrown::HashMap::with_capacity(aot_str_const_data.len());
+                for (s, data_id, len) in &aot_str_const_data {
+                    let gv = self.module.declare_data_in_func(*data_id, &mut builder.func);
+                    aot_str_const_gvs.insert(s.clone(), (gv, *len));
+                }
+                let aot_str_const_gvs_ref = if self.aot_mode {
+                    Some(&aot_str_const_gvs)
+                } else {
+                    None
+                };
+                let intern_static_bytes_fn = aot_intern_static_bytes_callee
+                    .map(|cid| self.module.declare_func_in_func(cid, &mut builder.func));
                 let alloc_array_fn = self.module.declare_func_in_func(alloc_array_callee, &mut builder.func);
                 let alloc_array_typed_fn = self.module.declare_func_in_func(alloc_array_typed_callee, &mut builder.func);
                 let alloc_tuple_typed_fn = self.module.declare_func_in_func(alloc_tuple_typed_callee, &mut builder.func);
@@ -8979,6 +9126,8 @@ pub mod jit_engine {
                     closure_fn_ids: closure_fn_ids_ref,
                     aot_mode: self.aot_mode,
                     aot_struct_name_gvs: aot_struct_name_gvs_ref,
+                    aot_str_const_gvs: aot_str_const_gvs_ref,
+                    intern_static_bytes_fn,
                 };
 
                 // Cache `type_id` once in `fn_entry_bb` for read-only `MirType::Unknown` parameters
@@ -9734,6 +9883,8 @@ pub mod jit_engine {
                         closure_fn_ids: closure_fn_ids_ref,
                         aot_mode: self.aot_mode,
                         aot_struct_name_gvs: aot_struct_name_gvs_ref,
+                    aot_str_const_gvs: aot_str_const_gvs_ref,
+                    intern_static_bytes_fn,
                     };
                     let active_promoted = if is_peeled_iq_hdr {
                         cl_opt.map(|ci| cl_states[ci].counters)
@@ -9888,6 +10039,8 @@ pub mod jit_engine {
                             closure_fn_ids: closure_fn_ids_ref,
                             aot_mode: self.aot_mode,
                             aot_struct_name_gvs: aot_struct_name_gvs_ref,
+                    aot_str_const_gvs: aot_str_const_gvs_ref,
+                    intern_static_bytes_fn,
                         };
                         if let Some(rc) = peeled_range_fusion.fused_checks.get(&stmt_idx) {
                             let dst_decl = mir_fn.locals.get(rc.dst.0).ok_or_else(|| {
@@ -10363,6 +10516,8 @@ pub mod jit_engine {
                                     closure_fn_ids: closure_fn_ids_ref,
                                     aot_mode: self.aot_mode,
                                     aot_struct_name_gvs: aot_struct_name_gvs_ref,
+                    aot_str_const_gvs: aot_str_const_gvs_ref,
+                    intern_static_bytes_fn,
                                 };
                                 let q0 = builder.use_var(quantum_rem_var);
                                 const UNROLL_K: i64 = 8;
@@ -10574,6 +10729,8 @@ pub mod jit_engine {
                                                         closure_fn_ids: closure_fn_ids_ref,
                                                         aot_mode: self.aot_mode,
                                                         aot_struct_name_gvs: aot_struct_name_gvs_ref,
+                    aot_str_const_gvs: aot_str_const_gvs_ref,
+                    intern_static_bytes_fn,
                                                     };
                                                     let d_val = lower_operand(
                                                         delta_op,
@@ -10649,6 +10806,8 @@ pub mod jit_engine {
                                                     closure_fn_ids: closure_fn_ids_ref,
                                                     aot_mode: self.aot_mode,
                                                     aot_struct_name_gvs: aot_struct_name_gvs_ref,
+                    aot_str_const_gvs: aot_str_const_gvs_ref,
+                    intern_static_bytes_fn,
                                                 };
                                                 let dst_decl = &mir_fn.locals[dst.0];
                                                 let val = lower_rvalue(
@@ -10770,6 +10929,8 @@ pub mod jit_engine {
                                     closure_fn_ids: closure_fn_ids_ref,
                                     aot_mode: self.aot_mode,
                                     aot_struct_name_gvs: aot_struct_name_gvs_ref,
+                    aot_str_const_gvs: aot_str_const_gvs_ref,
+                    intern_static_bytes_fn,
                                 };
                                 let q0 = builder.use_var(quantum_rem_var);
                                 let q_ge_k = builder.ins().icmp_imm_s(
@@ -11452,6 +11613,8 @@ pub mod jit_engine {
                             closure_fn_ids: closure_fn_ids_ref,
                             aot_mode: self.aot_mode,
                             aot_struct_name_gvs: aot_struct_name_gvs_ref,
+                    aot_str_const_gvs: aot_str_const_gvs_ref,
+                    intern_static_bytes_fn,
                         };
                         if let Some(rc) = block_range_fusion.fused_checks.get(&stmt_idx) {
                             let dst_decl = mir_fn.locals.get(rc.dst.0).ok_or_else(|| {
@@ -11706,6 +11869,8 @@ pub mod jit_engine {
                         closure_fn_ids: closure_fn_ids_ref,
                         aot_mode: self.aot_mode,
                         aot_struct_name_gvs: aot_struct_name_gvs_ref,
+                    aot_str_const_gvs: aot_str_const_gvs_ref,
+                    intern_static_bytes_fn,
                     };
 
                     // If this block is the pre-entry to a vectorized loop, insert runtime scalar-forced
@@ -16707,6 +16872,30 @@ pub mod jit_engine {
                             | CanonicalTypeTag::DateTimeUtc => Ok(MirType::Int),
                             CanonicalTypeTag::Float64 => Ok(MirType::Float),
                             CanonicalTypeTag::StringSlice => Ok(MirType::String),
+                            CanonicalTypeTag::NestedStruct(nested_id) => {
+                                struct_layouts
+                                    .values()
+                                    .find(|l| l.type_id == nested_id)
+                                    .map(|l| {
+                                        let inner = MirType::Struct(l.type_name.clone());
+                                        if f.is_optional || f.is_nullable {
+                                            MirType::Option(Box::new(inner))
+                                        } else {
+                                            inner
+                                        }
+                                    })
+                                    .or_else(|| {
+                                        with_current_mir_context(|ctx| {
+                                            ctx.get_struct_field_type(&name, *idx)
+                                        })
+                                    })
+                                    .ok_or_else(|| {
+                                        MirCraneliftBackendError::CodegenError(format!(
+                                            "Unsupported struct field tag '{:?}' at '{name}.{idx}'",
+                                            f.tag
+                                        ))
+                                    })
+                            }
                             other => with_current_mir_context(|ctx| {
                                 ctx.get_struct_field_type(&name, *idx)
                             })
@@ -16774,6 +16963,8 @@ pub mod jit_engine {
         closure_fn_ids: Option<&'a hashbrown::HashMap<String, i64>>,
         aot_mode: bool,
         aot_struct_name_gvs: Option<&'a hashbrown::HashMap<String, (GlobalValue, usize)>>,
+        aot_str_const_gvs: Option<&'a hashbrown::HashMap<String, (GlobalValue, usize)>>,
+        intern_static_bytes_fn: Option<FuncRef>,
     }
 
     fn is_bool_array_index_place(
@@ -17117,9 +17308,29 @@ pub mod jit_engine {
                 MirConstant::Bool(b) => Ok(builder.ins().iconst(types::I8, if *b { 1 } else { 0 })),
                 MirConstant::String(s) => {
                     if bc_ctx.aot_mode {
-                        return Err(MirCraneliftBackendError::UnlowerableValue(format!(
-                            "Static string constant {s:?} is not supported in Cranelift AOT object mode (no C-ABI static string interner symbol exported)"
-                        )));
+                        if s.is_empty() {
+                            return Ok(builder
+                                .ins()
+                                .iconst(types::I64, crate::mir::runtime_helpers::EMPTY_STR_HANDLE));
+                        }
+                        let (gv, len) = bc_ctx
+                            .aot_str_const_gvs
+                            .and_then(|m| m.get(s.as_str()))
+                            .copied()
+                            .ok_or_else(|| {
+                                MirCraneliftBackendError::UnlowerableValue(format!(
+                                    "Missing AOT rodata symbol for static string constant {s:?}"
+                                ))
+                            })?;
+                        let intern_fn = bc_ctx.intern_static_bytes_fn.ok_or_else(|| {
+                            MirCraneliftBackendError::UnlowerableValue(format!(
+                                "Missing AOT intern helper for static string constant {s:?}"
+                            ))
+                        })?;
+                        let ptr_val = builder.ins().symbol_value(types::I64, gv);
+                        let len_val = builder.ins().iconst(types::I64, len as i64);
+                        let call_inst = builder.ins().call(intern_fn, &[ptr_val, len_val]);
+                        return Ok(builder.inst_results(call_inst)[0]);
                     }
                     let handle = with_current_mir_context(|ctx| ctx.intern_string(s));
                     Ok(builder.ins().iconst(types::I64, handle))

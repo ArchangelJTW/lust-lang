@@ -448,6 +448,21 @@ impl<'a> AstLowering<'a> {
         module_name: impl Into<String>,
         items: &[Item],
     ) -> Result<MirModule, MirLowerError> {
+        Self::lower_module_items_inner(module_name, items, false)
+    }
+
+    pub fn lower_module_items_with_native_queues(
+        module_name: impl Into<String>,
+        items: &[Item],
+    ) -> Result<MirModule, MirLowerError> {
+        Self::lower_module_items_inner(module_name, items, true)
+    }
+
+    fn lower_module_items_inner(
+        module_name: impl Into<String>,
+        items: &[Item],
+        lower_native_queue_intrinsics: bool,
+    ) -> Result<MirModule, MirLowerError> {
         let mut module = MirModule::new(module_name.into());
         let mut defs = Vec::new();
         let mut enum_defs_ast: Vec<&EnumDef> = Vec::new();
@@ -501,7 +516,7 @@ impl<'a> AstLowering<'a> {
                         &enum_defs_ast,
                         Some(&mut lifted_functions),
                         Some(&mut lambda_counter),
-                        false,
+                        lower_native_queue_intrinsics,
                     )?;
                     module.add_function(mir_fn);
                     for op in ops {
@@ -523,7 +538,7 @@ impl<'a> AstLowering<'a> {
                             &enum_defs_ast,
                             Some(&mut lifted_functions),
                             Some(&mut lambda_counter),
-                            false,
+                            lower_native_queue_intrinsics,
                         )?;
                         if !mir_fn.signature.name.contains(':') {
                             mir_fn.signature.name = format!("{}:{}", target_name, method_fn.name);

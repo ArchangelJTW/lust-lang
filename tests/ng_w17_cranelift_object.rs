@@ -898,16 +898,12 @@ end
         let mut str_mod = MirModule::new("str_const_mod".into());
         str_mod.add_function(str_fn);
         let str_obj = tmp.path().join("str_const.o");
-        let err = compile_mir_to_object_file(&str_mod, &str_obj, None)
-            .expect_err("JIT-only static string constant must fail closed in Cranelift AOT");
-        assert!(
-            err.to_string().contains("Static string constant"),
-            "unexpected string constant error: {err}"
-        );
-        assert!(!str_obj.exists());
+        compile_mir_to_object_file(&str_mod, &str_obj, None)
+            .expect("static string constants should now compile in Cranelift AOT object mode");
+        assert!(str_obj.exists());
 
-        // 6. Non-C-ABI runtime helper (`queue.new` -> `lust_mir_queue_new` without `no_mangle`)
-        //    fails closed rather than emitting an unlinkable undefined symbol.
+        // 6. Exported C-ABI runtime helper (`queue.new` -> `lust_mir_queue_new` with `no_mangle`)
+        //    now compiles cleanly, while genuinely unexported/unknown intrinsics still fail closed.
         let mut queue_fn = MirFunction::new(
             FunctionSignature {
                 name: "uses_queue".into(),
@@ -933,13 +929,42 @@ end
         let mut q_mod = MirModule::new("queue_mod".into());
         q_mod.add_function(queue_fn);
         let q_obj = tmp.path().join("queue.o");
-        let err = compile_mir_to_object_file(&q_mod, &q_obj, None)
-            .expect_err("non-C-ABI runtime symbol must fail closed");
-        assert!(
-            err.to_string().contains("lust_mir_queue_new"),
-            "expected lust_mir_queue_new fail-closed error, got: {err}"
+        compile_mir_to_object_file(&q_mod, &q_obj, None)
+            .expect("exported queue.new runtime symbol should compile in Cranelift AOT");
+        assert!(q_obj.exists());
+
+        let mut unexp_fn = MirFunction::new(
+            FunctionSignature {
+                name: "uses_unexported".into(),
+                param_types: vec![],
+                return_type: MirType::Int,
+                is_public: true,
+                effects: None,
+            },
+            Span::dummy(),
         );
-        assert!(!q_obj.exists());
+        let u_dst = unexp_fn.add_local(Some("u".into()), MirType::Int, false, Span::dummy());
+        let u_ret = unexp_fn.new_block();
+        unexp_fn.blocks[0].terminator = Some(Terminator::Call {
+            callee: "__lust_unexported_non_c_abi_probe".into(),
+            args: vec![],
+            destination: Place::Local(u_dst),
+            success: u_ret,
+            error: None,
+            span: Span::dummy(),
+        });
+        unexp_fn.blocks[u_ret.0].terminator =
+            Some(Terminator::Return(Some(Operand::Copy(Place::Local(u_dst))), Span::dummy()));
+        let mut u_mod = MirModule::new("unexp_mod".into());
+        u_mod.add_function(unexp_fn);
+        let u_obj = tmp.path().join("unexported.o");
+        let err = compile_mir_to_object_file(&u_mod, &u_obj, None)
+            .expect_err("unexported non-C-ABI runtime symbol must fail closed");
+        assert!(
+            err.to_string().contains("__lust_unexported_non_c_abi_probe"),
+            "expected __lust_unexported_non_c_abi_probe fail-closed error, got: {err}"
+        );
+        assert!(!u_obj.exists());
     }
 
     #[test]

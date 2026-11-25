@@ -2214,7 +2214,10 @@ fn build_command(args: &[String]) {
 
         let prepared_items = lust::codegen_zig::aot::prepare_items_for_mir(&filtered_items);
         let mir_module =
-            match lust::mir::lowering::AstLowering::lower_module_items("main_module", &prepared_items) {
+            match lust::mir::lowering::AstLowering::lower_module_items_with_native_queues(
+                "main_module",
+                &prepared_items,
+            ) {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("MIR lowering error: {}", e);

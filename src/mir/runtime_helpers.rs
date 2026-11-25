@@ -3289,6 +3289,40 @@ pub extern "C" fn lust_mir_string_eq(a_handle: i64, b_handle: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_intern_static_bytes(ptr: *const u8, len: i64) -> i64 {
+    if len <= 0 {
+        return EMPTY_STR_HANDLE;
+    }
+    if ptr.is_null() {
+        return 0;
+    }
+    let Ok(byte_len) = usize::try_from(len) else {
+        with_current_mir_context(|ctx| {
+            ctx.last_status
+                .store(crate::effect_abi::LUST_STATUS_ERR_GENERIC as i64, Ordering::SeqCst);
+        });
+        return 0;
+    };
+    if byte_len > isize::MAX as usize {
+        with_current_mir_context(|ctx| {
+            ctx.last_status
+                .store(crate::effect_abi::LUST_STATUS_ERR_GENERIC as i64, Ordering::SeqCst);
+        });
+        return 0;
+    }
+    // Safety: caller guarantees `ptr` points to `byte_len` readable bytes (`byte_len <= isize::MAX`).
+    let slice = unsafe { core::slice::from_raw_parts(ptr, byte_len) };
+    let Ok(s) = core::str::from_utf8(slice) else {
+        with_current_mir_context(|ctx| {
+            ctx.last_status
+                .store(crate::effect_abi::LUST_STATUS_ERR_GENERIC as i64, Ordering::SeqCst);
+        });
+        return 0;
+    };
+    with_current_mir_context(|ctx| ctx.intern_string(s))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_string_len(handle: i64) -> i64 {
     if handle == EMPTY_STR_HANDLE {
         return 0;
@@ -3314,6 +3348,7 @@ fn register_string_results(ctx: &MirContext, values: Vec<Value>) -> i64 {
 
 // Native helper calls use the active MIR context guard. The leading context
 // operand is reserved by the call ABI and is never dereferenced.
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_string_sub(_vm_ctx: i64, handle: i64, start: i64, end: i64) -> i64 {
     enum SubPiece {
         Static(i64, usize),
@@ -3375,6 +3410,7 @@ pub extern "C" fn lust_mir_string_sub(_vm_ctx: i64, handle: i64, start: i64, end
 }
 
 /// Returns an array of byte values. An empty range returns a single nil.
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_string_byte(_vm_ctx: i64, handle: i64, start: i64, end: i64) -> i64 {
     with_current_mir_context(|ctx| {
         let Some(values) = ctx.with_str_handle(handle, |text| string_byte_values(text, start, Some(end))) else {
@@ -3386,6 +3422,7 @@ pub extern "C" fn lust_mir_string_byte(_vm_ctx: i64, handle: i64, start: i64, en
 }
 
 /// Scalar byte lookup for a call that requires an integer result.
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_string_byte_at(_vm_ctx: i64, handle: i64, index: i64) -> i64 {
     with_current_mir_context(|ctx| {
         let res = ctx.with_str_handle(handle, |text| {
@@ -3406,6 +3443,7 @@ pub extern "C" fn lust_mir_string_byte_at(_vm_ctx: i64, handle: i64, index: i64)
     })
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_string_gsub(
     _vm_ctx: i64,
     handle: i64,
@@ -3429,6 +3467,7 @@ pub extern "C" fn lust_mir_string_gsub(
 }
 
 /// Returns an array of 1-based endpoints and captures, or a single nil on no match.
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_string_find(
     _vm_ctx: i64,
     handle: i64,
@@ -3450,6 +3489,7 @@ pub extern "C" fn lust_mir_string_find(
     })
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_string_split(_vm_ctx: i64, handle: i64, separator: i64) -> i64 {
     with_current_mir_context(|ctx| {
         let Some(values) = ctx.with_str_pair(handle, separator, string_split_values) else {
@@ -3636,6 +3676,7 @@ fn with_typed_map<R>(
 }
 
 /// Returns MIR status. Operand tags are 0 = int, 1 = bool, 2 = float bits, 3 = handle.
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_map_set_typed(
     _vm_ctx: i64,
     map_handle: i64,
@@ -3717,6 +3758,7 @@ pub extern "C" fn lust_mir_map_set_typed(
     }
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_map_get_typed(
     _vm_ctx: i64,
     map_handle: i64,
@@ -3748,6 +3790,7 @@ pub extern "C" fn lust_mir_map_get_typed(
     .unwrap_or(0)
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_map_has_typed(
     _vm_ctx: i64,
     map_handle: i64,
@@ -3793,6 +3836,7 @@ pub extern "C" fn lust_mir_map_has_typed(
     .unwrap_or(0)
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_map_get_int_unwrap(
     _vm_ctx: i64,
     map_handle: i64,
@@ -3878,6 +3922,7 @@ pub extern "C" fn lust_mir_alloc_enum(tag: i64, payload_handle: i64) -> i64 {
 }
 
 /// Allocates a numeric-tag enum with up to two raw integer payloads.
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_alloc_enum2(
     _vm_ctx: i64,
     tag: i64,
@@ -3929,6 +3974,7 @@ pub extern "C" fn lust_mir_enum_payload(enum_handle: i64) -> i64 {
 }
 
 /// Reads a zero-based payload field, unboxing primitive values.
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_enum_payload_at(_vm_ctx: i64, enum_handle: i64, field_idx: i64) -> i64 {
     with_current_mir_context(|ctx| {
         let Some(Value::Enum(object)) = ctx.get_handle(enum_handle) else {
@@ -3949,6 +3995,7 @@ pub extern "C" fn lust_mir_enum_payload_at(_vm_ctx: i64, enum_handle: i64, field
 
 /// Creates a bounded FIFO integer queue in the active thread-confined `MirContext`.
 /// Returns a positive 1-based queue handle, or `0` on invalid capacity / OOM.
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_queue_new(cap: i64) -> i64 {
     #[cfg(feature = "std")]
     {
@@ -3994,6 +4041,7 @@ pub extern "C" fn lust_mir_queue_new(cap: i64) -> i64 {
 
 /// Non-blocking offer into a bounded FIFO integer queue.
 /// Returns `1` if enqueued, `0` if full (or on invalid handle, which sets OOB status).
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_queue_offer_int(q_handle: i64, val: i64) -> i64 {
     #[cfg(feature = "std")]
     {
@@ -4024,6 +4072,7 @@ pub extern "C" fn lust_mir_queue_offer_int(q_handle: i64, val: i64) -> i64 {
 
 /// Non-blocking take from a bounded FIFO integer queue.
 /// Returns the dequeued integer, or sets `MIR_STATUS_ERR_OUT_OF_BOUNDS` and returns `0` if empty/invalid.
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_queue_take_int(q_handle: i64) -> i64 {
     #[cfg(feature = "std")]
     {
@@ -4055,6 +4104,7 @@ pub extern "C" fn lust_mir_queue_take_int(q_handle: i64) -> i64 {
 }
 
 /// Returns `1` iff `handle` references a `Value::Int` or `LuaValue::Int` in the active `MirContext`.
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_unknown_is_int(handle: i64) -> i64 {
     #[cfg(feature = "std")]
     {
@@ -4094,6 +4144,7 @@ pub extern "C" fn lust_mir_unknown_is_int(handle: i64) -> i64 {
 
 /// Unwraps the integer payload from a `Value::Int` or `LuaValue::Int` handle in the active `MirContext`.
 /// Sets `MIR_STATUS_ERR_OUT_OF_BOUNDS` and returns `0` if `handle` does not hold an integer.
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_unknown_unwrap_int(handle: i64) -> i64 {
     #[cfg(feature = "std")]
     {

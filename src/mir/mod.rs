@@ -31,6 +31,7 @@ pub use runtime_helpers::*;
 pub use zig_backend::*;
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use super::*;
     use crate::ast::Span;
@@ -728,8 +729,10 @@ mod tests {
     #[test]
     fn test_unsupported_ast_binop_returns_error_in_lowering() {
         use crate::ast::BinaryOp;
-        let res = mir_binop_from_ast(BinaryOp::Concat);
-        assert!(matches!(res, Err(MirLowerError::UnsupportedBinaryOp(BinaryOp::Concat))));
+        // Concat is supported in MIR lowering (MirBinaryOp::Concat), while Range remains unsupported.
+        assert_eq!(mir_binop_from_ast(BinaryOp::Concat).unwrap(), MirBinaryOp::Concat);
+        let res = mir_binop_from_ast(BinaryOp::Range);
+        assert!(matches!(res, Err(MirLowerError::UnsupportedBinaryOp(BinaryOp::Range))));
     }
 
     #[test]
@@ -1262,9 +1265,32 @@ mod tests {
         let zig_res = MirToZigCompiler::generate_source(&func);
         assert!(matches!(zig_res, Err(MirZigBackendError::UnsupportedConstant(MirConstant::String(_)))));
 
+        // Cranelift backend supports MirConstant::String (via MIR context interning),
+        // while rejecting MirConstant::Unit as an unlowerable operand value.
         let mut jit = CraneliftJitCompiler::new().expect("JIT init");
-        let clif_res = jit.compile_function(&func);
-        assert!(matches!(clif_res, Err(MirCraneliftBackendError::UnsupportedConstant(MirConstant::String(_)))));
+        assert!(jit.compile_function(&func).is_ok());
+
+        let unit_sig = FunctionSignature {
+            name: "unsupported_unit_const".into(),
+            param_types: vec![MirType::Int],
+            return_type: MirType::Int,
+            is_public: true,
+            effects: None,
+        };
+        let mut unit_func = MirFunction::new(unit_sig, Span::dummy());
+        let unit_tmp = unit_func.add_local(Some("u".into()), MirType::Int, true, Span::dummy());
+        let unit_bb0 = &mut unit_func.blocks[0];
+        unit_bb0.statements.push(Statement::Assign(
+            Place::Local(unit_tmp),
+            Rvalue::Use(Operand::Constant(MirConstant::Unit)),
+            Span::dummy(),
+        ));
+        unit_bb0.terminator = Some(Terminator::Return(
+            Some(Operand::Constant(MirConstant::Int(0))),
+            Span::dummy(),
+        ));
+        let clif_res = jit.compile_function(&unit_func);
+        assert!(matches!(clif_res, Err(MirCraneliftBackendError::UnlowerableValue(_))));
     }
 
     #[test]
@@ -1368,7 +1394,6 @@ mod tests {
     #[test]
     #[cfg(feature = "cranelift")]
     fn test_mir_struct_and_tuple_field_access_and_mutation_parity() {
-        use crate::ast::ItemKind;
         use crate::bytecode::Value;
         use crate::intern::Interner;
         use crate::lexer::Lexer;
@@ -1378,6 +1403,11 @@ mod tests {
         use crate::vm::VM;
 
         let src = r#"
+            struct Point
+                x: int
+                y: int
+            end
+
             function struct_tuple_ops(n: int): int
                 local p = Point { x = 10, y = 20 }
                 local t = (5, 15)
@@ -1392,18 +1422,15 @@ mod tests {
         let mut parser = Parser::from_lexer(&mut lexer).expect("lexer");
         let items = parser.parse().expect("parse");
 
-        let mut mir_fn = None;
-        for item in items {
-            if let ItemKind::Function(func_def) = item.kind {
-                mir_fn = Some(AstLowering::lower_function(&func_def).expect("lower function"));
-                break;
-            }
-        }
-
-        let mir_fn = mir_fn.expect("Function parsed and lowered");
-        let mut module = MirModule::new("test_struct_tuple_mod".into());
-        module.add_function(mir_fn.clone());
+        let module = AstLowering::lower_module_items("test_struct_tuple_mod", &items)
+            .expect("lower module");
         assert!(MirVerifier::verify_module(&module).is_ok());
+        let mir_fn = module
+            .functions
+            .iter()
+            .find(|f| f.signature.name == "struct_tuple_ops")
+            .expect("Function parsed and lowered")
+            .clone();
 
         // p.x (15) + p.y (30) + t._0 (5) + t._1 (15) + n (7) = 72
         // 1. VM Bytecode Execution
@@ -1415,6 +1442,7 @@ mod tests {
 
         // 2. Cranelift JIT Execution
         let mut jit = CraneliftJitCompiler::new().expect("JIT initialization");
+        jit.register_struct_layouts(&module.struct_layouts);
         let code_ptr = jit.compile_function(&mir_fn).expect("JIT compile");
         let jit_func: extern "C" fn(i64) -> i64 = unsafe { core::mem::transmute(code_ptr) };
         let jit_res = jit_func(7);

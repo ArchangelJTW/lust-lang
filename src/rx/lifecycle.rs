@@ -147,6 +147,7 @@ pub struct SubscriptionControl<T: MeasurableItem + Send + 'static, E: Clone + Se
     pub coordinator: Arc<ScopeJoinCoordinator>,
     pub items_delivered: AtomicUsize,
     pub current_executing_thread: AtomicU64,
+    participant_id: Mutex<Option<super::scheduler::ParticipantId>>,
 }
 
 impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> SubscriptionControl<T, E> {
@@ -172,6 +173,19 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
             coordinator,
             items_delivered: AtomicUsize::new(0),
             current_executing_thread: AtomicU64::new(0),
+            participant_id: Mutex::new(None),
+        }
+    }
+
+    /// Attach a registered participant identifier to this subscription control.
+    pub fn attach_participant(&self, pid: super::scheduler::ParticipantId) {
+        *self.participant_id.lock().unwrap() = Some(pid);
+    }
+
+    /// Acknowledge participant exit with the coordinator once.
+    pub fn acknowledge_participant_exit(&self) {
+        if let Some(pid) = self.participant_id.lock().unwrap().take() {
+            self.coordinator.acknowledge_exit(self.scope_id, pid);
         }
     }
 
@@ -198,6 +212,7 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
 
         // Discard terminal handlers on cancellation per RFC §16.3
         drop(self.terminal_fn.lock().unwrap().take());
+        self.acknowledge_participant_exit();
     }
 
     /// Check if subscription is actively accepting new callbacks.
@@ -267,7 +282,10 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
 
         // Invoke outside of all mutexes!
         if let Some(terminal) = action {
+            self.acknowledge_participant_exit();
             (terminal.on_complete)();
+        } else {
+            self.acknowledge_participant_exit();
         }
     }
 
@@ -292,7 +310,10 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
 
         // Invoke outside of all mutexes!
         if let Some(terminal) = action {
+            self.acknowledge_participant_exit();
             (terminal.on_failure)(err);
+        } else {
+            self.acknowledge_participant_exit();
         }
     }
 
@@ -311,6 +332,9 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
                 *state = SubscriptionState::Joining;
             }
         }
+
+        // Acknowledge participant exit if not already acknowledged
+        self.acknowledge_participant_exit();
 
         // Wait for all registered producers, timers, and callbacks to acknowledge exit
         let quiescent = self.coordinator.close_and_wait_quiescent(self.scope_id, timeout);

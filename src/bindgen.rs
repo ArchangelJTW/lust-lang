@@ -73,6 +73,45 @@ use crate::typechecker::{FunctionSignature, TypeChecker};
 use crate::{LustConfig, LustError, Result};
 use hashbrown::{HashMap, HashSet};
 use std::fmt::Write as _;
+
+impl<A> crate::embed::FunctionArgs for (A,)
+where
+    A: crate::embed::IntoLustValue,
+{
+    fn into_values(self) -> Vec<crate::bytecode::Value> {
+        vec![self.0.into_value()]
+    }
+
+    fn write_args(self, dst: &mut [crate::bytecode::Value]) -> usize {
+        if !dst.is_empty() {
+            dst[0] = self.0.into_value();
+        }
+        1
+    }
+
+    fn validate_signature(function_name: &str, params: &[crate::ast::Type]) -> crate::Result<()> {
+        if params.len() != 1 {
+            return Err(crate::LustError::TypeError {
+                message: format!(
+                    "Function '{}' expects {} argument(s) but 1 were supplied",
+                    function_name,
+                    params.len()
+                ),
+            });
+        }
+        if !<A as crate::embed::IntoLustValue>::matches_lust_type(&params[0]) {
+            return Err(crate::LustError::TypeError {
+                message: format!(
+                    "Type mismatch for argument 1 of '{}': expected {}, got {}",
+                    function_name,
+                    params[0],
+                    <A as crate::embed::IntoLustValue>::type_description()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
 use std::path::{Path, PathBuf};
 
 const MAX_TYPED_BINDGEN_ARITY: usize = 12;
@@ -84,6 +123,7 @@ pub struct RustBindingsBuilder {
     bindings_name: String,
     runtime_crate_path: String,
     extern_registry: ExternRegistry,
+    vfs: Option<std::sync::Arc<dyn crate::vfs::VirtualFileSystem>>,
 }
 
 impl RustBindingsBuilder {
@@ -94,7 +134,14 @@ impl RustBindingsBuilder {
             bindings_name: "Bindings".to_string(),
             runtime_crate_path: "::lust".to_string(),
             extern_registry: ExternRegistry::new(),
+            vfs: None,
         }
+    }
+
+    /// Supply a virtual filesystem for resolving entry files and modules.
+    pub fn with_vfs(mut self, vfs: std::sync::Arc<dyn crate::vfs::VirtualFileSystem>) -> Self {
+        self.vfs = Some(vfs);
+        self
     }
 
     /// Set the generated facade type name (default: `Bindings`).
@@ -119,7 +166,11 @@ impl RustBindingsBuilder {
     /// Typecheck the Lust project and return generated Rust source plus the
     /// source/config files Cargo should watch when used from `build.rs`.
     pub fn generate(&self) -> Result<GeneratedRustBindings> {
-        let entry_file = std::fs::canonicalize(&self.entry_file).map_err(|err| {
+        let vfs = self
+            .vfs
+            .clone()
+            .unwrap_or_else(crate::vfs::current_vfs);
+        let entry_file = vfs.canonicalize(&self.entry_file).map_err(|err| {
             LustError::Unknown(format!(
                 "failed to resolve Lust entry '{}': {err}",
                 self.entry_file.display()
@@ -134,7 +185,8 @@ impl RustBindingsBuilder {
         let config = LustConfig::load_for_entry(&entry_file)
             .map_err(|err| LustError::Unknown(format!("failed to load Lust config: {err}")))?;
 
-        let mut loader = ModuleLoader::new(entry_file.parent().unwrap_or_else(|| Path::new(".")));
+        let mut loader = ModuleLoader::new(entry_file.parent().unwrap_or_else(|| Path::new(".")))
+            .with_vfs(vfs.clone());
         let program = loader.load_program_from_entry(entry_text)?;
 
         let mut imports = HashMap::new();
@@ -191,7 +243,7 @@ impl RustBindingsBuilder {
 
         let mut input_files = vec![entry_file.clone()];
         input_files.extend(program.modules.iter().map(|module| {
-            std::fs::canonicalize(&module.source_path)
+            vfs.canonicalize(&module.source_path)
                 .unwrap_or_else(|_| module.source_path.clone())
         }));
         // Watch the config path even if it doesn't exist yet, so adding one
@@ -228,13 +280,245 @@ impl GeneratedRustBindings {
     }
 
     pub fn write_to(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let vfs = crate::vfs::current_vfs();
         let path = path.as_ref();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent)?;
+            vfs.create_dir_all(parent)?;
         }
-        std::fs::write(path, &self.source)
+        vfs.write(path, self.source.as_bytes())
+    }
+}
+
+/// Generated `include!()`-ready Rust AOT module source and tracked input files (`NG-W13-1C`).
+#[derive(Clone, Debug)]
+pub struct GeneratedRustAot {
+    /// Complete, `include!()`-compatible Rust AOT module source (zero `unsafe`, panic-free).
+    pub source: String,
+    /// Entry, imported module, and config paths for `cargo:rerun-if-changed`.
+    pub input_files: Vec<PathBuf>,
+}
+
+impl GeneratedRustAot {
+    pub fn input_files(&self) -> &[PathBuf] {
+        &self.input_files
+    }
+
+    pub fn write_to(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let vfs = crate::vfs::current_vfs();
+        let path = path.as_ref();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            vfs.create_dir_all(parent)?;
+        }
+        vfs.write(path, self.source.as_bytes())
+    }
+}
+
+/// `build.rs` generator that compiles a `.lust` module into an `include!()`-ready Rust AOT
+/// module backed by `lust-aot-rt` without embedding the Lust VM at runtime (`NG-W13-1C`).
+///
+/// # Example (`build.rs`)
+/// ```ignore
+/// fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     lust::bindgen::RustAotBuilder::new("scripts/router.lust")
+///         .gas_metering(lust::codegen_zig::aot::GasMetering::LoopChunked)
+///         .emit_to_out_dir("router_aot.rs")?;
+///     Ok(())
+/// }
+/// ```
+///
+/// And in `src/lib.rs` or `src/main.rs`:
+/// ```ignore
+/// pub mod router_aot {
+///     include!(concat!(env!("OUT_DIR"), "/router_aot.rs"));
+/// }
+/// ```
+#[derive(Clone, Debug)]
+pub struct RustAotBuilder {
+    entry_file: PathBuf,
+    gas_metering: crate::codegen_zig::aot::GasMetering,
+    gas_limit: Option<u64>,
+    max_memory_bytes: Option<usize>,
+    pure_core: bool,
+    no_std: bool,
+    linked_crates: Vec<String>,
+    emit_cargo_rerun_directives: bool,
+}
+
+impl RustAotBuilder {
+    /// Create a new Rust AOT module builder for the given `.lust` entry file.
+    pub fn new(entry_file: impl Into<PathBuf>) -> Self {
+        Self {
+            entry_file: entry_file.into(),
+            gas_metering: crate::codegen_zig::aot::GasMetering::None,
+            gas_limit: None,
+            max_memory_bytes: None,
+            pure_core: false,
+            no_std: false,
+            linked_crates: Vec::new(),
+            emit_cargo_rerun_directives: true,
+        }
+    }
+
+    /// Configure gas metering mode (`None`, `LoopChunked`, or `Exact`).
+    pub fn gas_metering(mut self, mode: crate::codegen_zig::aot::GasMetering) -> Self {
+        self.gas_metering = mode;
+        self
+    }
+
+    /// Configure default gas limit for generated standalone entrypoints.
+    pub fn gas_limit(mut self, limit: u64) -> Self {
+        self.gas_limit = Some(limit);
+        if self.gas_metering == crate::codegen_zig::aot::GasMetering::None {
+            self.gas_metering = crate::codegen_zig::aot::GasMetering::Exact;
+        }
+        self
+    }
+
+    /// Configure maximum allocation budget in bytes for generated AOT allocators.
+    pub fn max_memory_bytes(mut self, bytes: usize) -> Self {
+        self.max_memory_bytes = Some(bytes);
+        self
+    }
+
+    /// Enable `PureCore` execution mode (disables ambient FFI in `AotCtx`).
+    pub fn pure_core(mut self, pure_core: bool) -> Self {
+        self.pure_core = pure_core;
+        self
+    }
+
+    /// Emit `#![no_std]`-compatible code (requires `lust-aot-rt` without `std`).
+    pub fn no_std(mut self, no_std: bool) -> Self {
+        self.no_std = no_std;
+        self
+    }
+
+    /// Register an external Rust crate name for direct Zero-FFI calls (`extern crate <name>;`).
+    pub fn link_crate(mut self, crate_name: impl Into<String>) -> Self {
+        let sanitized = crate_name.into().replace('-', "_");
+        if !sanitized.is_empty() && !self.linked_crates.contains(&sanitized) {
+            self.linked_crates.push(sanitized);
+        }
+        self
+    }
+
+    /// Control whether `emit_to_out_dir` prints `cargo:rerun-if-changed=...` lines to stdout.
+    pub fn cargo_rerun_if_changed(mut self, enabled: bool) -> Self {
+        self.emit_cargo_rerun_directives = enabled;
+        self
+    }
+
+    /// Load, typecheck, MIR-lower, and emit the `include!()`-ready Rust AOT module.
+    pub fn generate(&self) -> Result<GeneratedRustAot> {
+        let vfs = crate::vfs::current_vfs();
+        let entry_file = vfs.canonicalize(&self.entry_file).map_err(|err| {
+            LustError::Unknown(format!(
+                "failed to resolve Lust entry '{}': {err}",
+                self.entry_file.display()
+            ))
+        })?;
+        let entry_text = entry_file.to_str().ok_or_else(|| {
+            LustError::Unknown(format!(
+                "Lust entry path '{}' is not valid UTF-8",
+                entry_file.display()
+            ))
+        })?;
+        let config = LustConfig::load_for_entry(&entry_file)
+            .map_err(|err| LustError::Unknown(format!("failed to load Lust config: {err}")))?;
+
+        let mut loader = ModuleLoader::new(entry_file.parent().unwrap_or_else(|| Path::new(".")))
+            .with_vfs(vfs.clone());
+        let program = loader.load_program_from_entry(entry_text)?;
+
+        let mut imports = HashMap::new();
+        for module in &program.modules {
+            imports.insert(module.path.clone(), module.imports.clone());
+        }
+
+        let mut typechecker = TypeChecker::with_config(&config);
+        typechecker.set_imports_by_module(imports);
+        typechecker.check_program(&program.modules)?;
+
+        let mut all_items = Vec::new();
+        for module in &program.modules {
+            all_items.extend(module.items.clone());
+        }
+
+        let mir_module =
+            crate::codegen_zig::aot::compiler::prepare_and_lower_items_for_rust_aot(&all_items)?;
+
+        let compile_opts = crate::codegen_zig::aot::RustCompileOptions {
+            aot: crate::codegen_zig::aot::AotCompileOptions {
+                target_kind: crate::codegen_zig::aot::AotTargetKind::StaticLibrary,
+                max_memory_bytes: self.max_memory_bytes,
+                ..crate::codegen_zig::aot::AotCompileOptions::default()
+            },
+            gas_metering: self.gas_metering,
+            gas_limit: self.gas_limit,
+            pure_core: self.pure_core,
+            no_std: self.no_std,
+            cache_dir: None,
+        };
+
+        let source = crate::codegen_zig::aot::AotCompiler::emit_rust_include_module_from_items(
+            &mir_module,
+            &all_items,
+            &compile_opts,
+            &self.linked_crates,
+        )?;
+
+        let mut input_files = vec![entry_file.clone()];
+        input_files.extend(program.modules.iter().map(|module| {
+            vfs.canonicalize(&module.source_path)
+                .unwrap_or_else(|_| module.source_path.clone())
+        }));
+        input_files.push(
+            entry_file
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("lust-config.toml"),
+        );
+        input_files.sort();
+        input_files.dedup();
+
+        Ok(GeneratedRustAot {
+            source,
+            input_files,
+        })
+    }
+
+    /// Generate the Rust AOT module and write it to `out_path`.
+    pub fn write_to(&self, out_path: impl AsRef<Path>) -> Result<GeneratedRustAot> {
+        let generated = self.generate()?;
+        generated.write_to(out_path.as_ref()).map_err(|err| {
+            LustError::Unknown(format!(
+                "failed to write Rust AOT module '{}': {err}",
+                out_path.as_ref().display()
+            ))
+        })?;
+        Ok(generated)
+    }
+
+    /// Compile the `.lust` file and write the `include!()`-ready `.rs` module into Cargo's
+    /// `OUT_DIR` at `PathBuf::from(env!("OUT_DIR")).join(out_file)`.
+    pub fn emit_to_out_dir(&self, out_file: impl AsRef<Path>) -> Result<PathBuf> {
+        let out_dir = std::env::var_os("OUT_DIR").ok_or_else(|| {
+            LustError::Unknown(
+                "OUT_DIR environment variable is not set; call RustAotBuilder::emit_to_out_dir from build.rs or use write_to"
+                    .to_string(),
+            )
+        })?;
+        let out_path = PathBuf::from(out_dir).join(out_file.as_ref());
+        let generated = self.write_to(&out_path)?;
+        if self.emit_cargo_rerun_directives {
+            for input in generated.input_files() {
+                println!("cargo:rerun-if-changed={}", input.display());
+            }
+        }
+        Ok(out_path)
     }
 }
 
@@ -501,7 +785,9 @@ fn collect_nominal_names_in_items(
             | ItemKind::Use { .. }
             | ItemKind::Service(_)
             | ItemKind::Test(_)
-            | ItemKind::Suite(_) => {}
+            | ItemKind::Suite(_)
+            | ItemKind::Schema(_)
+            | ItemKind::TypeAlias { .. } => {}
         }
     }
 }
@@ -750,7 +1036,9 @@ fn collect_items(
             | ItemKind::Use { .. }
             | ItemKind::Service(_)
             | ItemKind::Test(_)
-            | ItemKind::Suite(_) => {}
+            | ItemKind::Suite(_)
+            | ItemKind::Schema(_)
+            | ItemKind::TypeAlias { .. } => {}
         }
     }
 
@@ -808,7 +1096,7 @@ fn generated_struct_accessor_names(def: &StructDef) -> Result<HashSet<String>> {
             rust_identifier(&field.name, "generated struct field accessor")?;
         let (_, collision_key) = if accessors.contains(&collision_key) {
             rust_identifier(
-                &format!("get_{}", collision_key.trim_start_matches("r#")),
+                &format!("get_{}", collision_key.trim_prefix("r#")),
                 "generated struct field accessor",
             )?
         } else {
@@ -1159,7 +1447,7 @@ fn generate_source(
     let (bindings_name, _) = rust_identifier(bindings_name, "bindings type name")?;
     validate_rust_path(runtime_crate_path)?;
     let mut source = String::new();
-    let runtime = runtime_crate_path.trim_end_matches("::");
+    let runtime = runtime_crate_path.trim_suffix("::");
     writeln!(source, "// @generated by `lust bindgen`; do not edit.").unwrap();
     writeln!(
         source,
@@ -1208,7 +1496,7 @@ fn generate_source(
     writeln!(
         source,
         "    pub fn from_program(program: &'a mut {}::EmbeddedProgram) -> Self {{",
-        runtime_crate_path.trim_end_matches("::")
+        runtime_crate_path.trim_suffix("::")
     )
     .unwrap();
     writeln!(
@@ -1270,7 +1558,7 @@ fn generate_source(
             .collect::<Vec<_>>();
         let args = match call_args.as_slice() {
             [] => "()".to_string(),
-            [arg] => arg.clone(),
+            [arg] => format!("({arg},)"),
             many => format!("({})", many.join(", ")),
         };
 
@@ -1467,7 +1755,7 @@ fn emit_bound_method(
     }));
     let args = match call_args.as_slice() {
         [] => "()".to_string(),
-        [arg] => arg.clone(),
+        [arg] => format!("({arg},)"),
         many => format!("({})", many.join(", ")),
     };
     writeln!(
@@ -1614,7 +1902,7 @@ fn emit_struct_wrapper(
             rust_identifier(&field.name, "generated struct field accessor")?;
         let (accessor, collision_key) = if accessors.contains(&collision_key) {
             rust_identifier(
-                &format!("get_{}", collision_key.trim_start_matches("r#")),
+                &format!("get_{}", collision_key.trim_prefix("r#")),
                 "generated struct field accessor",
             )?
         } else {
@@ -2621,6 +2909,7 @@ fn bindgen_error(message: impl Into<String>) -> LustError {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use super::*;
     use std::fs;
@@ -2729,7 +3018,7 @@ end
                 .contains("pub fn echo_name(&mut self, name: &str)")
         );
         assert!(generated.source.contains(
-            "__lust_call_typed(&self.__lust_context, \"main.echo_name\", name.to_string())"
+            "__lust_call_typed(&self.__lust_context, \"main.echo_name\", (name.to_string(),))"
         ));
         assert!(!generated.source.contains("internal_helper"));
         assert!(generated.source.contains("/// Adds two values."));
@@ -2806,7 +3095,7 @@ end
         assert!(
             generated
                 .source
-                .contains("__lust_call_typed(&context, \"main.Player:double_id\", self.clone())")
+                .contains("__lust_call_typed(&context, \"main.Player:double_id\", (self.clone(),))")
         );
         assert!(generated.source.contains(
             "pub fn from_id(bindings: &mut GameBindings<'a>, id: ::lust::LustInt) -> ::lust::Result<Player<'a>>"
@@ -2814,7 +3103,7 @@ end
         assert!(
             generated
                 .source
-                .contains("__lust_call_typed(&context, \"main.Player.from_id\", id)")
+                .contains("__lust_call_typed(&context, \"main.Player.from_id\", (id,))")
         );
         assert!(
             generated.source.contains(
@@ -2823,7 +3112,7 @@ end
         );
         assert!(
             generated.source.contains(
-                "__lust_call_typed(&context, \"main.Player:display_name\", self.clone())"
+                "__lust_call_typed(&context, \"main.Player:display_name\", (self.clone(),))"
             )
         );
         assert!(generated.source.contains(
@@ -2832,7 +3121,7 @@ end
         assert!(
             generated
                 .source
-                .contains("__lust_call_typed(&context, \"main.Level:ordinal\", self.clone())")
+                .contains("__lust_call_typed(&context, \"main.Level:ordinal\", (self.clone(),))")
         );
     }
 

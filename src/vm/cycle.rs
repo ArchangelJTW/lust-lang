@@ -69,7 +69,7 @@ impl Default for CycleCollector {
 }
 
 enum ContainerKind {
-    Array(Weak<RefCell<Vec<Value>>>),
+    Array(Weak<crate::bytecode::LustArray>),
     Map(Weak<RefCell<LustMap>>),
     Struct(Weak<StructObject>),
     Iterator(Weak<RefCell<IteratorState>>),
@@ -77,7 +77,7 @@ enum ContainerKind {
 
 #[derive(Clone)]
 enum NodeKind {
-    Array(Weak<RefCell<Vec<Value>>>),
+    Array(Weak<crate::bytecode::LustArray>),
     Map(Weak<RefCell<LustMap>>),
     Struct(Weak<StructObject>),
     Iterator(Weak<RefCell<IteratorState>>),
@@ -231,18 +231,23 @@ impl CycleCollector {
     /// the traversal stack).
     #[inline]
     pub(crate) fn is_leaf(value: &Value) -> bool {
-        matches!(
-            value,
+        match value {
             Value::Nil
-                | Value::Bool(_)
-                | Value::Int(_)
-                | Value::Float(_)
-                | Value::String(_)
-                | Value::Function(_)
-                | Value::NativeFunction(_)
-                | Value::WeakStruct(_)
-                | Value::Task(_)
-        ) || matches!(value, Value::Enum(object) if object.values.is_none())
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::String(_)
+            | Value::Function(_)
+            | Value::NativeFunction(_)
+            | Value::WeakStruct(_)
+            | Value::Task(_) => true,
+            Value::Enum(obj) => obj
+                .values
+                .as_ref()
+                .is_none_or(|vals| vals.iter().all(Value::is_plain)),
+            Value::Tuple(items) => items.iter().all(Value::is_plain),
+            _ => false,
+        }
     }
 
     fn discover_vm_roots(&mut self, vm: &VM) {
@@ -250,7 +255,7 @@ impl CycleCollector {
             self.discover_value(value, true);
         }
         for frame in &vm.call_stack {
-            self.discover_frame(vm, frame);
+            self.discover_active_frame(vm, frame);
         }
         if let Some(value) = &vm.pending_return_value {
             self.discover_value(value, true);
@@ -266,17 +271,27 @@ impl CycleCollector {
         }
     }
 
-    fn discover_frame(&mut self, vm: &VM, frame: &CallFrame) {
-        // Only the registers the function uses can hold anything; the rest
-        // of the fixed-size frame is Nil.
-        let used = vm
-            .functions
-            .get(frame.function_idx)
-            .map(|f| f.register_count as usize)
-            .unwrap_or(frame.registers.len())
-            .min(frame.registers.len());
-        self.work += used + frame.upvalues.len();
-        for value in &frame.registers[..used] {
+    fn discover_active_frame(&mut self, vm: &VM, frame: &CallFrame) {
+        let start = frame.base_reg;
+        let end = (start + frame.reg_count as usize).min(vm.vm_registers.len());
+        let regs = if start < end {
+            &vm.vm_registers[start..end]
+        } else {
+            &[]
+        };
+        self.work += regs.len() + frame.upvalues.len();
+        for value in regs {
+            self.discover_value(value, true);
+        }
+        for value in &frame.upvalues {
+            self.discover_value(value, true);
+        }
+    }
+
+    fn discover_detached_frame(&mut self, frame: &CallFrame) {
+        let regs = frame.saved_registers.as_deref().map(Vec::as_slice).unwrap_or(&[]);
+        self.work += regs.len() + frame.upvalues.len();
+        for value in regs {
             self.discover_value(value, true);
         }
         for value in &frame.upvalues {
@@ -286,18 +301,21 @@ impl CycleCollector {
 
     fn discover_task_signal(&mut self, signal: &TaskSignal) {
         match signal {
-            TaskSignal::Yield { value, .. } | TaskSignal::Stop { value } => {
+            TaskSignal::Yield { value, .. }
+            | TaskSignal::YieldTimer { value, .. }
+            | TaskSignal::Stop { value } => {
                 self.discover_value(value, true)
             }
+            TaskSignal::QuantumExhausted => {}
         }
     }
 
-    fn discover_task(&mut self, vm: &VM, task: &TaskInstance) {
+    fn discover_task(&mut self, _vm: &VM, task: &TaskInstance) {
         for frame in &task.call_stack {
-            self.discover_frame(vm, frame);
+            self.discover_detached_frame(frame);
         }
         if let Some(frame) = task.initial_frame() {
-            self.discover_frame(vm, frame);
+            self.discover_detached_frame(frame);
         }
         if let Some(value) = &task.pending_return_value {
             self.discover_value(value, true);
@@ -768,7 +786,7 @@ impl CycleCollector {
         nodes.get_mut(&child).unwrap().internal_incoming += 1;
     }
 
-    fn register_array(&mut self, rc: &Rc<RefCell<Vec<Value>>>) -> bool {
+    fn register_array(&mut self, rc: &Rc<crate::bytecode::LustArray>) -> bool {
         self.register_container((NODE_ARRAY, Rc::as_ptr(rc) as usize), || {
             ContainerKind::Array(Rc::downgrade(rc))
         })
@@ -933,7 +951,7 @@ mod tests {
     #[test]
     fn repeated_registration_reuses_the_weak_handle() {
         let mut collector = CycleCollector::new();
-        let array = Rc::new(RefCell::new(Vec::new()));
+        let array = Rc::new(crate::bytecode::LustArray::new(Vec::new()));
         let key = (NODE_ARRAY, Rc::as_ptr(&array) as usize);
         assert!(collector.register_array(&array));
         assert_eq!(Rc::weak_count(&array), 1);

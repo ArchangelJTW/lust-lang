@@ -131,6 +131,9 @@ pub fn field_pure(functions: &[Function], idx: usize) -> bool {
             .enumerate()
             .all(|(ip, instruction)| match instruction {
                 Instruction::SetField(..)
+                | Instruction::SetFieldSlot(..)
+                | Instruction::GetFieldAddSetInt(..)
+                | Instruction::MapSet(..)
                 | Instruction::CallMethod(..)
                 | Instruction::Closure(..)
                 | Instruction::StoreUpvalue(..) => false,
@@ -436,7 +439,9 @@ fn jump_targets(instructions: &[Instruction]) -> Option<HashSet<usize>> {
         let offset = match instruction {
             Instruction::Jump(offset)
             | Instruction::JumpIf(_, offset)
-            | Instruction::JumpIfNot(_, offset) => *offset,
+            | Instruction::JumpIfNot(_, offset)
+            | Instruction::BranchLtInt(_, _, offset)
+            | Instruction::BranchLeInt(_, _, offset) => *offset,
             _ => continue,
         };
         let target = jump_target(ip, offset)?;
@@ -1184,9 +1189,63 @@ impl<'a> Translator<'a> {
                     is_weak,
                 });
             }
+            Instruction::GetFieldSlot(dest, object, slot_idx) => {
+                let layout = self.guarded_layout(object)?;
+                let index = slot_idx as usize;
+                let field_name = (**layout.field_names().get(index)?).clone();
+                let kind = layout.field_type(index).kind.clone();
+                let is_weak = layout.is_weak(index);
+                let value_type = scalar_kind(&kind);
+                if value_type.is_none() && !is_weak && self.may_borrow(dest, object) {
+                    self.ops.push(TraceOp::BorrowField {
+                        dest,
+                        object,
+                        field_index: index,
+                    });
+                    self.take_borrow(dest);
+                    self.note_type(dest, &kind);
+                    return Some(());
+                }
+                self.ops.push(TraceOp::GetField {
+                    dest,
+                    object,
+                    field_name,
+                    field_index: Some(index),
+                    value_type,
+                    is_weak,
+                });
+                self.write_typed(dest, &kind);
+            }
+            Instruction::SetFieldSlot(object, slot_idx, value) => {
+                let layout = self.guarded_layout(object)?;
+                let index = slot_idx as usize;
+                let field_name = (**layout.field_names().get(index)?).clone();
+                let value_type = self.env.scalars.get(&value).copied();
+                let is_weak = layout.is_weak(index);
+                self.ops.push(TraceOp::SetField {
+                    object,
+                    field_name,
+                    value,
+                    field_index: Some(index),
+                    value_type,
+                    is_weak,
+                });
+            }
             Instruction::ArrayLen(dest, array) => {
                 self.ops.push(TraceOp::ArrayLen { dest, array });
                 self.write(dest, Some(ValueType::Int));
+            }
+            Instruction::ArrayPush(..)
+            | Instruction::MapGet(..)
+            | Instruction::MapSet(..)
+            | Instruction::MapGetUnwrap(..) => {
+                return None;
+            }
+            Instruction::ArrayGetUnwrap(dest, array, index) => {
+                self.guard(index, ValueType::Int);
+                self.ops.push(TraceOp::GetIndex { dest, array, index });
+                let element = self.env.elements.get(&array).copied();
+                self.write(dest, element);
             }
             Instruction::SetIndex(array, index, value) => {
                 self.guard(index, ValueType::Int);
@@ -2056,6 +2115,8 @@ mod compiled_semantics_tests {
             assert_eq!(result.as_int(), Some(1));
             assert_eq!(Rc::strong_count(rc), before);
         }
+        // Legacy Dynasm counter assertion: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
         assert!(program.jit_stats().functions_compiled >= 1);
         assert_eq!(value.array_len(), Some(1));
     }
@@ -2123,6 +2184,8 @@ mod compiled_semantics_tests {
         );
     }
 
+    // Legacy Dynasm whole-function JIT test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(feature = "legacy-dynasm")]
     #[test]
     fn b05_recursion_compiles_and_runs() {
         let mut program = program(
@@ -2149,6 +2212,8 @@ mod compiled_semantics_tests {
         );
     }
 
+    // Legacy Dynasm whole-function JIT test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(feature = "legacy-dynasm")]
     #[test]
     fn whole_function_map_callable_in_place_mutation_regression() {
         use crate::bytecode::value::{native_fn, NativeCallResult};

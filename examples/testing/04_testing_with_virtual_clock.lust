@@ -1,0 +1,73 @@
+-- Lust Lang Testing Framework - Unit Testing Effects with Virtual Time (TestClock)
+-- Demonstrates zero-delay simulation of heavy retry policies, exponential backoff,
+-- multi-fiber wakeup queues, and effect timeout boundaries in < 1 ms wall-clock time.
+
+suite "Unit Testing with Virtual Clock (TestClock) Suite" do
+    test "exponential backoff simulation without sleeping" do
+        local clock = test.clock_new()
+        assert_eq(test.clock_now_ms(clock), 0)
+
+        local policy = test.schedule_exponential(100, 2.0, 10000)
+        local state = 0
+        local attempts = 0
+        local auth_token = ""
+
+        for i = 1, 10 do
+            attempts = attempts + 1
+            if attempts < 4 then
+                -- Transient failure, advance virtual clock by backoff delay
+                local step = test.schedule_step(policy, state)
+                local delay_ms = step["delay_ms"]
+                test.clock_adjust(clock, delay_ms)
+                state = step["next_state"]
+            else
+                auth_token = "AUTH_OK_TX4"
+                break
+            end
+        end
+
+        assert_eq(attempts, 4)
+        assert_eq(auth_token, "AUTH_OK_TX4")
+        assert_eq(test.clock_now_ms(clock), 700)
+    end
+
+    test "long-horizon multi-fiber timers and priority wakeup queue" do
+        local long_clock = test.clock_new()
+
+        test.clock_schedule(long_clock, 101, 10000)   -- Fiber 101 @ 10s
+        test.clock_schedule(long_clock, 102, 30000)   -- Fiber 102 @ 30s
+        test.clock_schedule(long_clock, 103, 60000)   -- Fiber 103 @ 60s
+        test.clock_schedule(long_clock, 104, 120000)  -- Fiber 104 @ 120s
+
+        assert_eq(test.clock_pending_count(long_clock), 4)
+
+        -- Fast-forward virtual clock to 25s
+        local awakened_1 = test.clock_adjust(long_clock, 25000)
+        assert_eq(awakened_1, [101])
+        assert_eq(test.clock_pending_count(long_clock), 3)
+
+        -- Fast-forward virtual clock to 120s (+95s)
+        local awakened_rest = test.clock_adjust(long_clock, 95000)
+        assert_eq(awakened_rest, [102, 103, 104])
+        assert_eq(test.clock_pending_count(long_clock), 0)
+    end
+
+    test "effect timeout boundaries and interrupted assertion" do
+        local timeout_clock = test.clock_new()
+        local fiber_id = 999
+        local timeout_ms = 5000
+        test.clock_schedule(timeout_clock, fiber_id, timeout_ms)
+
+        -- Advance to 4,999 ms: 1 ms before timeout boundary
+        local prematurely_awakened = test.clock_adjust(timeout_clock, 4999)
+        assert_eq(prematurely_awakened, [])
+
+        -- Advance 1 ms: exactly hitting 5,000 ms boundary
+        local timeout_awakened = test.clock_adjust(timeout_clock, 1)
+        assert_eq(timeout_awakened, [fiber_id])
+
+        -- Emulate delivered timeout exit
+        local timeout_signal = "Timeout"
+        assert_interrupted(timeout_signal)
+    end
+end

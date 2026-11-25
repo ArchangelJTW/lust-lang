@@ -1,4 +1,5 @@
 #![cfg(feature = "std")]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use lust::{
     ast::{ItemKind, TestModifier},

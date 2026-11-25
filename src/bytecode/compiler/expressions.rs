@@ -1,32 +1,460 @@
 use super::*;
 use crate::ast::StructLiteralField;
 impl Compiler {
+    pub(super) fn is_unshadowed_array_module(&self, name: &str) -> bool {
+        name == "array" && self.is_unshadowed_std_module(name)
+    }
+
+    fn is_unshadowed_std_module(&self, name: &str) -> bool {
+        if self.resolve_local(name).is_ok()
+            || self.lookup_effect_thunk(name).is_some()
+            || self.is_module_level_identifier(name)
+        {
+            return false;
+        }
+        if self.function_table.contains_key(name) || self.extern_value_aliases.contains_key(name) {
+            return false;
+        }
+        let module_imports = self
+            .current_module
+            .as_ref()
+            .or(self.entry_module.as_ref())
+            .and_then(|module| self.imports_by_module.get(module));
+        if let Some(imports) = module_imports {
+            if imports.function_aliases.contains_key(name) {
+                return false;
+            }
+            if let Some(target) = imports.module_aliases.get(name) {
+                return target == name || target.strip_prefix("std.") == Some(name);
+            }
+        }
+        self.is_stdlib_symbol(name)
+    }
+
+    pub(super) fn builtin_map_args<'a>(
+        &self,
+        expr: &'a Expr,
+        operation: &str,
+    ) -> Option<&'a [Expr]> {
+        let ExprKind::Call {
+            callee,
+            args,
+            type_args: None,
+        } = &expr.kind
+        else {
+            return None;
+        };
+        match &callee.kind {
+            ExprKind::FieldAccess { object, field }
+                if field == operation
+                    && args.len() == if operation == "set" { 3 } else { 2 }
+                    && matches!(&object.kind, ExprKind::Identifier(name)
+                        if name == "map" && self.is_unshadowed_std_module(name)) =>
+            {
+                Some(args)
+            }
+            _ => None,
+        }
+    }
+
+    fn map_operand_registers(&mut self, args: &[Expr]) -> Result<(Register, Register, Register)> {
+        // Keep the ordinary call's left-to-right argument snapshots whenever an
+        // expression could write a register used by an earlier argument.
+        if args
+            .iter()
+            .all(|arg| matches!(arg.kind, ExprKind::Identifier(_) | ExprKind::Literal(_)))
+        {
+            let map = self.compile_expr(&args[0])?;
+            let key = self.compile_expr(&args[1])?;
+            let value = if args.len() == 3 {
+                self.compile_expr(&args[2])?
+            } else {
+                0
+            };
+            Ok((map, key, value))
+        } else {
+            let refs: Vec<_> = args.iter().collect();
+            let first = self.place_exprs_consecutive(&refs)?;
+            Ok((
+                first,
+                first + 1,
+                if args.len() == 3 { first + 2 } else { 0 },
+            ))
+        }
+    }
+
+    fn compile_map_get(&mut self, args: &[Expr], unwrap: bool) -> Result<Register> {
+        let saved_register = self.next_register;
+        let (map, key, _) = self.map_operand_registers(args)?;
+        self.next_register = saved_register;
+        let dest = self.allocate_register();
+        let inst = if unwrap {
+            Instruction::MapGetUnwrap(dest, map, key)
+        } else {
+            Instruction::MapGet(dest, map, key)
+        };
+        self.emit(inst, 0);
+        Ok(dest)
+    }
+
+    pub(super) fn try_compile_map_set(&mut self, expr: &Expr) -> Result<bool> {
+        let Some(args) = self.builtin_map_args(expr, "set") else {
+            return Ok(false);
+        };
+        let saved_register = self.next_register;
+        let (map, key, value) = self.map_operand_registers(args)?;
+        self.emit(Instruction::MapSet(map, key, value), expr.span.start_line);
+        self.next_register = saved_register;
+        Ok(true)
+    }
+
+    pub(super) fn try_compile_array_void_call(&mut self, expr: &Expr) -> Result<bool> {
+        let mut inner = expr;
+        while let ExprKind::Paren(e) = &inner.kind {
+            inner = e;
+        }
+        let ExprKind::Call {
+            callee,
+            args,
+            type_args,
+        } = &inner.kind
+        else {
+            return Ok(false);
+        };
+        if type_args.is_some() {
+            return Ok(false);
+        }
+        let ExprKind::FieldAccess { object, field } = &callee.kind else {
+            return Ok(false);
+        };
+        let ExprKind::Identifier(mod_name) = &object.kind else {
+            return Ok(false);
+        };
+        if !self.is_unshadowed_array_module(mod_name) {
+            return Ok(false);
+        }
+        self.current_line = inner.span.start_line;
+        match (field.as_str(), args.len()) {
+            ("push", 2) => {
+                let arr_reg = self.compile_expr(&args[0])?;
+                let saved_freereg = self.next_register;
+                let val_reg = self.compile_expr(&args[1])?;
+                if self.next_register < saved_freereg {
+                    self.next_register = saved_freereg;
+                }
+                self.emit(Instruction::ArrayPush(arr_reg, val_reg), 0);
+                self.free_register(val_reg);
+                self.free_register(arr_reg);
+                Ok(true)
+            }
+            ("set", 3) => {
+                let arr_reg = self.compile_expr(&args[0])?;
+                let saved_after_arr = self.next_register;
+                let idx_reg = self.compile_expr(&args[1])?;
+                if self.next_register < saved_after_arr {
+                    self.next_register = saved_after_arr;
+                }
+                let saved_after_idx = self.next_register;
+                let val_reg = self.compile_expr(&args[2])?;
+                if self.next_register < saved_after_idx {
+                    self.next_register = saved_after_idx;
+                }
+                self.emit(Instruction::SetIndex(arr_reg, idx_reg, val_reg), 0);
+                self.free_register(val_reg);
+                self.free_register(idx_reg);
+                self.free_register(arr_reg);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub(super) fn const_int_literal(expr: &Expr) -> Option<LustInt> {
+        match &expr.kind {
+            ExprKind::Literal(Literal::Integer(value)) => Some(*value),
+            ExprKind::Paren(inner) => Self::const_int_literal(inner),
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => Self::const_int_literal(operand).and_then(|value| value.checked_neg()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn try_int_add_imm<'a>(
+        op: BinaryOp,
+        left: &'a Expr,
+        right: &'a Expr,
+    ) -> Option<(&'a Expr, i8)> {
+        match op {
+            BinaryOp::Add => {
+                if let Some(v) = Self::const_int_literal(right)
+                    && let Ok(imm) = i8::try_from(v)
+                {
+                    return Some((left, imm));
+                }
+                if let Some(v) = Self::const_int_literal(left)
+                    && let Ok(imm) = i8::try_from(v)
+                {
+                    return Some((right, imm));
+                }
+                None
+            }
+            BinaryOp::Sub => Self::const_int_literal(right)
+                .and_then(|v| v.checked_neg())
+                .and_then(|neg| i8::try_from(neg).ok())
+                .map(|imm| (left, imm)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn has_hoisted_consts_in_scope(&self) -> bool {
+        for scope in self.scopes.iter().rev() {
+            if scope.locals.contains_key("(hoist_active)") {
+                return true;
+            }
+            if scope.is_thunk_boundary {
+                break;
+            }
+        }
+        false
+    }
+
+    pub(super) fn hoisted_int_key(value: LustInt) -> String {
+        format!("(hoist_i:{value})")
+    }
+
+    pub(super) fn hoisted_float_key(bits: crate::number::FloatBits) -> String {
+        format!("(hoist_f:{bits:x})")
+    }
+
+    pub(super) fn hoisted_bool_key(value: bool) -> String {
+        format!("(hoist_b:{value})")
+    }
+
+    pub(super) fn hoisted_fn_key(func_idx: usize) -> String {
+        format!("(hoist_fn:{func_idx})")
+    }
+
+    pub(super) fn lookup_hoisted_int_const(&self, value: LustInt) -> Option<Register> {
+        if !self.has_hoisted_consts_in_scope() {
+            return None;
+        }
+        let key = Self::hoisted_int_key(value);
+        self.resolve_local(&key).ok()
+    }
+
+    pub(super) fn lookup_hoisted_float_const(
+        &self,
+        value: crate::number::LustFloat,
+    ) -> Option<Register> {
+        if !self.has_hoisted_consts_in_scope() {
+            return None;
+        }
+        let key = Self::hoisted_float_key(value.to_bits());
+        self.resolve_local(&key).ok()
+    }
+
+    pub(super) fn lookup_hoisted_bool_const(&self, value: bool) -> Option<Register> {
+        if !self.has_hoisted_consts_in_scope() {
+            return None;
+        }
+        let key = Self::hoisted_bool_key(value);
+        self.resolve_local(&key).ok()
+    }
+
+    pub(super) fn lookup_hoisted_fn_const(&self, func_idx: usize) -> Option<Register> {
+        if !self.has_hoisted_consts_in_scope() {
+            return None;
+        }
+        let key = Self::hoisted_fn_key(func_idx);
+        self.resolve_local(&key).ok()
+    }
+
+    pub(super) fn resolve_direct_fn_ident(&self, name: &str) -> Option<usize> {
+        if self.lookup_effect_thunk(name).is_some()
+            || self.resolve_local(name).is_ok()
+            || self.is_module_level_identifier(name)
+        {
+            return None;
+        }
+        let imported_fn = self
+            .current_module
+            .as_ref()
+            .and_then(|module| self.imports_by_module.get(module))
+            .and_then(|imports| imports.function_aliases.get(name).cloned());
+        let lookup_name = imported_fn.as_deref().unwrap_or(name);
+        self.function_table.get(lookup_name).copied()
+    }
+
+    pub(super) fn resolve_static_dispatch_fn(&self, callee: &Expr) -> Option<usize> {
+        let ExprKind::FieldAccess { object, field } = &callee.kind else {
+            return None;
+        };
+        let ExprKind::Identifier(type_name) = &object.kind else {
+            return None;
+        };
+        let is_module_alias = self
+            .current_module
+            .as_ref()
+            .and_then(|module| self.imports_by_module.get(module))
+            .is_some_and(|imports| {
+                imports.module_aliases.contains_key(type_name)
+                    && !self.is_module_level_identifier(type_name)
+            });
+        let is_local = self.resolve_local(type_name).is_ok();
+        if is_local || !(Self::looks_like_type_name(type_name) || is_module_alias) {
+            return None;
+        }
+        let mut alias_candidate = format!("{}.{}", type_name, field);
+        if let Some(module) = &self.current_module
+            && let Some(imports) = self.imports_by_module.get(module)
+            && let Some(real_mod) = imports.module_aliases.get(type_name)
+        {
+            alias_candidate = format!("{}.{}", real_mod, field);
+        }
+        if let Some(&func_idx) = self.function_table.get(&alias_candidate) {
+            return Some(func_idx);
+        }
+        let resolved_type = self.resolve_type_name(type_name);
+        let resolved_candidate = format!("{}.{}", resolved_type, field);
+        if resolved_candidate != alias_candidate
+            && let Some(&func_idx) = self.function_table.get(&resolved_candidate)
+        {
+            return Some(func_idx);
+        }
+        None
+    }
+
+    fn resolve_struct_type_from_typekind(&self, tk: &TypeKind) -> Option<String> {
+        match tk {
+            TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => {
+                Some(self.resolve_type_name(name))
+            }
+            TypeKind::Ref(inner) | TypeKind::MutRef(inner) => {
+                self.resolve_struct_type_from_typekind(&inner.kind)
+            }
+            _ => None,
+        }
+    }
+
+    fn lookup_struct_def_by_name(&self, struct_name: &str) -> Option<&crate::ast::StructDef> {
+        self.struct_defs.get(struct_name).or_else(|| {
+            struct_name
+                .rsplit('.')
+                .next()
+                .and_then(|simple| self.struct_defs.get(simple))
+        })
+    }
+
+    pub(super) fn resolve_expr_struct_type(&self, expr: &Expr) -> Option<String> {
+        let mut cur = expr;
+        while let ExprKind::Paren(inner) = &cur.kind {
+            cur = inner;
+        }
+        match &cur.kind {
+            ExprKind::Identifier(name) => {
+                let reg = self.resolve_local(name).ok()?;
+                if let Some(tk) = self.get_register_type(reg)
+                    && let Some(resolved) = self.resolve_struct_type_from_typekind(tk)
+                    && resolved != "Self"
+                    && self.lookup_struct_def_by_name(&resolved).is_some()
+                {
+                    return Some(resolved);
+                }
+                if name == "self"
+                    && let Some(func) = self.functions.get(self.current_function)
+                    && func.is_method
+                    && let Some((owner, _)) = func.name.rsplit_once(':')
+                {
+                    return Some(self.resolve_type_name(owner));
+                }
+                None
+            }
+            ExprKind::StructLiteral { name, .. } => Some(self.resolve_type_name(name)),
+            ExprKind::FieldAccess { object, field } => {
+                let owner_name = self.resolve_expr_struct_type(object)?;
+                let def = self.lookup_struct_def_by_name(&owner_name)?;
+                let field_def = def.fields.iter().find(|f| f.name == *field)?;
+                self.resolve_struct_type_from_typekind(&field_def.ty.kind)
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn resolve_struct_field_slot(
+        &self,
+        object: &Expr,
+        field: &str,
+    ) -> Option<(u8, TypeKind)> {
+        let struct_name = self.resolve_expr_struct_type(object)?;
+        if struct_name == "LuaTable" || struct_name.ends_with(".LuaTable") {
+            return None;
+        }
+        let def = self.lookup_struct_def_by_name(&struct_name)?;
+        let idx = def.fields.iter().position(|f| f.name == field)?;
+        let slot = u8::try_from(idx).ok()?;
+        Some((slot, def.fields[idx].ty.kind.clone()))
+    }
+
+    pub(super) fn is_side_effect_free_expr(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Literal(_) | ExprKind::Identifier(_) => true,
+            ExprKind::Paren(inner) | ExprKind::Unary { operand: inner, .. } => {
+                Self::is_side_effect_free_expr(inner)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::is_side_effect_free_expr(left) && Self::is_side_effect_free_expr(right)
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn compile_expr(&mut self, expr: &Expr) -> Result<Register> {
         self.current_line = expr.span.start_line;
         match &expr.kind {
-            ExprKind::Literal(lit) => {
-                let reg = self.allocate_register();
-                match lit {
-                    Literal::Integer(i) => {
-                        let const_idx = self.add_int_const(*i);
-                        self.emit(Instruction::LoadConst(reg, const_idx), 0);
+            ExprKind::Literal(lit) => match lit {
+                Literal::Integer(i) => {
+                    if let Some(hoisted_reg) = self.lookup_hoisted_int_const(*i) {
+                        return Ok(hoisted_reg);
                     }
-
-                    Literal::Float(f) => {
-                        let const_idx = self.add_constant(Value::Float(*f));
-                        self.emit(Instruction::LoadConst(reg, const_idx), 0);
-                    }
-
-                    Literal::String(s) => {
-                        let const_idx = self.add_constant(Value::string(s.clone()));
-                        self.emit(Instruction::LoadConst(reg, const_idx), 0);
-                    }
-
-                    Literal::Bool(b) => {
-                        self.emit(Instruction::LoadBool(reg, *b), 0);
-                    }
+                    let reg = self.allocate_register();
+                    let const_idx = self.add_int_const(*i);
+                    self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                    Ok(reg)
                 }
 
+                Literal::Float(f) => {
+                    if let Some(hoisted_reg) = self.lookup_hoisted_float_const(*f) {
+                        return Ok(hoisted_reg);
+                    }
+                    let reg = self.allocate_register();
+                    let const_idx = self.add_constant(Value::Float(*f));
+                    self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                    Ok(reg)
+                }
+
+                Literal::String(s) => {
+                    let reg = self.allocate_register();
+                    let const_idx = self.add_constant(Value::string(s.clone()));
+                    self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                    Ok(reg)
+                }
+
+                Literal::Bool(b) => {
+                    if let Some(hoisted_reg) = self.lookup_hoisted_bool_const(*b) {
+                        return Ok(hoisted_reg);
+                    }
+                    let reg = self.allocate_register();
+                    self.emit(Instruction::LoadBool(reg, *b), 0);
+                    Ok(reg)
+                }
+            },
+
+            ExprKind::RegexLiteral { pattern, .. } => {
+                let reg = self.allocate_register();
+                let const_idx = self.add_constant(Value::string(pattern.clone()));
+                self.emit(Instruction::LoadConst(reg, const_idx), 0);
                 Ok(reg)
             }
 
@@ -56,6 +484,9 @@ impl Compiler {
                 let lookup_name = imported_fn.clone().unwrap_or_else(|| name.clone());
 
                 if let Some(&func_idx) = self.function_table.get(&lookup_name) {
+                    if let Some(hoisted_reg) = self.lookup_hoisted_fn_const(func_idx) {
+                        return Ok(hoisted_reg);
+                    }
                     let reg = self.allocate_register();
                     let const_idx = self.add_constant(Value::Function(func_idx));
                     self.emit(Instruction::LoadConst(reg, const_idx), 0);
@@ -122,6 +553,18 @@ impl Compiler {
                 BinaryOp::And => self.compile_and_expr(expr.span, left, right),
                 BinaryOp::Or => self.compile_or_expr(left, right),
                 _ => {
+                    if !self.loop_contexts.is_empty()
+                        && self.numeric_type(left.span) == Some(NumericType::Int)
+                        && self.numeric_type(right.span) == Some(NumericType::Int)
+                        && let Some((operand_expr, imm)) = Self::try_int_add_imm(*op, left, right)
+                    {
+                        let operand_reg = self.compile_expr(operand_expr)?;
+                        let result_reg = self.allocate_register();
+                        self.emit(Instruction::AddIntImm(result_reg, operand_reg, imm), 0);
+                        self.free_register(operand_reg);
+                        return Ok(result_reg);
+                    }
+
                     let left_reg = self.compile_expr(left)?;
                     let saved_freereg = self.next_register;
                     let right_reg = self.compile_expr(right)?;
@@ -159,7 +602,19 @@ impl Compiler {
                 Ok(result_reg)
             }
 
-            ExprKind::Call { callee, args, .. } => {
+            ExprKind::Call {
+                callee,
+                args,
+                type_args,
+            } => {
+                if let Some(args) = self.builtin_map_args(expr, "get") {
+                    return self.compile_map_get(args, false);
+                }
+                if self.try_compile_map_set(expr)? {
+                    let result_reg = self.allocate_register();
+                    self.emit(Instruction::LoadNil(result_reg), 0);
+                    return Ok(result_reg);
+                }
                 if let ExprKind::Identifier(fn_name) = &callee.kind {
                     if fn_name == "Ok" || fn_name == "Err" {
                         let enum_name_idx = self.add_string_constant("Result");
@@ -206,6 +661,96 @@ impl Compiler {
                     }
                 }
 
+                if let ExprKind::FieldAccess { object, field } = &callee.kind {
+                    let is_static = if let ExprKind::Identifier(type_name) = &object.kind {
+                        let is_module_alias = self
+                            .current_module
+                            .as_ref()
+                            .and_then(|module| self.imports_by_module.get(module))
+                            .is_some_and(|imports| {
+                                imports.module_aliases.contains_key(type_name)
+                                    && !self.is_module_level_identifier(type_name)
+                            });
+                        let is_local = self.resolve_local(type_name).is_ok();
+                        !is_local && (Self::looks_like_type_name(type_name) || is_module_alias)
+                    } else {
+                        false
+                    };
+                    if !is_static
+                        && matches!(
+                            field.as_str(),
+                            "unwrap"
+                                | "try_unwrap"
+                                | "unwrap_or"
+                                | "is_some"
+                                | "is_none"
+                                | "is_ok"
+                                | "is_err"
+                        )
+                    {
+                        let method_call = Expr::new(
+                            ExprKind::MethodCall {
+                                receiver: object.clone(),
+                                method: field.clone(),
+                                type_args: type_args.clone(),
+                                args: args.clone(),
+                            },
+                            callee.span,
+                        );
+                        return self.compile_expr(&method_call);
+                    }
+
+                    if type_args.is_none()
+                        && let ExprKind::Identifier(mod_name) = &object.kind
+                        && self.is_unshadowed_array_module(mod_name)
+                    {
+                        match (field.as_str(), args.len()) {
+                            ("len", 1) => {
+                                let arr_reg = self.compile_expr(&args[0])?;
+                                let result_reg = self.allocate_register();
+                                self.emit(Instruction::ArrayLen(result_reg, arr_reg), 0);
+                                self.free_register(arr_reg);
+                                return Ok(result_reg);
+                            }
+                            ("push", 2) => {
+                                let arr_reg = self.compile_expr(&args[0])?;
+                                let saved_freereg = self.next_register;
+                                let val_reg = self.compile_expr(&args[1])?;
+                                if self.next_register < saved_freereg {
+                                    self.next_register = saved_freereg;
+                                }
+                                self.emit(Instruction::ArrayPush(arr_reg, val_reg), 0);
+                                self.free_register(val_reg);
+                                self.free_register(arr_reg);
+                                let result_reg = self.allocate_register();
+                                self.emit(Instruction::LoadNil(result_reg), 0);
+                                return Ok(result_reg);
+                            }
+                            ("set", 3) => {
+                                let arr_reg = self.compile_expr(&args[0])?;
+                                let saved_after_arr = self.next_register;
+                                let idx_reg = self.compile_expr(&args[1])?;
+                                if self.next_register < saved_after_arr {
+                                    self.next_register = saved_after_arr;
+                                }
+                                let saved_after_idx = self.next_register;
+                                let val_reg = self.compile_expr(&args[2])?;
+                                if self.next_register < saved_after_idx {
+                                    self.next_register = saved_after_idx;
+                                }
+                                self.emit(Instruction::SetIndex(arr_reg, idx_reg, val_reg), 0);
+                                self.free_register(val_reg);
+                                self.free_register(idx_reg);
+                                self.free_register(arr_reg);
+                                let result_reg = self.allocate_register();
+                                self.emit(Instruction::LoadNil(result_reg), 0);
+                                return Ok(result_reg);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 if let ExprKind::FieldAccess { object, field } = &callee.kind
                     && let ExprKind::Identifier(type_name) = &object.kind
                 {
@@ -235,14 +780,21 @@ impl Compiler {
                         let resolved_type = self.resolve_type_name(type_name);
                         let resolved_candidate = format!("{}.{}", resolved_type, field);
                         if resolved_candidate != alias_candidate {
-                            candidates.push(resolved_candidate);
+                            candidates.push(resolved_candidate.clone());
                         }
 
                         for static_method_name in &candidates {
                             if let Some(&func_idx) = self.function_table.get(static_method_name) {
-                                let func_reg = self.allocate_register();
-                                let const_idx = self.add_constant(Value::Function(func_idx));
-                                self.emit(Instruction::LoadConst(func_reg, const_idx), 0);
+                                let func_reg = if let Some(hoisted_reg) =
+                                    self.lookup_hoisted_fn_const(func_idx)
+                                {
+                                    hoisted_reg
+                                } else {
+                                    let reg = self.allocate_register();
+                                    let const_idx = self.add_constant(Value::Function(func_idx));
+                                    self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                                    reg
+                                };
                                 let first_arg_reg = if args.is_empty() {
                                     0
                                 } else {
@@ -264,9 +816,17 @@ impl Compiler {
                         }
 
                         for static_method_name in &candidates {
-                            if let Some(runtime_name) =
-                                self.extern_value_aliases.get(static_method_name).cloned()
-                            {
+                            let runtime_name = self
+                                .extern_value_aliases
+                                .get(static_method_name)
+                                .cloned()
+                                .or_else(|| {
+                                    (field == "decode"
+                                        && self.struct_defs.contains_key(&resolved_type)
+                                        && static_method_name == &resolved_candidate)
+                                        .then(|| resolved_candidate.clone())
+                                });
+                            if let Some(runtime_name) = runtime_name {
                                 let func_reg = self.allocate_register();
                                 let name_idx = self.add_string_constant(&runtime_name);
                                 self.emit(Instruction::LoadGlobal(func_reg, name_idx), 0);
@@ -357,6 +917,9 @@ impl Compiler {
                     while let ExprKind::Paren(inner) = &index_expr.kind {
                         index_expr = inner;
                     }
+                    if let Some(args) = self.builtin_map_args(index_expr, "get") {
+                        return self.compile_map_get(args, true);
+                    }
                     if let ExprKind::Index { object, index } = &index_expr.kind {
                         let obj_reg = self.compile_expr(object)?;
                         let idx_reg = self.compile_expr(index)?;
@@ -364,6 +927,30 @@ impl Compiler {
                         self.emit(Instruction::GetIndex(result_reg, obj_reg, idx_reg), 0);
                         self.free_register(obj_reg);
                         self.free_register(idx_reg);
+                        return Ok(result_reg);
+                    }
+                    if let ExprKind::Call {
+                        callee,
+                        args: call_args,
+                        type_args: call_type_args,
+                    } = &index_expr.kind
+                        && call_type_args.is_none()
+                        && call_args.len() == 2
+                        && let ExprKind::FieldAccess { object, field } = &callee.kind
+                        && field == "get"
+                        && let ExprKind::Identifier(mod_name) = &object.kind
+                        && self.is_unshadowed_array_module(mod_name)
+                    {
+                        let arr_reg = self.compile_expr(&call_args[0])?;
+                        let saved_freereg = self.next_register;
+                        let idx_reg = self.compile_expr(&call_args[1])?;
+                        if self.next_register < saved_freereg {
+                            self.next_register = saved_freereg;
+                        }
+                        let result_reg = self.allocate_register();
+                        self.emit(Instruction::ArrayGetUnwrap(result_reg, arr_reg, idx_reg), 0);
+                        self.free_register(idx_reg);
+                        self.free_register(arr_reg);
                         return Ok(result_reg);
                     }
                 }
@@ -446,10 +1033,15 @@ impl Compiler {
                     return Ok(result_reg);
                 }
 
+                let field_slot = self.resolve_struct_field_slot(object, field).map(|(s, _)| s);
                 let obj_reg = self.compile_expr(object)?;
-                let field_idx = self.add_string_constant(field);
                 let result_reg = self.allocate_register();
-                self.emit(Instruction::GetField(result_reg, obj_reg, field_idx), 0);
+                if let Some(slot_idx) = field_slot {
+                    self.emit(Instruction::GetFieldSlot(result_reg, obj_reg, slot_idx), 0);
+                } else {
+                    let field_idx = self.add_string_constant(field);
+                    self.emit(Instruction::GetField(result_reg, obj_reg, field_idx), 0);
+                }
                 self.free_register(obj_reg);
                 Ok(result_reg)
             }
@@ -615,6 +1207,7 @@ impl Compiler {
                 self.scopes.clear();
                 let mut lambda_scope = Scope {
                     locals: HashMap::new(),
+                    upvalues: HashMap::new(),
                     effect_thunks: HashMap::new(),
                     depth: 0,
                     cleanups: Vec::new(),
@@ -627,9 +1220,11 @@ impl Compiler {
 
                 self.scopes.push(lambda_scope);
                 let mut upvalue_map = HashMap::new();
+                let mut upvalue_indices = HashMap::new();
                 for (upvalue_idx, var_name) in captured_vars.iter().enumerate() {
                     let upvalue_reg = self.allocate_register();
                     upvalue_map.insert(var_name.clone(), upvalue_reg);
+                    upvalue_indices.insert(var_name.clone(), upvalue_idx as u8);
                     self.emit(Instruction::LoadUpvalue(upvalue_reg, upvalue_idx as u8), 0);
                 }
 
@@ -637,6 +1232,7 @@ impl Compiler {
                     for (var_name, reg) in &upvalue_map {
                         scope.locals.insert(var_name.clone(), (*reg, false));
                     }
+                    scope.upvalues = upvalue_indices;
                 }
 
                 let body_reg = self.compile_expr(body)?;
@@ -1042,6 +1638,10 @@ impl Compiler {
                 if let Ok(target_reg) = self.resolve_local(name) {
                     self.move_result(target_reg, value_reg, expression_start);
 
+                    if let Some(upvalue_idx) = self.lookup_upvalue(name) {
+                        self.emit(Instruction::StoreUpvalue(upvalue_idx, target_reg), 0);
+                    }
+
                     if self.should_sync_module_local(name) {
                         self.emit_store_module_global(name, target_reg);
                     }
@@ -1064,9 +1664,14 @@ impl Compiler {
             }
 
             ExprKind::FieldAccess { object, field } => {
+                let field_slot = self.resolve_struct_field_slot(object, field).map(|(s, _)| s);
                 let object_reg = self.compile_expr(object)?;
-                let field_idx = self.add_string_constant(field);
-                self.emit(Instruction::SetField(object_reg, field_idx, value_reg), 0);
+                if let Some(slot_idx) = field_slot {
+                    self.emit(Instruction::SetFieldSlot(object_reg, slot_idx, value_reg), 0);
+                } else {
+                    let field_idx = self.add_string_constant(field);
+                    self.emit(Instruction::SetField(object_reg, field_idx, value_reg), 0);
+                }
                 self.free_register(object_reg);
             }
 

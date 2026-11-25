@@ -4,6 +4,11 @@ use crate::lazy::StaticOnceCell;
 use alloc::{boxed::Box, collections::BTreeMap, string::ToString, vec, vec::Vec};
 use hashbrown::HashMap;
 
+#[cfg(feature = "std")]
+pub use crate::stdlib::coord;
+#[cfg(feature = "std")]
+pub use crate::stdlib::{net, services};
+
 #[derive(Debug, Clone)]
 pub struct BuiltinSignature {
     pub type_params: &'static [&'static str],
@@ -507,6 +512,10 @@ static TASK_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::ne
 static LUA_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 static IO_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 static OS_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+static RX_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+static TEST_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+static RANDOM_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+static COORD_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 
 fn build_array_functions() -> Vec<BuiltinFunction> {
     let t = TypeExpr::Generic("T");
@@ -535,6 +544,14 @@ fn build_array_functions() -> Vec<BuiltinFunction> {
             &["arr", "index"],
             vec![arr_t.clone(), TypeExpr::Int],
             TypeExpr::Option(Box::new(t.clone())),
+        ),
+        generic_func(
+            "array.set",
+            "Set the element at the given index",
+            &["T"],
+            &["arr", "index", "value"],
+            vec![arr_t.clone(), TypeExpr::Int, t.clone()],
+            TypeExpr::Unit,
         ),
         generic_func(
             "array.first",
@@ -683,6 +700,14 @@ fn build_array_functions() -> Vec<BuiltinFunction> {
             vec![arr_t.clone()],
             TypeExpr::Named("Iterator"),
         ),
+        generic_func(
+            "array.unpack",
+            "Unpack elements from an array into multiple values",
+            &["T"],
+            &["arr", "i", "j"],
+            vec![arr_t.clone(), TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
     ]
 }
 
@@ -690,29 +715,33 @@ fn build_table_functions() -> Vec<BuiltinFunction> {
     let t = TypeExpr::Generic("T");
     let arr_t = TypeExpr::Array(Box::new(t.clone()));
     vec![
-        generic_func(
+        func(
             "table.len",
             "Return the number of elements in the array/table",
-            &["T"],
-            &["arr"],
-            vec![arr_t.clone()],
+            &["col"],
+            vec![TypeExpr::Unknown],
             TypeExpr::Int,
         ),
-        generic_func(
+        func(
             "table.is_empty",
             "Check if the array/table contains no elements",
-            &["T"],
-            &["arr"],
-            vec![arr_t.clone()],
+            &["col"],
+            vec![TypeExpr::Unknown],
             TypeExpr::Bool,
         ),
-        generic_func(
+        func(
             "table.get",
-            "Return the element at the given index, if any",
-            &["T"],
-            &["arr", "index"],
-            vec![arr_t.clone(), TypeExpr::Int],
-            TypeExpr::Option(Box::new(t.clone())),
+            "Return the element at the given key or index, if any",
+            &["col", "key"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Option(Box::new(TypeExpr::Unknown)),
+        ),
+        func(
+            "table.set",
+            "Set the element at the given key or index in the array/table",
+            &["col", "key", "value"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unit,
         ),
         generic_func(
             "table.first",
@@ -763,6 +792,22 @@ fn build_table_functions() -> Vec<BuiltinFunction> {
             TypeExpr::Option(Box::new(t.clone())),
         ),
         generic_func(
+            "table.clear",
+            "Remove all elements from the array/table",
+            &["T"],
+            &["col"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unit,
+        ),
+        generic_func(
+            "table.slice",
+            "Return a slice of the array/table between two indices",
+            &["T"],
+            &["arr", "start", "end"],
+            vec![arr_t.clone(), TypeExpr::Int, TypeExpr::Int],
+            arr_t.clone(),
+        ),
+        generic_func(
             "table.concat",
             "Concatenate array/table elements into a string with an optional separator",
             &["T"],
@@ -787,14 +832,6 @@ fn build_table_functions() -> Vec<BuiltinFunction> {
             TypeExpr::Unit,
         ),
         generic_func(
-            "table.clear",
-            "Remove all elements from the array/table",
-            &["T"],
-            &["arr"],
-            vec![arr_t.clone()],
-            TypeExpr::Unit,
-        ),
-        generic_func(
             "table.contains",
             "Check if the array/table contains a given value",
             &["T"],
@@ -803,11 +840,75 @@ fn build_table_functions() -> Vec<BuiltinFunction> {
             TypeExpr::Bool,
         ),
         generic_func(
-            "table.slice",
-            "Return a slice of the array/table between two indices",
+            "table.map",
+            "Transform each element using the provided function",
             &["T"],
-            &["arr", "start", "end"],
-            vec![arr_t.clone(), TypeExpr::Int, TypeExpr::Int],
+            &["arr", "func"],
+            vec![
+                arr_t.clone(),
+                TypeExpr::Function {
+                    params: vec![t.clone()],
+                    return_type: Box::new(TypeExpr::Unknown),
+                },
+            ],
+            TypeExpr::Array(Box::new(TypeExpr::Unknown)),
+        ),
+        generic_func(
+            "table.filter",
+            "Keep elements where the predicate returns true",
+            &["T"],
+            &["arr", "func"],
+            vec![
+                arr_t.clone(),
+                TypeExpr::Function {
+                    params: vec![t.clone()],
+                    return_type: Box::new(TypeExpr::Bool),
+                },
+            ],
+            arr_t.clone(),
+        ),
+        generic_func(
+            "table.reduce",
+            "Fold elements into a single value",
+            &["T"],
+            &["arr", "initial", "func"],
+            vec![
+                arr_t.clone(),
+                TypeExpr::Unknown,
+                TypeExpr::Function {
+                    params: vec![TypeExpr::Unknown, t.clone()],
+                    return_type: Box::new(TypeExpr::Unknown),
+                },
+            ],
+            TypeExpr::Unknown,
+        ),
+        generic_func(
+            "table.iter",
+            "Return an iterator over the array/table items",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Named("Iterator"),
+        ),
+        func(
+            "table.unpack",
+            "Unpack elements from an array/table into multiple values",
+            &["arr", "i", "j"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        generic_func(
+            "table.move",
+            "Copy elements from one range/array to another",
+            &["T"],
+            &["a1", "f", "e", "t", "a2"],
+            vec![
+                arr_t.clone(),
+                TypeExpr::Int,
+                TypeExpr::Int,
+                TypeExpr::Int,
+                TypeExpr::Unknown,
+            ],
             arr_t.clone(),
         ),
     ]
@@ -1435,6 +1536,76 @@ fn build_io_functions() -> Vec<BuiltinFunction> {
             vec![TypeExpr::Unknown],
             TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
         ),
+        func(
+            "io.read_file_effect",
+            "Read file contents returning an Effect",
+            &["path"],
+            vec![TypeExpr::String],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "io.write_file_effect",
+            "Write file contents returning an Effect",
+            &["path", "content"],
+            vec![TypeExpr::String, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "io.exists_effect",
+            "Check path existence returning an Effect",
+            &["path"],
+            vec![TypeExpr::String],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "io.remove_file_effect",
+            "Remove a file returning an Effect",
+            &["path"],
+            vec![TypeExpr::String],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "io.create_dir_all_effect",
+            "Create directories recursively returning an Effect",
+            &["path"],
+            vec![TypeExpr::String],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "io.read_dir_effect",
+            "Read directory entries returning an Effect",
+            &["path"],
+            vec![TypeExpr::String],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "io.open_scoped",
+            "Open scoped file handle returning an Effect",
+            &["path", "mode"],
+            vec![TypeExpr::String, TypeExpr::String],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "io.read_handle",
+            "Read bytes from handle returning an Effect",
+            &["handle", "max_bytes"],
+            vec![TypeExpr::Unknown, TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "io.write_handle",
+            "Write bytes to handle returning an Effect",
+            &["handle", "bytes"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "io.close_handle",
+            "Close file handle returning an Effect",
+            &["handle"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
     ]
 }
 
@@ -1446,6 +1617,13 @@ fn build_os_functions() -> Vec<BuiltinFunction> {
             &[],
             vec![],
             TypeExpr::Float,
+        ),
+        func(
+            "os.date",
+            "Format date and time or return date components table",
+            &["format", "time"],
+            vec![TypeExpr::Option(Box::new(TypeExpr::String)), TypeExpr::Option(Box::new(TypeExpr::Float))],
+            TypeExpr::Unknown,
         ),
         func(
             "os.sleep",
@@ -1498,6 +1676,34 @@ fn build_os_functions() -> Vec<BuiltinFunction> {
                 Box::new(TypeExpr::Option(Box::new(TypeExpr::String))),
                 Box::new(TypeExpr::String),
             ),
+        ),
+        func(
+            "os.getenv_effect",
+            "Get an environment variable returning an Effect",
+            &["key"],
+            vec![TypeExpr::String],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "os.setenv_effect",
+            "Set an environment variable returning an Effect",
+            &["key", "val"],
+            vec![TypeExpr::String, TypeExpr::String],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "os.now_ms_effect",
+            "Get current time in milliseconds returning an Effect",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "os.args_effect",
+            "Get command line arguments returning an Effect",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
         ),
     ]
 }
@@ -1556,6 +1762,404 @@ pub fn io_functions() -> &'static [BuiltinFunction] {
 
 pub fn os_functions() -> &'static [BuiltinFunction] {
     OS_FUNCTIONS.get_or_init(build_os_functions).as_slice()
+}
+
+pub fn rx_functions() -> &'static [BuiltinFunction] {
+    RX_FUNCTIONS.get_or_init(build_rx_functions).as_slice()
+}
+
+pub fn test_functions() -> &'static [BuiltinFunction] {
+    TEST_FUNCTIONS.get_or_init(build_test_functions).as_slice()
+}
+
+pub fn random_functions() -> &'static [BuiltinFunction] {
+    RANDOM_FUNCTIONS.get_or_init(build_random_functions).as_slice()
+}
+
+pub fn coord_functions() -> &'static [BuiltinFunction] {
+    COORD_FUNCTIONS.get_or_init(build_coord_functions).as_slice()
+}
+
+fn build_coord_functions() -> Vec<BuiltinFunction> {
+    vec![
+        func(
+            "coord.Ref",
+            "Create a new shared mutable Ref cell",
+            &["initial"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Deferred",
+            "Create a new single-assignment Deferred promise",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Semaphore",
+            "Create a new counting Semaphore",
+            &["permits"],
+            vec![TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Queue",
+            "Create a new bounded or unbounded Queue",
+            &["capacity", "overflow"],
+            vec![TypeExpr::Int, TypeExpr::String],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Schedule",
+            "Create a recurrence schedule",
+            &["recurs"],
+            vec![TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Schedule.recurs",
+            "Create a recurs schedule",
+            &["n"],
+            vec![TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Schedule.spaced",
+            "Create a spaced schedule",
+            &["ms"],
+            vec![TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Schedule.exponential",
+            "Create an exponential backoff schedule",
+            &["base", "factor", "max"],
+            vec![TypeExpr::Int, TypeExpr::Float, TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Schedule.retry",
+            "Retry an action under a schedule",
+            &["schedule", "action"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Schedule.timeout",
+            "Execute action with timeout",
+            &["timeout_ms", "action"],
+            vec![TypeExpr::Int, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Stream",
+            "Create a pull stream from an array",
+            &["items"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Stream.from_array",
+            "Create a stream from an array",
+            &["items"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Stream.range",
+            "Create a numeric range stream",
+            &["start", "end", "step"],
+            vec![TypeExpr::Int, TypeExpr::Int, TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Stream.collect",
+            "Collect all items from a stream",
+            &["stream"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Sink",
+            "Create a collect sink",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Sink.collect",
+            "Create a collect sink",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Sink.drain",
+            "Create a drain sink",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
+        ),
+    ]
+}
+
+fn build_random_functions() -> Vec<BuiltinFunction> {
+    vec![
+        func(
+            "random.int_effect",
+            "Generate random integer in range [min, max) returning an Effect",
+            &["min", "max"],
+            vec![TypeExpr::Int, TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "random.float_effect",
+            "Generate random float in range [0.0, 1.0) returning an Effect",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "random.bool_effect",
+            "Generate random boolean returning an Effect",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "random.bytes_effect",
+            "Generate random byte buffer of length len returning an Effect",
+            &["len"],
+            vec![TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+    ]
+}
+
+fn build_rx_functions() -> Vec<BuiltinFunction> {
+    vec![
+        func(
+            "rx.Subject",
+            "Create a new reactive Subject",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.Observable",
+            "Create an Observable from an array or source",
+            &["source"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.from_iter",
+            "Create an Observable from an array or iterable",
+            &["items"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.interval",
+            "Create a periodic timer Observable",
+            &["period_ms"],
+            vec![TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.Scheduler",
+            "Create a virtual reactive scheduler",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.advance_by",
+            "Advance virtual scheduler by delta milliseconds",
+            &["sched", "delta_ms"],
+            vec![TypeExpr::Unknown, TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.unsubscribe",
+            "Unsubscribe a reactive subscription",
+            &["sub"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.join",
+            "Join a reactive subscription awaiting completion",
+            &["sub"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.BoundedQueue",
+            "Create a dual-limit bounded queue with overflow strategy",
+            &["max_items", "max_bytes", "strategy"],
+            vec![TypeExpr::Int, TypeExpr::Int, TypeExpr::String],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.BufferOptions",
+            "Configure bounded buffer options",
+            &["max_items", "max_bytes", "low_watermark_items", "low_watermark_bytes", "strategy"],
+            vec![TypeExpr::Int, TypeExpr::Int, TypeExpr::Int, TypeExpr::Int, TypeExpr::String],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.default_buffer_options",
+            "Default bounded buffer options (64 items / 64KB)",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.push",
+            "Push an item into bounded queue respecting overflow policy",
+            &["queue", "item"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.pop",
+            "Pop an item from bounded queue",
+            &["queue"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.dequeue",
+            "Dequeue an item from bounded queue",
+            &["queue"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.dropped_count",
+            "Get number of dropped items from bounded queue",
+            &["queue"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Int,
+        ),
+        func(
+            "rx.len",
+            "Get number of items in queue or observable",
+            &["target"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Int,
+        ),
+        func(
+            "rx.used_bytes",
+            "Get byte usage in bounded queue",
+            &["queue"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Int,
+        ),
+        func(
+            "rx.subject_subscribe",
+            "Subscribe observer to Subject",
+            &["subject", "next_fn"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.subject_subscribe_with",
+            "Subscribe observer to Subject with callbacks and buffer options",
+            &["subject", "next_fn", "err_fn", "complete_fn", "options"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.next",
+            "Emit value to Subject subscribers",
+            &["subject", "val"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.complete",
+            "Complete Subject stream",
+            &["subject"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.filter",
+            "Filter Observable items with predicate",
+            &["obs", "pred_fn"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.map",
+            "Transform Observable items with mapping function",
+            &["obs", "map_fn"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.take",
+            "Take first n items from Observable",
+            &["obs", "n"],
+            vec![TypeExpr::Unknown, TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.subscribe",
+            "Subscribe to Observable stream",
+            &["obs", "next_fn"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "rx.subscribe_with",
+            "Subscribe to Observable with error and completion callbacks",
+            &["obs", "next_fn", "err_fn", "complete_fn"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+    ]
+}
+
+fn build_test_functions() -> Vec<BuiltinFunction> {
+    vec![
+        func("test.clock_new", "Create a virtual TestClock", &[], vec![], TypeExpr::Unknown),
+        func("test.clock_now_ms", "Get current virtual time in ms", &["clock"], vec![TypeExpr::Unknown], TypeExpr::Int),
+        func("test.clock_schedule", "Schedule a fiber wake timer", &["clock", "fiber_id", "delay_ms"], vec![TypeExpr::Unknown, TypeExpr::Int, TypeExpr::Int], TypeExpr::Int),
+        func("test.clock_adjust", "Fast-forward virtual time", &["clock", "delta_ms"], vec![TypeExpr::Unknown, TypeExpr::Int], TypeExpr::Unknown),
+        func("test.clock_pending_count", "Pending timer count", &["clock"], vec![TypeExpr::Unknown], TypeExpr::Int),
+        func("test.schedule_exponential", "Create exponential schedule", &["initial_ms", "factor", "max_delay_ms"], vec![TypeExpr::Int, TypeExpr::Float, TypeExpr::Int], TypeExpr::Unknown),
+        func("test.schedule_step", "Step a schedule state", &["schedule", "state"], vec![TypeExpr::Unknown, TypeExpr::Unknown], TypeExpr::Unknown),
+        func("test.mock_new", "Create a mock service", &["id"], vec![TypeExpr::Int], TypeExpr::Unknown),
+        func("test.mock_set_response", "Set mock response", &["mock", "endpoint", "response"], vec![TypeExpr::Unknown, TypeExpr::String, TypeExpr::String], TypeExpr::Unknown),
+        func("test.mock_record_call", "Record mock service call", &["mock", "method", "args", "latency_ms"], vec![TypeExpr::Unknown, TypeExpr::String, TypeExpr::Unknown, TypeExpr::Int], TypeExpr::Unknown),
+        func("test.mock_call_count", "Get mock call count", &["mock", "method"], vec![TypeExpr::Unknown, TypeExpr::String], TypeExpr::Int),
+        func("test.mock_last_call", "Get mock last call record", &["mock", "method"], vec![TypeExpr::Unknown, TypeExpr::String], TypeExpr::Unknown),
+        func("test.projection_new", "Create stack context projection", &["types", "services"], vec![TypeExpr::Unknown, TypeExpr::Unknown], TypeExpr::Unknown),
+        func("test.projection_get", "Get service from projection", &["projection", "type_id"], vec![TypeExpr::Unknown, TypeExpr::Int], TypeExpr::Unknown),
+        func("test.resource_new", "Create mock host resource", &["name"], vec![TypeExpr::String], TypeExpr::Unknown),
+        func("test.resource_is_active", "Check if host resource is active", &["resource"], vec![TypeExpr::Unknown], TypeExpr::Bool),
+        func("test.scope_new", "Create a scope", &["id"], vec![TypeExpr::Int], TypeExpr::Unknown),
+        func("test.scope_is_open", "Check if scope is open", &["scope"], vec![TypeExpr::Unknown], TypeExpr::Bool),
+        func("test.scope_teardown_state", "Get scope teardown state", &["scope"], vec![TypeExpr::Unknown], TypeExpr::String),
+        func("test.scope_admission_state", "Get scope admission state", &["scope"], vec![TypeExpr::Unknown], TypeExpr::String),
+        func("test.scope_register_finalizer", "Register finalizer in scope", &["scope", "resource"], vec![TypeExpr::Unknown, TypeExpr::Unknown], TypeExpr::Unknown),
+        func("test.scope_register_child", "Register child fiber in scope", &["scope", "child"], vec![TypeExpr::Unknown, TypeExpr::Unknown], TypeExpr::Unknown),
+        func("test.scope_begin_teardown", "Begin scope teardown", &["scope"], vec![TypeExpr::Unknown], TypeExpr::Unknown),
+        func("test.scope_mark_joining", "Mark scope joining", &["scope"], vec![TypeExpr::Unknown], TypeExpr::Unknown),
+        func("test.scope_current_releases", "Get currently released resources", &["scope"], vec![TypeExpr::Unknown], TypeExpr::Unknown),
+        func("test.scope_finalize", "Finalize scope and run LIFO finalizers", &["scope"], vec![TypeExpr::Unknown], TypeExpr::Unknown),
+        func("test.fiber_new", "Create a fiber descriptor", &["id", "parent_id"], vec![TypeExpr::Int, TypeExpr::Int], TypeExpr::Unknown),
+        func("test.fiber_set_state", "Set fiber execution state", &["fiber", "state"], vec![TypeExpr::Unknown, TypeExpr::String], TypeExpr::Unit),
+        func("test.fiber_enter_mask", "Mask fiber interrupts", &["fiber"], vec![TypeExpr::Unknown], TypeExpr::Unknown),
+        func("test.fiber_exit_mask", "Unmask fiber interrupts", &["fiber"], vec![TypeExpr::Unknown], TypeExpr::Unknown),
+        func("test.fiber_is_masked", "Check if fiber is masked", &["fiber"], vec![TypeExpr::Unknown], TypeExpr::Bool),
+        func("test.fiber_request_interrupt", "Request fiber interrupt", &["fiber", "reason"], vec![TypeExpr::Unknown, TypeExpr::String], TypeExpr::Unknown),
+        func("test.fiber_state", "Get fiber state", &["fiber"], vec![TypeExpr::Unknown], TypeExpr::String),
+    ]
 }
 
 pub fn builtin_methods() -> &'static [BuiltinMethod] {
@@ -1633,7 +2237,7 @@ static BUILTINS_DATABASE: StaticOnceCell<BuiltinsDatabase> = StaticOnceCell::new
 
 fn build_builtins_database() -> BuiltinsDatabase {
     let mut modules: BTreeMap<&'static str, BuiltinModule> = BTreeMap::new();
-    let module_specs: [(&'static str, &'static str, &'static [BuiltinFunction]); 8] = [
+    let module_specs: [(&'static str, &'static str, &'static [BuiltinFunction]); 12] = [
         ("array", "array collection module", array_functions()),
         ("map", "map collection module", map_functions()),
         ("math", "math module", math_functions()),
@@ -1642,6 +2246,10 @@ fn build_builtins_database() -> BuiltinsDatabase {
         ("task", "task runtime module", task_functions()),
         ("io", "io file & console module", io_functions()),
         ("os", "os filesystem module", os_functions()),
+        ("rx", "reactive streams module", rx_functions()),
+        ("test", "test framework module", test_functions()),
+        ("random", "pseudorandom number and byte generator module", random_functions()),
+        ("coord", "coordination primitives module", coord_functions()),
     ];
     for (name, description, functions) in module_specs {
         let mut module_funcs: Vec<&'static BuiltinFunction> = functions.iter().collect();
@@ -1732,6 +2340,11 @@ pub fn is_virtual_std_module(module_path: &str) -> bool {
             | "json"
             | "jsonc"
             | "jsonl"
+            | "rx"
+            | "coord"
+            | "sync"
+            | "stream"
+            | "schedule"
     )
 }
 
@@ -1770,6 +2383,11 @@ pub fn canonical_std_module_name(module_path: &str) -> &'static str {
         "jsonc" => "jsonc",
         "jsonl" => "jsonl",
         "test" | "test.clock" | "test.mock" => "test",
+        "rx" => "rx",
+        "coord" => "coord",
+        "sync" => "sync",
+        "stream" => "stream",
+        "schedule" => "schedule",
         _ => "unknown",
     }
 }
@@ -1820,6 +2438,39 @@ pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'stat
             "after_each" => Some("std.test.after_each"),
             "before_all" => Some("std.test.before_all"),
             "after_all" => Some("std.test.after_all"),
+            "clock_new" => Some("test.clock_new"),
+            "clock_now_ms" => Some("test.clock_now_ms"),
+            "clock_schedule" => Some("test.clock_schedule"),
+            "clock_adjust" => Some("test.clock_adjust"),
+            "clock_pending_count" => Some("test.clock_pending_count"),
+            "schedule_exponential" => Some("test.schedule_exponential"),
+            "schedule_step" => Some("test.schedule_step"),
+            "mock_new" => Some("test.mock_new"),
+            "mock_set_response" => Some("test.mock_set_response"),
+            "mock_record_call" => Some("test.mock_record_call"),
+            "mock_call_count" => Some("test.mock_call_count"),
+            "mock_last_call" => Some("test.mock_last_call"),
+            "projection_new" => Some("test.projection_new"),
+            "projection_get" => Some("test.projection_get"),
+            "resource_new" => Some("test.resource_new"),
+            "resource_is_active" => Some("test.resource_is_active"),
+            "scope_new" => Some("test.scope_new"),
+            "scope_is_open" => Some("test.scope_is_open"),
+            "scope_teardown_state" => Some("test.scope_teardown_state"),
+            "scope_admission_state" => Some("test.scope_admission_state"),
+            "scope_register_finalizer" => Some("test.scope_register_finalizer"),
+            "scope_register_child" => Some("test.scope_register_child"),
+            "scope_begin_teardown" => Some("test.scope_begin_teardown"),
+            "scope_mark_joining" => Some("test.scope_mark_joining"),
+            "scope_current_releases" => Some("test.scope_current_releases"),
+            "scope_finalize" => Some("test.scope_finalize"),
+            "fiber_new" => Some("test.fiber_new"),
+            "fiber_set_state" => Some("test.fiber_set_state"),
+            "fiber_enter_mask" => Some("test.fiber_enter_mask"),
+            "fiber_exit_mask" => Some("test.fiber_exit_mask"),
+            "fiber_is_masked" => Some("test.fiber_is_masked"),
+            "fiber_request_interrupt" => Some("test.fiber_request_interrupt"),
+            "fiber_state" => Some("test.fiber_state"),
             _ => None,
         },
         "effect" => match item_name {
@@ -1884,6 +2535,32 @@ pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'stat
             "println" => Some("println"),
             "read_file" => Some("io.read_file"),
             "write_file" => Some("io.write_file"),
+            "read_file_effect" => Some("io.read_file_effect"),
+            "write_file_effect" => Some("io.write_file_effect"),
+            "exists_effect" => Some("io.exists_effect"),
+            "remove_file_effect" => Some("io.remove_file_effect"),
+            "create_dir_all_effect" => Some("io.create_dir_all_effect"),
+            "read_dir_effect" => Some("io.read_dir_effect"),
+            "open_scoped" => Some("io.open_scoped"),
+            "read_handle" => Some("io.read_handle"),
+            "write_handle" => Some("io.write_handle"),
+            "close_handle" => Some("io.close_handle"),
+            _ => None,
+        },
+        "os" => match item_name {
+            "time" => Some("os.time"),
+            "date" => Some("os.date"),
+            "sleep" => Some("os.sleep"),
+            "create_file" => Some("os.create_file"),
+            "create_dir" => Some("os.create_dir"),
+            "remove_file" => Some("os.remove_file"),
+            "remove_dir" => Some("os.remove_dir"),
+            "rename" => Some("os.rename"),
+            "get_env" => Some("os.get_env"),
+            "getenv_effect" => Some("os.getenv_effect"),
+            "setenv_effect" => Some("os.setenv_effect"),
+            "now_ms_effect" => Some("os.now_ms_effect"),
+            "args_effect" => Some("os.args_effect"),
             _ => None,
         },
         "fmt" => match item_name {
@@ -1905,12 +2582,17 @@ pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'stat
         "random" => match item_name {
             "random" => Some("random"),
             "randomseed" => Some("randomseed"),
+            "int_effect" | "int" => Some("random.int_effect"),
+            "float_effect" | "float" => Some("random.float_effect"),
+            "bool_effect" | "bool" => Some("random.bool_effect"),
+            "bytes_effect" | "bytes" => Some("random.bytes_effect"),
             _ => None,
         },
         "table" => match item_name {
             "len" => Some("table.len"),
             "is_empty" => Some("table.is_empty"),
             "get" => Some("table.get"),
+            "set" => Some("table.set"),
             "first" => Some("table.first"),
             "last" => Some("table.last"),
             "push" => Some("table.push"),
@@ -1928,6 +2610,9 @@ pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'stat
             "reduce" => Some("table.reduce"),
             "iter" => Some("table.iter"),
             "unpack" => Some("table.unpack"),
+            "move" => Some("table.move"),
+            "Table" => Some("table.Table"),
+            "LuaTable" => Some("table.LuaTable"),
             _ => None,
         },
         "string" => match item_name {
@@ -1966,6 +2651,7 @@ pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'stat
             "filter" => Some("array.filter"),
             "reduce" => Some("array.reduce"),
             "iter" => Some("array.iter"),
+            "unpack" => Some("array.unpack"),
             _ => None,
         },
         "map" => match item_name {
@@ -1979,6 +2665,64 @@ pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'stat
             "keys" => Some("map.keys"),
             "values" => Some("map.values"),
             "iter" => Some("map.iter"),
+            _ => None,
+        },
+        "rx" => match item_name {
+            "Subject" => Some("rx.Subject"),
+            "Observable" => Some("rx.Observable"),
+            "from_iter" => Some("rx.from_iter"),
+            "interval" => Some("rx.interval"),
+            "Scheduler" => Some("rx.Scheduler"),
+            "advance_by" => Some("rx.advance_by"),
+            "unsubscribe" => Some("rx.unsubscribe"),
+            "join" => Some("rx.join"),
+            "BoundedQueue" => Some("rx.BoundedQueue"),
+            "BufferOptions" => Some("rx.BufferOptions"),
+            "default_buffer_options" => Some("rx.default_buffer_options"),
+            "push" => Some("rx.push"),
+            "pop" => Some("rx.pop"),
+            "dequeue" => Some("rx.dequeue"),
+            "dropped_count" => Some("rx.dropped_count"),
+            "len" => Some("rx.len"),
+            "used_bytes" => Some("rx.used_bytes"),
+            "subject_subscribe" => Some("rx.subject_subscribe"),
+            "subject_subscribe_with" => Some("rx.subject_subscribe_with"),
+            "next" => Some("rx.next"),
+            "complete" => Some("rx.complete"),
+            "filter" => Some("rx.filter"),
+            "map" => Some("rx.map"),
+            "take" => Some("rx.take"),
+            "subscribe" => Some("rx.subscribe"),
+            "subscribe_with" => Some("rx.subscribe_with"),
+            _ => crate::rx::resolve_rx_function(item_name),
+        },
+        "coord" => match item_name {
+            "Stream" => Some("coord.Stream"),
+            "Sink" => Some("coord.Sink"),
+            "Queue" => Some("coord.Queue"),
+            "Deferred" => Some("coord.Deferred"),
+            "Semaphore" => Some("coord.Semaphore"),
+            "Ref" => Some("coord.Ref"),
+            "Schedule" => Some("coord.Schedule"),
+            _ => None,
+        },
+        "sync" => match item_name {
+            "Queue" => Some("coord.Queue"),
+            "Deferred" => Some("coord.Deferred"),
+            "Semaphore" => Some("coord.Semaphore"),
+            "Ref" => Some("coord.Ref"),
+            _ => None,
+        },
+        "stream" => match item_name {
+            "Stream" => Some("coord.Stream"),
+            "Sink" => Some("coord.Sink"),
+            _ => None,
+        },
+        "schedule" => match item_name {
+            "Schedule" => Some("coord.Schedule"),
+            "retry" => Some("coord.Schedule.retry"),
+            "repeat" => Some("coord.Schedule.repeat"),
+            "timeout" => Some("coord.Schedule.timeout"),
             _ => None,
         },
         _ => None,
@@ -2028,6 +2772,7 @@ pub fn virtual_std_module_functions(module_path: &str) -> Vec<(&'static str, &'s
             ("len", "table.len"),
             ("is_empty", "table.is_empty"),
             ("get", "table.get"),
+            ("set", "table.set"),
             ("first", "table.first"),
             ("last", "table.last"),
             ("push", "table.push"),
@@ -2045,6 +2790,7 @@ pub fn virtual_std_module_functions(module_path: &str) -> Vec<(&'static str, &'s
             ("reduce", "table.reduce"),
             ("iter", "table.iter"),
             ("unpack", "table.unpack"),
+            ("move", "table.move"),
         ],
         "string" => vec![
             ("len", "string.len"),
@@ -2081,6 +2827,7 @@ pub fn virtual_std_module_functions(module_path: &str) -> Vec<(&'static str, &'s
             ("filter", "array.filter"),
             ("reduce", "array.reduce"),
             ("iter", "array.iter"),
+            ("unpack", "array.unpack"),
         ],
         "map" => vec![
             ("len", "map.len"),
@@ -2099,6 +2846,31 @@ pub fn virtual_std_module_functions(module_path: &str) -> Vec<(&'static str, &'s
             ("println", "println"),
             ("read_file", "io.read_file"),
             ("write_file", "io.write_file"),
+            ("read_file_effect", "io.read_file_effect"),
+            ("write_file_effect", "io.write_file_effect"),
+            ("exists_effect", "io.exists_effect"),
+            ("remove_file_effect", "io.remove_file_effect"),
+            ("create_dir_all_effect", "io.create_dir_all_effect"),
+            ("read_dir_effect", "io.read_dir_effect"),
+            ("open_scoped", "io.open_scoped"),
+            ("read_handle", "io.read_handle"),
+            ("write_handle", "io.write_handle"),
+            ("close_handle", "io.close_handle"),
+        ],
+        "os" => vec![
+            ("time", "os.time"),
+            ("date", "os.date"),
+            ("sleep", "os.sleep"),
+            ("create_file", "os.create_file"),
+            ("create_dir", "os.create_dir"),
+            ("remove_file", "os.remove_file"),
+            ("remove_dir", "os.remove_dir"),
+            ("rename", "os.rename"),
+            ("get_env", "os.get_env"),
+            ("getenv_effect", "os.getenv_effect"),
+            ("setenv_effect", "os.setenv_effect"),
+            ("now_ms_effect", "os.now_ms_effect"),
+            ("args_effect", "os.args_effect"),
         ],
         "fmt" => vec![
             ("tostring", "tostring"),
@@ -2116,6 +2888,10 @@ pub fn virtual_std_module_functions(module_path: &str) -> Vec<(&'static str, &'s
         "random" => vec![
             ("random", "random"),
             ("randomseed", "randomseed"),
+            ("int_effect", "random.int_effect"),
+            ("float_effect", "random.float_effect"),
+            ("bool_effect", "random.bool_effect"),
+            ("bytes_effect", "random.bytes_effect"),
         ],
         "schema" => vec![
             ("s", "schema.s"),
@@ -2125,6 +2901,102 @@ pub fn virtual_std_module_functions(module_path: &str) -> Vec<(&'static str, &'s
             ("is_match", "regex.is_match"),
             ("find", "regex.find"),
             ("replace_all", "regex.replace_all"),
+        ],
+        "rx" => vec![
+            ("Subject", "rx.Subject"),
+            ("Observable", "rx.Observable"),
+            ("from_iter", "rx.from_iter"),
+            ("interval", "rx.interval"),
+            ("Scheduler", "rx.Scheduler"),
+            ("advance_by", "rx.advance_by"),
+            ("unsubscribe", "rx.unsubscribe"),
+            ("join", "rx.join"),
+            ("BoundedQueue", "rx.BoundedQueue"),
+            ("BufferOptions", "rx.BufferOptions"),
+            ("default_buffer_options", "rx.default_buffer_options"),
+            ("push", "rx.push"),
+            ("pop", "rx.pop"),
+            ("dequeue", "rx.dequeue"),
+            ("dropped_count", "rx.dropped_count"),
+            ("len", "rx.len"),
+            ("used_bytes", "rx.used_bytes"),
+            ("subject_subscribe", "rx.subject_subscribe"),
+            ("subject_subscribe_with", "rx.subject_subscribe_with"),
+            ("next", "rx.next"),
+            ("complete", "rx.complete"),
+            ("filter", "rx.filter"),
+            ("map", "rx.map"),
+            ("take", "rx.take"),
+            ("subscribe", "rx.subscribe"),
+            ("subscribe_with", "rx.subscribe_with"),
+        ],
+        "test" => vec![
+            ("assert", "std.test.assert"),
+            ("assert_eq", "std.test.assert_eq"),
+            ("assert_ne", "std.test.assert_ne"),
+            ("assert_almost_eq", "std.test.assert_almost_eq"),
+            ("assert_success", "std.test.assert_success"),
+            ("assert_fails", "std.test.assert_fails"),
+            ("assert_interrupted", "std.test.assert_interrupted"),
+            ("assert_dies", "std.test.assert_dies"),
+            ("clock_new", "test.clock_new"),
+            ("clock_now_ms", "test.clock_now_ms"),
+            ("clock_schedule", "test.clock_schedule"),
+            ("clock_adjust", "test.clock_adjust"),
+            ("clock_pending_count", "test.clock_pending_count"),
+            ("schedule_exponential", "test.schedule_exponential"),
+            ("schedule_step", "test.schedule_step"),
+            ("mock_new", "test.mock_new"),
+            ("mock_set_response", "test.mock_set_response"),
+            ("mock_record_call", "test.mock_record_call"),
+            ("mock_call_count", "test.mock_call_count"),
+            ("mock_last_call", "test.mock_last_call"),
+            ("projection_new", "test.projection_new"),
+            ("projection_get", "test.projection_get"),
+            ("resource_new", "test.resource_new"),
+            ("resource_is_active", "test.resource_is_active"),
+            ("scope_new", "test.scope_new"),
+            ("scope_is_open", "test.scope_is_open"),
+            ("scope_teardown_state", "test.scope_teardown_state"),
+            ("scope_admission_state", "test.scope_admission_state"),
+            ("scope_register_finalizer", "test.scope_register_finalizer"),
+            ("scope_register_child", "test.scope_register_child"),
+            ("scope_begin_teardown", "test.scope_begin_teardown"),
+            ("scope_mark_joining", "test.scope_mark_joining"),
+            ("scope_current_releases", "test.scope_current_releases"),
+            ("scope_finalize", "test.scope_finalize"),
+            ("fiber_new", "test.fiber_new"),
+            ("fiber_set_state", "test.fiber_set_state"),
+            ("fiber_enter_mask", "test.fiber_enter_mask"),
+            ("fiber_exit_mask", "test.fiber_exit_mask"),
+            ("fiber_is_masked", "test.fiber_is_masked"),
+            ("fiber_request_interrupt", "test.fiber_request_interrupt"),
+            ("fiber_state", "test.fiber_state"),
+        ],
+        "coord" => vec![
+            ("Stream", "coord.Stream"),
+            ("Sink", "coord.Sink"),
+            ("Queue", "coord.Queue"),
+            ("Deferred", "coord.Deferred"),
+            ("Semaphore", "coord.Semaphore"),
+            ("Ref", "coord.Ref"),
+            ("Schedule", "coord.Schedule"),
+        ],
+        "sync" => vec![
+            ("Queue", "coord.Queue"),
+            ("Deferred", "coord.Deferred"),
+            ("Semaphore", "coord.Semaphore"),
+            ("Ref", "coord.Ref"),
+        ],
+        "stream" => vec![
+            ("Stream", "coord.Stream"),
+            ("Sink", "coord.Sink"),
+        ],
+        "schedule" => vec![
+            ("Schedule", "coord.Schedule"),
+            ("retry", "coord.Schedule.retry"),
+            ("repeat", "coord.Schedule.repeat"),
+            ("timeout", "coord.Schedule.timeout"),
         ],
         _ => Vec::new(),
     }
@@ -2178,6 +3050,26 @@ pub fn find_builtin_function(name: &str) -> Option<&'static BuiltinFunction> {
     }
     for func in lua_functions() {
         if func.name == name || func.name.strip_prefix("lua.") == Some(name) {
+            return Some(func);
+        }
+    }
+    for func in rx_functions() {
+        if func.name == name || func.name.strip_prefix("rx.") == Some(name) {
+            return Some(func);
+        }
+    }
+    for func in test_functions() {
+        if func.name == name || func.name.strip_prefix("test.") == Some(name) {
+            return Some(func);
+        }
+    }
+    for func in random_functions() {
+        if func.name == name || func.name.strip_prefix("random.") == Some(name) {
+            return Some(func);
+        }
+    }
+    for func in coord_functions() {
+        if func.name == name || func.name.strip_prefix("coord.") == Some(name) {
             return Some(func);
         }
     }
@@ -2251,11 +3143,12 @@ mod tests {
     #[test]
     fn test_table_functions_registered() {
         let funcs = table_functions();
-        assert_eq!(funcs.len(), 15);
+        assert_eq!(funcs.len(), 22);
         let names: Vec<&str> = funcs.iter().map(|f| f.name).collect();
         assert!(names.contains(&"table.len"));
         assert!(names.contains(&"table.is_empty"));
         assert!(names.contains(&"table.get"));
+        assert!(names.contains(&"table.set"));
         assert!(names.contains(&"table.first"));
         assert!(names.contains(&"table.last"));
         assert!(names.contains(&"table.push"));
@@ -2268,13 +3161,19 @@ mod tests {
         assert!(names.contains(&"table.clear"));
         assert!(names.contains(&"table.contains"));
         assert!(names.contains(&"table.slice"));
+        assert!(names.contains(&"table.map"));
+        assert!(names.contains(&"table.filter"));
+        assert!(names.contains(&"table.reduce"));
+        assert!(names.contains(&"table.iter"));
+        assert!(names.contains(&"table.unpack"));
+        assert!(names.contains(&"table.move"));
     }
 
     #[test]
     fn test_table_module_in_database() {
         let db = builtins();
         let table_mod = db.module("table").expect("table module must exist in builtins");
-        assert_eq!(table_mod.functions().len(), 15);
+        assert_eq!(table_mod.functions().len(), 22);
     }
 
     #[test]

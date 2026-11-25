@@ -1,4 +1,7 @@
 pub mod runtime;
+#[path = "../aot/mod.rs"]
+pub mod aot;
+pub use aot::AotCompiler;
 
 use crate::ast::{
     BinaryOp, EnumDef, Expr, ExprKind, FunctionDef, Item, ItemKind, Literal, Pattern, Stmt,
@@ -44,6 +47,24 @@ impl Default for CompileOptions {
             strip: false,
             target_triple: None,
             cache_dir: None,
+        }
+    }
+}
+
+/// Link options for external libraries and capabilities in Zig compilation.
+#[derive(Debug, Clone)]
+pub struct ZigLinkOptions {
+    pub link_libraries: Vec<PathBuf>,
+    pub link_dirs: Vec<PathBuf>,
+    pub allow_ffi: bool,
+}
+
+impl Default for ZigLinkOptions {
+    fn default() -> Self {
+        Self {
+            link_libraries: Vec::new(),
+            link_dirs: Vec::new(),
+            allow_ffi: true,
         }
     }
 }
@@ -647,8 +668,8 @@ impl ZigCodegen {
                         BinaryOp::BitAnd => self.emit_line(&format!("{}.set({}, {} & {});", raw_obj, idx_temp, cur_str, val_str)),
                         BinaryOp::BitOr => self.emit_line(&format!("{}.set({}, {} | {});", raw_obj, idx_temp, cur_str, val_str)),
                         BinaryOp::BitXor => self.emit_line(&format!("{}.set({}, {} ^ {});", raw_obj, idx_temp, cur_str, val_str)),
-                        BinaryOp::Shl => self.emit_line(&format!("{}.set({}, {} << @as(u6, @intCast({} & 63)));", raw_obj, idx_temp, cur_str, val_str)),
-                        BinaryOp::Shr => self.emit_line(&format!("{}.set({}, {} >> @as(u6, @intCast({} & 63)));", raw_obj, idx_temp, cur_str, val_str)),
+                        BinaryOp::Shl => self.emit_line(&format!("{}.set({}, (@as(i64, {}) << @as(u6, @intCast({} & 63))));", raw_obj, idx_temp, cur_str, val_str)),
+                        BinaryOp::Shr => self.emit_line(&format!("{}.set({}, (@as(i64, {}) >> @as(u6, @intCast({} & 63))));", raw_obj, idx_temp, cur_str, val_str)),
                         BinaryOp::Concat => self.emit_line(&format!("{}.set({}, try __lust_str_concat({}, {}));", raw_obj, idx_temp, cur_str, val_str)),
                         _ => self.emit_line(&format!("{}.set({}, {});", raw_obj, idx_temp, val_str)),
                     }
@@ -665,8 +686,8 @@ impl ZigCodegen {
                         BinaryOp::BitAnd => self.emit_line(&format!("{} = {} & {};", target_str, target_str, val_str)),
                         BinaryOp::BitOr => self.emit_line(&format!("{} = {} | {};", target_str, target_str, val_str)),
                         BinaryOp::BitXor => self.emit_line(&format!("{} = {} ^ {};", target_str, target_str, val_str)),
-                        BinaryOp::Shl => self.emit_line(&format!("{} = {} << @as(u6, @intCast({} & 63));", target_str, target_str, val_str)),
-                        BinaryOp::Shr => self.emit_line(&format!("{} = {} >> @as(u6, @intCast({} & 63));", target_str, target_str, val_str)),
+                        BinaryOp::Shl => self.emit_line(&format!("{} = (@as(i64, {}) << @as(u6, @intCast({} & 63)));", target_str, target_str, val_str)),
+                        BinaryOp::Shr => self.emit_line(&format!("{} = (@as(i64, {}) >> @as(u6, @intCast({} & 63)));", target_str, target_str, val_str)),
                         BinaryOp::Concat => self.emit_line(&format!("{} = try __lust_str_concat({}, {});", target_str, target_str, val_str)),
                         _ => self.emit_line(&format!("{} = {};", target_str, val_str)),
                     }
@@ -1081,6 +1102,44 @@ impl ZigCodegen {
         Ok(Some(call_str))
     }
 
+    fn emit_print_call(&mut self, args: &[Expr], is_println: bool) -> Result<String> {
+        if args.is_empty() {
+            return if is_println {
+                Ok("__lust_println(\"\")".to_string())
+            } else {
+                Ok("__lust_print(\"\")".to_string())
+            };
+        }
+        if args.len() == 1 {
+            let arg_str = self.emit_expr_to_string(&args[0])?;
+            return if is_println {
+                Ok(format!("__lust_println({})", arg_str))
+            } else {
+                Ok(format!("__lust_print({})", arg_str))
+            };
+        }
+        let label = self.next_temp_var();
+        let mut parts = Vec::new();
+        let mut tmp_vars = Vec::new();
+        for arg in args {
+            let tmp = self.next_temp_var();
+            let arg_str = self.emit_expr_to_string(arg)?;
+            parts.push(format!("const {tmp} = {arg_str}"));
+            tmp_vars.push(tmp);
+        }
+        for (i, tmp) in tmp_vars.iter().enumerate() {
+            if i > 0 {
+                parts.push("__lust_print(\"\\t\")".to_string());
+            }
+            parts.push(format!("__lust_print({tmp})"));
+        }
+        if is_println {
+            parts.push("__lust_print(\"\\n\")".to_string());
+        }
+        parts.push(format!("break :{label}"));
+        Ok(format!("{label}: {{ {}; }}", parts.join("; ")))
+    }
+
     fn emit_expr_to_string(&mut self, expr: &Expr) -> Result<String> {
         match &expr.kind {
             ExprKind::Literal(lit) => match lit {
@@ -1104,8 +1163,8 @@ impl ZigCodegen {
                     BinaryOp::BitAnd => Ok(format!("({} & {})", l_str, r_str)),
                     BinaryOp::BitOr => Ok(format!("({} | {})", l_str, r_str)),
                     BinaryOp::BitXor => Ok(format!("({} ^ {})", l_str, r_str)),
-                    BinaryOp::Shl => Ok(format!("({} << @as(u6, @intCast({} & 63)))", l_str, r_str)),
-                    BinaryOp::Shr => Ok(format!("({} >> @as(u6, @intCast({} & 63)))", l_str, r_str)),
+                    BinaryOp::Shl => Ok(format!("(@as(i64, {}) << @as(u6, @intCast({} & 63)))", l_str, r_str)),
+                    BinaryOp::Shr => Ok(format!("(@as(i64, {}) >> @as(u6, @intCast({} & 63)))", l_str, r_str)),
                     BinaryOp::Eq => Ok(format!("({} == {})", l_str, r_str)),
                     BinaryOp::Ne => Ok(format!("({} != {})", l_str, r_str)),
                     BinaryOp::Lt => Ok(format!("({} < {})", l_str, r_str)),
@@ -1239,16 +1298,10 @@ impl ZigCodegen {
                             }
                         }
                         "println" => {
-                            if let Some(arg) = args.first() {
-                                let arg_str = self.emit_expr_to_string(arg)?;
-                                return Ok(format!("__lust_println({})", arg_str));
-                            }
+                            return self.emit_print_call(args, true);
                         }
                         "print" => {
-                            if let Some(arg) = args.first() {
-                                let arg_str = self.emit_expr_to_string(arg)?;
-                                return Ok(format!("__lust_print({})", arg_str));
-                            }
+                            return self.emit_print_call(args, false);
                         }
                         "tostring" => {
                             if let Some(arg) = args.first() {
@@ -1273,15 +1326,9 @@ impl ZigCodegen {
                     let imported = self.imports.get(fn_name.as_str()).cloned();
                     if let Some(imported) = imported {
                         if imported == "std.io.print" || imported == "io.print" {
-                            if let Some(arg) = args.first() {
-                                let arg_str = self.emit_expr_to_string(arg)?;
-                                return Ok(format!("__lust_print({})", arg_str));
-                            }
+                            return self.emit_print_call(args, false);
                         } else if imported == "std.io.println" || imported == "io.println" {
-                            if let Some(arg) = args.first() {
-                                let arg_str = self.emit_expr_to_string(arg)?;
-                                return Ok(format!("__lust_println({})", arg_str));
-                            }
+                            return self.emit_print_call(args, true);
                         } else if imported.starts_with("std.math.") || imported.starts_with("math.") {
                             let math_fn = imported.rsplit('.').next().unwrap_or(fn_name.as_str());
                             if let Some(m_call) = self.emit_math_call(math_fn, args)? {
@@ -1477,13 +1524,11 @@ impl ZigCodegen {
                                 _ => {}
                             },
                             "io" => match field.as_str() {
-                                "print" if args.len() == 1 => {
-                                    let arg_str = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_print({})", arg_str));
+                                "print" => {
+                                    return self.emit_print_call(args, false);
                                 }
-                                "println" if args.len() == 1 => {
-                                    let arg_str = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_println({})", arg_str));
+                                "println" => {
+                                    return self.emit_print_call(args, true);
                                 }
                                 "read_file" if args.len() == 1 => {
                                     let path_str = self.emit_expr_to_string(&args[0])?;
@@ -1864,6 +1909,14 @@ impl ZigCodegen {
                             Ok(format!("({} == .{})", expr_str, variant))
                         } else {
                             Ok(format!("({} == .{})", expr_str, variant))
+                        }
+                    }
+                    Pattern::Literal(lit) => {
+                        match lit {
+                            Literal::String(s) => Ok(format!("std.mem.eql(u8, {}, \"{}\")", expr_str, s)),
+                            Literal::Integer(i) => Ok(format!("({} == {})", expr_str, i)),
+                            Literal::Float(f) => Ok(format!("({} == {})", expr_str, f)),
+                            Literal::Bool(b) => Ok(format!("({} == {})", expr_str, b)),
                         }
                     }
                     _ => Ok("true".to_string()),
@@ -2605,13 +2658,82 @@ fn c_type_from_lust(ty: &Type) -> String {
     }
 }
 
-/// Compiles a Zig source file to a native executable or library with full configuration.
+/// Checks whether the system `zig` compiler is installed and available in PATH.
+/// Can be explicitly disabled via `LUST_NO_ZIG=1` or `LUST_FORCE_AOT_NATIVE=1`.
+pub fn is_zig_available() -> bool {
+    let disabled = std::env::var("LUST_NO_ZIG")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+        || std::env::var("LUST_FORCE_AOT_NATIVE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    if disabled {
+        return false;
+    }
+    Command::new("zig")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Compiles a Zig source file to a native executable or library with default link options.
 pub fn compile_zig(
     zig_path: &Path,
     output_bin: &Path,
     opts: &CompileOptions,
     link_libc: bool,
 ) -> Result<PathBuf> {
+    compile_zig_with_links(zig_path, output_bin, opts, link_libc, &ZigLinkOptions::default())
+}
+
+/// Compiles a Zig source file to a native executable or library with full configuration and link options.
+/// If system `zig` is unavailable or disabled, seamlessly falls back to autonomous AOT compilation.
+pub fn compile_zig_with_links(
+    zig_path: &Path,
+    output_bin: &Path,
+    opts: &CompileOptions,
+    link_libc: bool,
+    link_opts: &ZigLinkOptions,
+) -> Result<PathBuf> {
+    if !link_opts.allow_ffi && (!link_opts.link_libraries.is_empty() || !link_opts.link_dirs.is_empty()) {
+        return Err(LustError::Unknown(
+            "CapabilityDenied: external library linking requires 'ffi' capability".to_string(),
+        ));
+    }
+
+    for lib in &link_opts.link_libraries {
+        if !lib.exists() {
+            return Err(LustError::Unknown(format!(
+                "missing external library at '{}'",
+                lib.display()
+            )));
+        }
+    }
+
+    if let Some(target) = opts.target_triple.as_deref() {
+        if target == "wasm32-wasip2" {
+            return Err(LustError::Unknown(
+                "offline-blocked: target 'wasm32-wasip2' is not installed offline".to_string(),
+            ));
+        }
+    }
+
+    if !is_zig_available() {
+        let aot_link_opts = aot::AotLinkOptions {
+            link_libraries: link_opts.link_libraries.clone(),
+            link_dirs: link_opts.link_dirs.clone(),
+            allow_ffi: link_opts.allow_ffi,
+        };
+        return aot::AotCompiler::compile_zig_fallback_with_links(
+            zig_path,
+            output_bin,
+            opts,
+            link_libc,
+            &aot_link_opts,
+        );
+    }
+
     let mut cmd = Command::new("zig");
     match opts.target_kind {
         BuildTargetKind::Executable => {
@@ -2632,10 +2754,22 @@ pub fn compile_zig(
         cmd.arg("-fstrip");
     }
     if let Some(target) = &opts.target_triple {
-        cmd.arg("-target").arg(target);
+        if target == "wasm32-wasi" || target == "wasm32-wasip1" {
+            cmd.arg("-target").arg("wasm32-wasi");
+        } else if target == "wasm32-unknown-unknown" {
+            cmd.arg("-target").arg("wasm32-freestanding");
+        } else {
+            cmd.arg("-target").arg(target);
+        }
     }
     if let Some(cache) = &opts.cache_dir {
         cmd.arg("--cache-dir").arg(cache);
+    }
+    for dir in &link_opts.link_dirs {
+        cmd.arg(format!("-L{}", dir.display()));
+    }
+    for lib in &link_opts.link_libraries {
+        cmd.arg(lib);
     }
     if link_libc {
         cmd.arg("-lc");

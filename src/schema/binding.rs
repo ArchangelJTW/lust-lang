@@ -192,14 +192,14 @@ impl StructSchemaBuilder {
         let ordinal = self.fields.len() as u16;
 
         let (tag, is_nullable, is_optional) = match &sch.ir {
-            SchemaIR::Nullable(inner) => {
-                let tag = ir_to_canonical_tag(inner);
-                (tag, true, false)
-            }
-            SchemaIR::Optional(inner) => {
-                let tag = ir_to_canonical_tag(inner);
-                (tag, true, true)
-            }
+            SchemaIR::Nullable(inner) => match &**inner {
+                SchemaIR::Optional(innermost) => (ir_to_canonical_tag(innermost), true, true),
+                _ => (ir_to_canonical_tag(inner), true, false),
+            },
+            SchemaIR::Optional(inner) => match &**inner {
+                SchemaIR::Nullable(innermost) => (ir_to_canonical_tag(innermost), true, true),
+                _ => (ir_to_canonical_tag(inner), false, true),
+            },
             other => (ir_to_canonical_tag(other), false, false),
         };
 
@@ -207,10 +207,12 @@ impl StructSchemaBuilder {
             .with_nullability(is_nullable, is_optional);
         self.fields.push(field_desc);
 
+        let (schema_ir, optional) = crate::schema::builder::unpack_optional(sch.ir);
+
         self.schema_fields.push(ObjectFieldIR {
             name: name_str,
-            schema: sch.ir,
-            optional: is_optional,
+            schema: schema_ir,
+            optional,
             default: None,
         });
 

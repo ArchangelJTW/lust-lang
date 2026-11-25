@@ -1,5 +1,22 @@
 use std::fmt;
 
+/// Category of validation error, differentiating codec syntax parse errors from schema constraint failures (DS-93).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ValidationErrorKind {
+    #[default]
+    Constraint,
+    Parse,
+}
+
+impl fmt::Display for ValidationErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValidationErrorKind::Constraint => write!(f, "Constraint"),
+            ValidationErrorKind::Parse => write!(f, "Parse"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationError {
     pub path: Vec<String>,
@@ -7,6 +24,7 @@ pub struct ValidationError {
     pub code: String,
     pub expected: Option<String>,
     pub received: Option<String>,
+    pub kind: ValidationErrorKind,
 }
 
 impl ValidationError {
@@ -17,7 +35,25 @@ impl ValidationError {
             code: code.into(),
             expected: None,
             received: None,
+            kind: ValidationErrorKind::Constraint,
         }
+    }
+
+    /// Construct a syntax or codec parse error.
+    pub fn parse(message: impl Into<String>, code: impl Into<String>) -> Self {
+        Self {
+            path: Vec::new(),
+            message: message.into(),
+            code: code.into(),
+            expected: None,
+            received: None,
+            kind: ValidationErrorKind::Parse,
+        }
+    }
+
+    pub fn with_kind(mut self, kind: ValidationErrorKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     pub fn with_expected(mut self, expected: impl Into<String>) -> Self {
@@ -28,6 +64,14 @@ impl ValidationError {
     pub fn with_received(mut self, received: impl Into<String>) -> Self {
         self.received = Some(received.into());
         self
+    }
+
+    pub fn is_parse(&self) -> bool {
+        matches!(self.kind, ValidationErrorKind::Parse)
+    }
+
+    pub fn is_constraint(&self) -> bool {
+        matches!(self.kind, ValidationErrorKind::Constraint)
     }
 
     pub fn path_string(&self) -> String {
@@ -69,6 +113,14 @@ impl ValidationErrors {
 
     pub fn len(&self) -> usize {
         self.errors.len()
+    }
+
+    pub fn has_parse_error(&self) -> bool {
+        self.errors.iter().any(|e| e.is_parse())
+    }
+
+    pub fn has_constraint_error(&self) -> bool {
+        self.errors.iter().any(|e| e.is_constraint())
     }
 }
 

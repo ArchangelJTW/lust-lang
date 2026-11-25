@@ -14,7 +14,7 @@ pub(super) struct PortableRng {
 }
 
 impl PortableRng {
-    fn from_seed(seed: u64) -> Self {
+    pub(super) fn from_seed(seed: u64) -> Self {
         let mut splitmix = seed;
         let mut state = [0; 4];
         for word in &mut state {
@@ -89,7 +89,7 @@ impl VM {
     /// Set the script-visible random stream to an explicit deterministic seed.
     /// This is reproducible, but does not make the stream cryptographically safe.
     pub fn set_random_seed(&mut self, seed: u64) {
-        self.random_rng = Some(PortableRng::from_seed(seed));
+        self.set_seed(seed);
     }
 
     pub(crate) fn random_value(
@@ -97,10 +97,11 @@ impl VM {
         lower: Option<&Value>,
         upper: Option<&Value>,
     ) -> Result<Value, String> {
-        if self.random_rng.is_none() {
-            self.random_rng = Some(PortableRng::from_entropy()?);
+        let mut rng_slot = self.random_rng.borrow_mut();
+        if rng_slot.is_none() {
+            *rng_slot = Some(PortableRng::from_entropy()?);
         }
-        let rng = self.random_rng.as_mut().expect("RNG was initialized");
+        let rng = rng_slot.as_mut().expect("RNG was initialized");
 
         match (lower, upper) {
             (None, _) => Ok(Value::Float(rng.random_float())),

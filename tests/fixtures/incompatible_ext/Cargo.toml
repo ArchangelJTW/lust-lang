@@ -1,0 +1,21 @@
+[package]
+name = "incompatible_ext"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["version_mismatch"]
+version_mismatch = []
+missing_manifest = []
+corrupt_manifest = []
+null_manifest = []
+same_version_legacy_raw_vm = []
+malformed_scalar_metadata = []
+hanging_constructor = []
+hanging_callback = []
+duplicate_export = []
+
+[workspace]

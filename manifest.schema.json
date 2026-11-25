@@ -1,0 +1,59 @@
+{
+  "manifest_version": "1.0.0",
+  "name": "lust-data-formats-and-schemas",
+  "phase": 3,
+  "sprints": ["12A", "12B", "12C", "12D", "12E", "12F"],
+  "spec_contracts": "docs/schema/CONTRACTS_V1.md",
+  "test_profile": "tests/schema/profile-v1.json",
+  "repositories": {
+    "evaluation_root": {
+      "path": "/Users/vedmalex/work/lust-lang",
+      "branch": "main"
+    },
+    "compiler_fork": {
+      "path": "/Users/vedmalex/work/lust-lang/repos/lust-lang-fork",
+      "branch": "perf/10x-jit-optimization-suite"
+    }
+  },
+  "modules": [
+    {
+      "name": "@std/schema",
+      "status": "planned",
+      "dsl": "fluent",
+      "path": "repos/lust-lang-fork/src/schema/"
+    },
+    {
+      "name": "@std/regex",
+      "status": "planned",
+      "engine": "regex-automata-onepass-dfa",
+      "path": "repos/lust-lang-fork/src/regex/"
+    },
+    {
+      "name": "@std/data",
+      "status": "planned",
+      "formats": ["json", "jsonc", "jsonl", "bson", "yaml", "toon"],
+      "path": "repos/lust-lang-fork/src/data/"
+    },
+    {
+      "name": "@std/model",
+      "status": "planned",
+      "contracts": ["entity", "primary_key", "column_mapping", "hooks"],
+      "path": "repos/lust-lang-fork/src/model/"
+    }
+  ],
+  "gates": [
+    "Gate-SCHEMA-01",
+    "Gate-SCHEMA-02",
+    "Gate-SCHEMA-03",
+    "Gate-SCHEMA-04",
+    "Gate-SCHEMA-05",
+    "Gate-SCHEMA-06",
+    "Gate-SCHEMA-07",
+    "Gate-SCHEMA-08",
+    "Gate-SCHEMA-09",
+    "Gate-SCHEMA-10",
+    "Gate-SCHEMA-11",
+    "Gate-SCHEMA-12",
+    "Gate-SCHEMA-13"
+  ]
+}

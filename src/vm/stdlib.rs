@@ -8,10 +8,11 @@ use crate::config::LustConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::lua_compat::register_lust_function;
 use regex::Regex;
-use std::fs;
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::io::{self, Read, Write};
+use std::path::Path;
 use std::rc::Rc;
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)> {
@@ -28,8 +29,90 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
         ("map", create_map_module(vm)),
         ("math", create_math_module(vm)),
         ("effect", create_effect_module(vm)),
+        ("rx", create_rx_module(vm)),
+        ("test", crate::stdlib::rx_test_bridge::create_test_module(vm)),
+        ("random", create_random_module(vm)),
+        ("bit", create_bit_module(vm)),
+        ("bitwise", create_bit_module(vm)),
 
         // Direct qualified entries for imported symbols
+        ("random.int_effect", create_random_int_effect_fn()),
+        ("random.float_effect", create_random_float_effect_fn()),
+        ("random.bool_effect", create_random_bool_effect_fn()),
+        ("random.bytes_effect", create_random_bytes_effect_fn()),
+        ("io.read_file_effect", create_io_read_file_effect_fn()),
+        ("io.write_file_effect", create_io_write_file_effect_fn()),
+        ("io.exists_effect", create_io_exists_effect_fn()),
+        ("io.remove_file_effect", create_io_remove_file_effect_fn()),
+        ("io.create_dir_all_effect", create_io_create_dir_all_effect_fn()),
+        ("io.read_dir_effect", create_io_read_dir_effect_fn()),
+        ("io.open_scoped", create_io_open_scoped_fn()),
+        ("io.read_handle", create_io_read_handle_fn()),
+        ("io.write_handle", create_io_write_handle_fn()),
+        ("io.close_handle", create_io_close_handle_fn()),
+        ("os.getenv_effect", create_os_getenv_effect_fn()),
+        ("os.setenv_effect", create_os_setenv_effect_fn()),
+        ("os.now_ms_effect", create_os_now_ms_effect_fn()),
+        ("os.args_effect", create_os_args_effect_fn()),
+        ("rx.Subject", create_rx_subject_fn()),
+        ("rx.Observable", create_rx_observable_fn()),
+        ("rx.from_iter", crate::stdlib::rx_test_bridge::create_rx_observable_fn()),
+        ("rx.interval", create_rx_interval_fn()),
+        ("rx.Scheduler", crate::stdlib::rx_test_bridge::create_rx_scheduler_fn()),
+        ("rx.advance_by", crate::stdlib::rx_test_bridge::create_rx_advance_by_fn()),
+        ("rx.unsubscribe", crate::stdlib::rx_test_bridge::create_rx_unsubscribe_fn()),
+        ("rx.join", crate::stdlib::rx_test_bridge::create_rx_join_fn()),
+        ("rx.BoundedQueue", crate::stdlib::rx_test_bridge::create_rx_bounded_queue_fn()),
+        ("rx.BufferOptions", crate::stdlib::rx_test_bridge::create_rx_buffer_options_fn()),
+        ("rx.default_buffer_options", crate::stdlib::rx_test_bridge::create_rx_default_buffer_options_fn()),
+        ("rx.push", crate::stdlib::rx_test_bridge::create_rx_push_fn()),
+        ("rx.pop", crate::stdlib::rx_test_bridge::create_rx_pop_fn()),
+        ("rx.dequeue", crate::stdlib::rx_test_bridge::create_rx_pop_fn()),
+        ("rx.dropped_count", crate::stdlib::rx_test_bridge::create_rx_dropped_count_fn()),
+        ("rx.len", crate::stdlib::rx_test_bridge::create_rx_len_fn()),
+        ("rx.used_bytes", crate::stdlib::rx_test_bridge::create_rx_used_bytes_fn()),
+        ("rx.subject_subscribe", crate::stdlib::rx_test_bridge::create_rx_subject_subscribe_fn()),
+        ("rx.subject_subscribe_with", crate::stdlib::rx_test_bridge::create_rx_subject_subscribe_with_fn()),
+        ("rx.next", crate::stdlib::rx_test_bridge::create_rx_next_fn()),
+        ("rx.complete", crate::stdlib::rx_test_bridge::create_rx_complete_fn()),
+        ("rx.filter", crate::stdlib::rx_test_bridge::create_rx_filter_fn()),
+        ("rx.map", crate::stdlib::rx_test_bridge::create_rx_map_fn()),
+        ("rx.take", crate::stdlib::rx_test_bridge::create_rx_take_fn()),
+        ("rx.subscribe", crate::stdlib::rx_test_bridge::create_rx_subscribe_fn()),
+        ("rx.subscribe_with", crate::stdlib::rx_test_bridge::create_rx_subscribe_with_fn()),
+        ("test.clock_new", crate::stdlib::rx_test_bridge::create_test_clock_new_fn()),
+        ("test.clock_now_ms", crate::stdlib::rx_test_bridge::create_test_clock_now_ms_fn()),
+        ("test.clock_schedule", crate::stdlib::rx_test_bridge::create_test_clock_schedule_fn()),
+        ("test.clock_adjust", crate::stdlib::rx_test_bridge::create_test_clock_adjust_fn()),
+        ("test.clock_pending_count", crate::stdlib::rx_test_bridge::create_test_clock_pending_count_fn()),
+        ("test.schedule_exponential", crate::stdlib::rx_test_bridge::create_test_schedule_exponential_fn()),
+        ("test.schedule_step", crate::stdlib::rx_test_bridge::create_test_schedule_step_fn()),
+        ("test.mock_new", crate::stdlib::rx_test_bridge::create_test_mock_new_fn()),
+        ("test.mock_set_response", crate::stdlib::rx_test_bridge::create_test_mock_set_response_fn()),
+        ("test.mock_record_call", crate::stdlib::rx_test_bridge::create_test_mock_record_call_fn()),
+        ("test.mock_call_count", crate::stdlib::rx_test_bridge::create_test_mock_call_count_fn()),
+        ("test.mock_last_call", crate::stdlib::rx_test_bridge::create_test_mock_last_call_fn()),
+        ("test.projection_new", crate::stdlib::rx_test_bridge::create_test_projection_new_fn()),
+        ("test.projection_get", crate::stdlib::rx_test_bridge::create_test_projection_get_fn()),
+        ("test.resource_new", crate::stdlib::rx_test_bridge::create_test_resource_new_fn()),
+        ("test.resource_is_active", crate::stdlib::rx_test_bridge::create_test_resource_is_active_fn()),
+        ("test.scope_new", crate::stdlib::rx_test_bridge::create_test_scope_new_fn()),
+        ("test.scope_is_open", crate::stdlib::rx_test_bridge::create_test_scope_is_open_fn()),
+        ("test.scope_teardown_state", crate::stdlib::rx_test_bridge::create_test_scope_teardown_state_fn()),
+        ("test.scope_admission_state", crate::stdlib::rx_test_bridge::create_test_scope_admission_state_fn()),
+        ("test.scope_register_finalizer", crate::stdlib::rx_test_bridge::create_test_scope_register_finalizer_fn()),
+        ("test.scope_register_child", crate::stdlib::rx_test_bridge::create_test_scope_register_child_fn()),
+        ("test.scope_begin_teardown", crate::stdlib::rx_test_bridge::create_test_scope_begin_teardown_fn()),
+        ("test.scope_mark_joining", crate::stdlib::rx_test_bridge::create_test_scope_mark_joining_fn()),
+        ("test.scope_current_releases", crate::stdlib::rx_test_bridge::create_test_scope_current_releases_fn()),
+        ("test.scope_finalize", crate::stdlib::rx_test_bridge::create_test_scope_finalize_fn()),
+        ("test.fiber_new", crate::stdlib::rx_test_bridge::create_test_fiber_new_fn()),
+        ("test.fiber_set_state", crate::stdlib::rx_test_bridge::create_test_fiber_set_state_fn()),
+        ("test.fiber_enter_mask", crate::stdlib::rx_test_bridge::create_test_fiber_enter_mask_fn()),
+        ("test.fiber_exit_mask", crate::stdlib::rx_test_bridge::create_test_fiber_exit_mask_fn()),
+        ("test.fiber_is_masked", crate::stdlib::rx_test_bridge::create_test_fiber_is_masked_fn()),
+        ("test.fiber_request_interrupt", crate::stdlib::rx_test_bridge::create_test_fiber_request_interrupt_fn()),
+        ("test.fiber_state", crate::stdlib::rx_test_bridge::create_test_fiber_state_fn()),
         ("effect.succeed", create_effect_succeed_fn()),
         ("effect.fail", create_effect_fail_fn()),
         ("effect.die", create_effect_die_fn()),
@@ -61,17 +144,33 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
         ("math.mod", create_math_mod_fn()),
         ("math.random", create_math_random_fn()),
         ("math.randomseed", create_math_randomseed_fn()),
+        ("math.pow", create_math_pow_fn()),
+        ("bit.band", create_bit_band_fn()),
+        ("bit.bor", create_bit_bor_fn()),
+        ("bit.bxor", create_bit_bxor_fn()),
+        ("bit.bnot", create_bit_bnot_fn()),
+        ("bit.lshift", create_bit_lshift_fn()),
+        ("bit.rshift", create_bit_rshift_fn()),
+        ("bit.arshift", create_bit_arshift_fn()),
+        ("bitwise.band", create_bit_band_fn()),
+        ("bitwise.bor", create_bit_bor_fn()),
+        ("bitwise.bxor", create_bit_bxor_fn()),
+        ("bitwise.bnot", create_bit_bnot_fn()),
+        ("bitwise.lshift", create_bit_lshift_fn()),
+        ("bitwise.rshift", create_bit_rshift_fn()),
+        ("bitwise.arshift", create_bit_arshift_fn()),
 
-        ("table.len", create_array_len_fn()),
-        ("table.is_empty", create_array_is_empty_fn()),
-        ("table.get", create_array_get_fn()),
+        ("table.len", create_table_len_fn()),
+        ("table.is_empty", create_table_is_empty_fn()),
+        ("table.get", create_table_get_fn()),
+        ("table.set", create_table_set_fn()),
         ("table.first", create_array_first_fn()),
         ("table.last", create_array_last_fn()),
         ("table.push", create_array_push_fn()),
         ("table.pop", create_array_pop_fn()),
         ("table.insert", create_table_insert_fn()),
         ("table.remove", create_table_remove_fn()),
-        ("table.clear", create_array_clear_fn()),
+        ("table.clear", create_table_clear_fn()),
         ("table.slice", create_array_slice_fn()),
         ("table.concat", create_array_concat_fn()),
         ("table.sort", create_array_sort_fn()),
@@ -82,10 +181,12 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
         ("table.reduce", create_array_reduce_fn()),
         ("table.iter", create_array_iter_fn()),
         ("table.unpack", create_table_unpack_fn()),
+        ("table.move", create_table_move_fn()),
 
         ("array.len", create_array_len_fn()),
         ("array.is_empty", create_array_is_empty_fn()),
         ("array.get", create_array_get_fn()),
+        ("array.set", create_array_set_fn()),
         ("array.first", create_array_first_fn()),
         ("array.last", create_array_last_fn()),
         ("array.push", create_array_push_fn()),
@@ -102,6 +203,7 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
         ("array.filter", create_array_filter_fn()),
         ("array.reduce", create_array_reduce_fn()),
         ("array.iter", create_array_iter_fn()),
+        ("array.unpack", create_array_unpack_fn()),
 
         ("string.len", create_string_len_fn()),
         ("string.sub", create_string_sub_fn()),
@@ -119,6 +221,15 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
         ("string.ends_with", create_string_ends_with_fn()),
         ("string.contains", create_string_contains_fn()),
         ("string.replace", create_string_replace_fn()),
+        ("string.match", create_string_match_fn()),
+        ("string.gsub", create_string_gsub_fn()),
+        ("string.trim_start", create_string_trim_start_fn()),
+        ("string.trim_end", create_string_trim_end_fn()),
+        ("string.is_empty", create_string_is_empty_fn()),
+        ("string.chars", create_string_chars_fn()),
+        ("string.lines", create_string_lines_fn()),
+        ("string.slice", create_string_slice_fn()),
+        ("string.index_of", create_string_index_of_fn()),
 
         ("map.len", create_map_len_fn()),
         ("map.is_empty", create_map_is_empty_fn()),
@@ -144,12 +255,21 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
 
 fn create_print_fn() -> Value {
     Value::NativeFunction(native_fn(|args: &[Value]| {
+        let mut text = String::new();
         for (i, arg) in args.iter().enumerate() {
             if i > 0 {
-                print!("\t");
+                text.push('\t');
             }
+            use core::fmt::Write;
+            let _ = write!(text, "{}", arg);
+        }
 
-            print!("{}", arg);
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            unsafe {
+                (*vm_ptr).console.write_stdout(text.as_bytes());
+            }
+        } else {
+            print!("{}", text);
         }
 
         Ok(NativeCallResult::Return(Value::Nil))
@@ -158,15 +278,24 @@ fn create_print_fn() -> Value {
 
 fn create_println_fn() -> Value {
     Value::NativeFunction(native_fn(|args: &[Value]| {
+        let mut text = String::new();
         for (i, arg) in args.iter().enumerate() {
             if i > 0 {
-                print!("\t");
+                text.push('\t');
             }
+            use core::fmt::Write;
+            let _ = write!(text, "{}", arg);
+        }
+        text.push('\n');
 
-            print!("{}", arg);
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            unsafe {
+                (*vm_ptr).console.write_stdout(text.as_bytes());
+            }
+        } else {
+            print!("{}", text);
         }
 
-        println!();
         Ok(NativeCallResult::Return(Value::Nil))
     }))
 }
@@ -284,6 +413,16 @@ fn create_io_module(vm: &VM) -> Value {
         (string_key("read_stdin"), create_io_read_stdin_fn()),
         (string_key("read_line"), create_io_read_line_fn()),
         (string_key("write_stdout"), create_io_write_stdout_fn()),
+        (string_key("read_file_effect"), create_io_read_file_effect_fn()),
+        (string_key("write_file_effect"), create_io_write_file_effect_fn()),
+        (string_key("exists_effect"), create_io_exists_effect_fn()),
+        (string_key("remove_file_effect"), create_io_remove_file_effect_fn()),
+        (string_key("create_dir_all_effect"), create_io_create_dir_all_effect_fn()),
+        (string_key("read_dir_effect"), create_io_read_dir_effect_fn()),
+        (string_key("open_scoped"), create_io_open_scoped_fn()),
+        (string_key("read_handle"), create_io_read_handle_fn()),
+        (string_key("write_handle"), create_io_write_handle_fn()),
+        (string_key("close_handle"), create_io_close_handle_fn()),
     ];
     vm.map_with_entries(entries)
 }
@@ -304,7 +443,8 @@ fn create_io_read_file_fn() -> Value {
                 ))));
             }
         };
-        match fs::read_to_string(path) {
+        let vfs = crate::vfs::current_vfs();
+        match vfs.read_to_string(Path::new(path)) {
             Ok(contents) => Ok(NativeCallResult::Return(Value::ok(Value::string(contents)))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
@@ -330,7 +470,8 @@ fn create_io_read_file_bytes_fn() -> Value {
             }
         };
 
-        match fs::read(path) {
+        let vfs = crate::vfs::current_vfs();
+        match vfs.read(Path::new(path)) {
             Ok(bytes) => {
                 let values: Vec<Value> = bytes
                     .into_iter()
@@ -363,18 +504,22 @@ fn create_io_read_dir_fn() -> Value {
             }
         };
 
-        let entries = fs::read_dir(path).and_then(|entries| {
-            entries
-                .map(|entry| {
-                    entry.map(|entry| {
-                        Value::string(entry.file_name().to_string_lossy().into_owned())
+        let vfs = crate::vfs::current_vfs();
+        match vfs.read_dir(Path::new(path)) {
+            Ok(entries) => {
+                let names = entries
+                    .into_iter()
+                    .map(|entry| {
+                        Value::string(
+                            entry
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                        )
                     })
-                })
-                .collect::<std::io::Result<Vec<_>>>()
-        });
-
-        match entries {
-            Ok(names) => Ok(NativeCallResult::Return(Value::ok(Value::array(names)))),
+                    .collect::<Vec<_>>();
+                Ok(NativeCallResult::Return(Value::ok(Value::array(names))))
+            }
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
             )))),
@@ -403,7 +548,8 @@ fn create_io_write_file_fn() -> Value {
         } else {
             format!("{}", args[1])
         };
-        match fs::write(path, contents) {
+        let vfs = crate::vfs::current_vfs();
+        match vfs.write(Path::new(path), contents.as_bytes()) {
             Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
@@ -420,12 +566,32 @@ fn create_io_read_stdin_fn() -> Value {
             ))));
         }
 
-        let mut buffer = String::new();
-        match io::stdin().read_to_string(&mut buffer) {
-            Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::string(buffer)))),
-            Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
-                err.to_string(),
-            )))),
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let mut buf = Vec::new();
+            unsafe {
+                let mut temp = [0u8; 1024];
+                loop {
+                    match (*vm_ptr).console.read_stdin(&mut temp) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&temp[..n]),
+                        Err(e) => {
+                            return Ok(NativeCallResult::Return(Value::err(Value::string(
+                                e.to_string(),
+                            ))));
+                        }
+                    }
+                }
+            }
+            let s = String::from_utf8_lossy(&buf).into_owned();
+            Ok(NativeCallResult::Return(Value::ok(Value::string(s))))
+        } else {
+            let mut buffer = String::new();
+            match io::stdin().read_to_string(&mut buffer) {
+                Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::string(buffer)))),
+                Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
+                    err.to_string(),
+                )))),
+            }
         }
     }))
 }
@@ -438,31 +604,49 @@ fn create_io_read_line_fn() -> Value {
             ))));
         }
 
-        let mut line = String::new();
-        match io::stdin().read_line(&mut line) {
-            Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::string(line)))),
-            Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
-                err.to_string(),
-            )))),
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            match unsafe { (*vm_ptr).console.read_line_stdin() } {
+                Ok(line) => Ok(NativeCallResult::Return(Value::ok(Value::string(line)))),
+                Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
+                    err.to_string(),
+                )))),
+            }
+        } else {
+            let mut line = String::new();
+            match io::stdin().read_line(&mut line) {
+                Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::string(line)))),
+                Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
+                    err.to_string(),
+                )))),
+            }
         }
     }))
 }
 
 fn create_io_write_stdout_fn() -> Value {
     Value::NativeFunction(native_fn(|args: &[Value]| {
-        let mut stdout = io::stdout();
-        for arg in args {
-            if let Err(err) = write!(stdout, "{}", arg) {
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            unsafe {
+                for arg in args {
+                    let s = format!("{}", arg);
+                    (*vm_ptr).console.write_stdout(s.as_bytes());
+                }
+            }
+        } else {
+            let mut stdout = io::stdout();
+            for arg in args {
+                if let Err(err) = write!(stdout, "{}", arg) {
+                    return Ok(NativeCallResult::Return(Value::err(Value::string(
+                        err.to_string(),
+                    ))));
+                }
+            }
+
+            if let Err(err) = stdout.flush() {
                 return Ok(NativeCallResult::Return(Value::err(Value::string(
                     err.to_string(),
                 ))));
             }
-        }
-
-        if let Err(err) = stdout.flush() {
-            return Ok(NativeCallResult::Return(Value::err(Value::string(
-                err.to_string(),
-            ))));
         }
 
         Ok(NativeCallResult::Return(Value::ok(Value::Nil)))
@@ -472,6 +656,7 @@ fn create_io_write_stdout_fn() -> Value {
 fn create_os_module(vm: &VM) -> Value {
     let entries = [
         (string_key("time"), create_os_time_fn()),
+        (string_key("date"), create_os_date_fn()),
         (string_key("sleep"), create_os_sleep_fn()),
         (string_key("create_file"), create_os_create_file_fn()),
         (string_key("create_dir"), create_os_create_dir_fn()),
@@ -479,6 +664,13 @@ fn create_os_module(vm: &VM) -> Value {
         (string_key("remove_dir"), create_os_remove_dir_fn()),
         (string_key("rename"), create_os_rename_fn()),
         (string_key("get_env"), create_os_get_env_fn()),
+        (string_key("getenv"), create_os_get_env_fn()),
+        (string_key("set_env"), create_os_set_env_fn()),
+        (string_key("setenv"), create_os_set_env_fn()),
+        (string_key("getenv_effect"), create_os_getenv_effect_fn()),
+        (string_key("setenv_effect"), create_os_setenv_effect_fn()),
+        (string_key("now_ms_effect"), create_os_now_ms_effect_fn()),
+        (string_key("args_effect"), create_os_args_effect_fn()),
     ];
     vm.map_with_entries(entries)
 }
@@ -491,13 +683,89 @@ fn create_os_time_fn() -> Value {
             ))));
         }
 
-        let now = SystemTime::now();
-        let seconds = match now.duration_since(UNIX_EPOCH) {
-            Ok(duration) => duration.as_secs_f64(),
-            Err(err) => -(err.duration().as_secs_f64()),
+        let seconds = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            unsafe {
+                let vm = &*vm_ptr;
+                vm.clock.now_epoch_secs_f64()
+            }
+        } else {
+            let now = SystemTime::now();
+            match now.duration_since(UNIX_EPOCH) {
+                Ok(duration) => duration.as_secs_f64(),
+                Err(err) => -(err.duration().as_secs_f64()),
+            }
         };
 
         Ok(NativeCallResult::Return(Value::Float(seconds)))
+    }))
+}
+
+fn create_os_date_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let format_opt = if !args.is_empty() {
+            match &args[0] {
+                Value::Nil => None,
+                Value::String(s) => Some(s.as_str()),
+                _ => {
+                    return Ok(NativeCallResult::Return(Value::err(Value::string(
+                        "os.date(format, time) expects a string format",
+                    ))));
+                }
+            }
+        } else {
+            None
+        };
+
+        let epoch_seconds = if args.len() >= 2 {
+            match args[1].as_float() {
+                Some(s) => s as i64,
+                None => match args[1].as_int() {
+                    Some(i) => i,
+                    None => {
+                        return Ok(NativeCallResult::Return(Value::err(Value::string(
+                            "os.date(format, time) expects numeric time",
+                        ))));
+                    }
+                },
+            }
+        } else if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            unsafe {
+                let vm = &*vm_ptr;
+                (vm.clock.now_epoch_nanos() / 1_000_000_000) as i64
+            }
+        } else {
+            let now = SystemTime::now();
+            match now.duration_since(UNIX_EPOCH) {
+                Ok(d) => d.as_secs() as i64,
+                Err(e) => -(e.duration().as_secs() as i64),
+            }
+        };
+
+        let civil = crate::sim::clock::epoch_secs_to_civil(epoch_seconds);
+        let fmt_str = format_opt.unwrap_or("%Y-%m-%d %H:%M:%S");
+
+        if fmt_str == "*t" || fmt_str == "!*t" {
+            if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+                let vm = unsafe { &*vm_ptr };
+                let entries = [
+                    (string_key("year"), Value::Int(civil.year as i64)),
+                    (string_key("month"), Value::Int(civil.month as i64)),
+                    (string_key("day"), Value::Int(civil.day as i64)),
+                    (string_key("hour"), Value::Int(civil.hour as i64)),
+                    (string_key("min"), Value::Int(civil.min as i64)),
+                    (string_key("sec"), Value::Int(civil.sec as i64)),
+                    (string_key("wday"), Value::Int(civil.wday as i64)),
+                    (string_key("yday"), Value::Int(civil.yday as i64)),
+                    (string_key("isdst"), Value::Bool(civil.isdst)),
+                ];
+                return Ok(NativeCallResult::Return(vm.map_with_entries(entries)));
+            } else {
+                return Ok(NativeCallResult::Return(Value::string(civil.format_default())));
+            }
+        }
+
+        let formatted = civil.format(fmt_str);
+        Ok(NativeCallResult::Return(Value::string(formatted)))
     }))
 }
 
@@ -530,9 +798,10 @@ fn create_os_sleep_fn() -> Value {
             ))));
         }
 
-        thread::sleep(Duration::from_secs_f64(seconds));
-
-        Ok(NativeCallResult::Return(Value::ok(Value::Nil)))
+        Ok(NativeCallResult::YieldTimer(
+            Duration::from_secs_f64(seconds),
+            Value::ok(Value::Nil),
+        ))
     }))
 }
 
@@ -552,17 +821,17 @@ fn create_os_create_file_fn() -> Value {
                 ))));
             }
         };
-        match fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            // An existing file is opened as is, not emptied.
-            .truncate(false)
-            .open(path)
-        {
-            Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
-            Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
-                err.to_string(),
-            )))),
+        let vfs = crate::vfs::current_vfs();
+        let path_obj = Path::new(path);
+        if !vfs.exists(path_obj) {
+            match vfs.write(path_obj, &[]) {
+                Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
+                Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
+                    err.to_string(),
+                )))),
+            }
+        } else {
+            Ok(NativeCallResult::Return(Value::ok(Value::Nil)))
         }
     }))
 }
@@ -583,7 +852,8 @@ fn create_os_create_dir_fn() -> Value {
                 ))));
             }
         };
-        match fs::create_dir_all(path) {
+        let vfs = crate::vfs::current_vfs();
+        match vfs.create_dir_all(Path::new(path)) {
             Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
@@ -608,7 +878,8 @@ fn create_os_remove_file_fn() -> Value {
                 ))));
             }
         };
-        match fs::remove_file(path) {
+        let vfs = crate::vfs::current_vfs();
+        match vfs.remove_file(Path::new(path)) {
             Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
@@ -633,7 +904,22 @@ fn create_os_remove_dir_fn() -> Value {
                 ))));
             }
         };
-        match fs::remove_dir_all(path) {
+        let vfs = crate::vfs::current_vfs();
+        let path_obj = Path::new(path);
+        let entries = match vfs.read_dir(path_obj) {
+            Ok(e) => e,
+            Err(err) => {
+                return Ok(NativeCallResult::Return(Value::err(Value::string(
+                    err.to_string(),
+                ))));
+            }
+        };
+        if !entries.is_empty() {
+            return Ok(NativeCallResult::Return(Value::err(Value::string(
+                "Directory not empty",
+            ))));
+        }
+        match vfs.remove_dir_all(path_obj) {
             Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
@@ -666,7 +952,8 @@ fn create_os_rename_fn() -> Value {
                 ))));
             }
         };
-        match fs::rename(from, to) {
+        let vfs = crate::vfs::current_vfs();
+        match vfs.rename(Path::new(from), Path::new(to)) {
             Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
@@ -677,15 +964,12 @@ fn create_os_rename_fn() -> Value {
 
 fn create_os_get_env_fn() -> Value {
     Value::NativeFunction(native_fn(|args: &[Value]| {
-        // check for one value in args
         if args.len() != 1 {
             return Ok(NativeCallResult::Return(Value::err(Value::string(
                 "os.get_env(name) requires a single string name",
             ))));
         }
 
-        // convert the value with as_string().
-        // return Lust Err if it is not a string
         let name = match args[0].as_string() {
             Some(p) => p,
             None => {
@@ -695,18 +979,53 @@ fn create_os_get_env_fn() -> Value {
             }
         };
 
-        // match on std::env::var(name)
-        match std::env::var(name) {
-            Ok(value) => Ok(NativeCallResult::Return(Value::ok(Value::some(
+        let val_opt = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            unsafe { (*vm_ptr).env.get(name) }
+        } else {
+            std::env::var(name).ok()
+        };
+
+        match val_opt {
+            Some(value) => Ok(NativeCallResult::Return(Value::ok(Value::some(
                 Value::string(value),
             )))),
-            Err(std::env::VarError::NotPresent) => {
-                Ok(NativeCallResult::Return(Value::ok(Value::none())))
-            }
-            Err(std::env::VarError::NotUnicode(_)) => Ok(NativeCallResult::Return(Value::err(
-                Value::string("os.get_env(name) found a value that is not valid Unicode"),
-            ))),
+            None => Ok(NativeCallResult::Return(Value::ok(Value::none()))),
         }
+    }))
+}
+
+fn create_os_set_env_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() != 2 {
+            return Ok(NativeCallResult::Return(Value::err(Value::string(
+                "os.set_env(name, value) requires two string arguments",
+            ))));
+        }
+
+        let name = match args[0].as_string() {
+            Some(p) => p,
+            None => {
+                return Ok(NativeCallResult::Return(Value::err(Value::string(
+                    "os.set_env(name, value) requires a string name",
+                ))));
+            }
+        };
+
+        let val = match args[1].as_string() {
+            Some(v) => v,
+            None => {
+                return Ok(NativeCallResult::Return(Value::err(Value::string(
+                    "os.set_env(name, value) requires a string value",
+                ))));
+            }
+        };
+
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            unsafe {
+                (*vm_ptr).env.set(name, val);
+            }
+        }
+        Ok(NativeCallResult::Return(Value::ok(Value::Nil)))
     }))
 }
 
@@ -788,15 +1107,15 @@ fn create_string_sub_fn() -> Value {
                 .as_int()
                 .unwrap_or(source.len() as LustInt)
         });
-        let (start_idx, end_idx) = normalize_range(start, end, source.len());
-        if start_idx >= source.len() || start_idx >= end_idx {
-            return Ok(NativeCallResult::Return(Value::string("")));
-        }
-        let slice = &source.as_bytes()[start_idx..end_idx.min(source.len())];
-        Ok(NativeCallResult::Return(Value::string(
-            String::from_utf8_lossy(slice),
-        )))
+        Ok(NativeCallResult::Return(Value::string(string_sub_slice(
+            source, start, end,
+        ))))
     }))
+}
+
+pub(crate) fn string_sub_slice(source: &str, start: LustInt, end: Option<LustInt>) -> Cow<'_, str> {
+    let (start, end) = normalize_range(start, end, source.len());
+    String::from_utf8_lossy(&source.as_bytes()[start..end])
 }
 
 fn create_string_byte_fn() -> Value {
@@ -812,17 +1131,19 @@ fn create_string_byte_fn() -> Value {
         let end = args
             .get(2)
             .map(|v| unwrap_lua_value(v.clone()).as_int().unwrap_or(start));
-        let (start_idx, end_idx) = normalize_range(start, end, source.len());
-        let bytes = source.as_bytes();
-        if start_idx >= bytes.len() || start_idx >= end_idx {
-            return return_lua_values(vec![lua_nil()]);
-        }
-        let mut values = Vec::new();
-        for b in &bytes[start_idx..end_idx.min(bytes.len())] {
-            values.push(Value::Int(*b as LustInt));
-        }
-        return_lua_values(values)
+        return_lua_values(string_byte_values(source, start, end))
     }))
+}
+
+pub(crate) fn string_byte_values(source: &str, start: LustInt, end: Option<LustInt>) -> Vec<Value> {
+    let (start, end) = normalize_range(start, end, source.len());
+    if start == end {
+        return vec![Value::Nil];
+    }
+    source.as_bytes()[start..end]
+        .iter()
+        .map(|&byte| Value::Int(LustInt::from(byte)))
+        .collect()
 }
 
 fn create_string_char_fn() -> Value {
@@ -863,43 +1184,45 @@ fn create_string_find_fn() -> Value {
             .get(3)
             .map(|v| matches!(unwrap_lua_value(v.clone()), Value::Bool(true)))
             .unwrap_or(false);
-        let (offset, _) = normalize_range(start, None, haystack.len());
-        if offset > haystack.len() {
-            return return_lua_values(vec![lua_nil()]);
-        }
-        let slice = haystack.get(offset..).unwrap_or("");
-        if plain {
-            if let Some(pos) = slice.find(pattern) {
+        return_lua_values(string_find_values(haystack, pattern, start, plain)?)
+    }))
+}
+
+pub(crate) fn string_find_values(
+    haystack: &str,
+    pattern: &str,
+    start: LustInt,
+    plain: bool,
+) -> Result<Vec<Value>, String> {
+    let (offset, _) = normalize_range(start, None, haystack.len());
+    let slice = haystack.get(offset..).unwrap_or("");
+    if plain {
+        return Ok(match slice.find(pattern) {
+            Some(pos) => {
                 let begin = offset + pos;
                 let end = begin + pattern.len().saturating_sub(1);
-                return return_lua_values(vec![
-                    Value::Int((begin as LustInt) + 1),
-                    Value::Int((end as LustInt) + 1),
-                ]);
+                vec![Value::Int(begin as LustInt + 1), Value::Int(end as LustInt + 1)]
             }
-            return return_lua_values(vec![lua_nil()]);
-        }
-        let regex = lua_pattern_to_regex(pattern)?;
-        if let Some(caps) = regex.captures(slice)
-            && let Some(mat) = caps.get(0)
-        {
-            let begin = offset + mat.start();
-            let end = offset + mat.end().saturating_sub(1);
-            let mut results: Vec<Value> = vec![
-                Value::Int((begin as LustInt) + 1),
-                Value::Int((end as LustInt) + 1),
-            ];
-            for idx in 1..caps.len() {
-                if let Some(c) = caps.get(idx) {
-                    results.push(Value::string(c.as_str()));
-                } else {
-                    results.push(lua_nil());
-                }
-            }
-            return return_lua_values(results);
-        }
-        return_lua_values(vec![lua_nil()])
-    }))
+            None => vec![Value::Nil],
+        });
+    }
+
+    with_lua_pattern_regex(pattern, |regex| {
+        let Some(caps) = regex.captures(slice) else {
+            return vec![Value::Nil];
+        };
+        let mat = caps.get(0).expect("captures include the full match");
+        let mut results = vec![
+            Value::Int((offset + mat.start()) as LustInt + 1),
+            Value::Int((offset + mat.end().saturating_sub(1)) as LustInt + 1),
+        ];
+        results.extend(
+            caps.iter()
+                .skip(1)
+                .map(|capture| capture.map_or(Value::Nil, |m| Value::string(m.as_str()))),
+        );
+        results
+    })
 }
 
 fn create_string_match_fn() -> Value {
@@ -967,30 +1290,26 @@ fn create_string_gsub_fn() -> Value {
         let pattern = pattern_val
             .as_string()
             .ok_or_else(|| "string.gsub expects a pattern string".to_string())?;
-        let regex = lua_pattern_to_regex(pattern)?;
         let max_repls = if limit < 0 { i64::MAX } else { limit };
-        enum Replacer {
-            String(String),
-            Func(Value),
-            Other(Value),
-        }
-        let replacer = match &repl {
-            Value::Enum(object)
-                if object.enum_name == "LuaValue" && object.variant == "Function" =>
-            {
-                Replacer::Func(repl.clone())
-            }
-            Value::Function(_) | Value::NativeFunction(_) | Value::Closure(_) => {
-                Replacer::Func(repl.clone())
-            }
-            _ => {
-                let unwrapped = unwrap_lua_value(repl.clone());
-                match unwrapped {
-                    Value::String(s) => Replacer::String(s.to_string()),
-                    other => Replacer::Other(other),
-                }
-            }
+        let callable = match &repl {
+            Value::Enum(object) => object.enum_name == "LuaValue" && object.variant == "Function",
+            Value::Function(_) | Value::NativeFunction(_) | Value::Closure(_) => true,
+            _ => false,
         };
+        let unwrapped = if callable {
+            Value::Nil
+        } else {
+            unwrap_lua_value(repl.clone())
+        };
+        if let Value::String(template) = &unwrapped {
+            let (output, count) = if limit < 0 {
+                string_gsub_fast(text, pattern, template)?
+            } else {
+                string_gsub_template(text, pattern, template, max_repls)?
+            };
+            return return_lua_values(vec![Value::string(output), Value::Int(count)]);
+        }
+        let regex = lua_pattern_to_regex(pattern)?;
         let mut last_end = 0;
         let mut count: i64 = 0;
         let mut output = String::new();
@@ -1000,9 +1319,8 @@ fn create_string_gsub_fn() -> Value {
             }
             let mat = caps.get(0).unwrap();
             output.push_str(&text[last_end..mat.start()]);
-            let replacement = match &replacer {
-                Replacer::String(template) => build_template_replacement(template.as_str(), &caps),
-                Replacer::Func(func_val) => VM::with_current(|vm| {
+            let replacement = if callable {
+                VM::with_current(|vm| {
                     let mut call_args = Vec::new();
                     if caps.len() > 1 {
                         for idx in 1..caps.len() {
@@ -1016,12 +1334,13 @@ fn create_string_gsub_fn() -> Value {
                         call_args.push(to_lua_value(vm, Value::string(m.as_str()))?);
                     }
                     let result = vm
-                        .call_value(func_val, call_args)
+                        .call_value(&repl, call_args)
                         .map_err(|e| e.to_string())?;
                     let first = unwrap_first_return(result);
                     Ok(first.to_string())
-                })?,
-                Replacer::Other(other) => other.to_string(),
+                })?
+            } else {
+                unwrapped.to_string()
             };
             output.push_str(&replacement);
             last_end = mat.end();
@@ -1100,13 +1419,18 @@ fn create_string_split_fn() -> Value {
             .as_ref()
             .and_then(|v| v.as_string())
             .unwrap_or_default();
-        let parts: Vec<Value> = if delimiter.is_empty() {
-            s.chars().map(|c| Value::string(c.to_string())).collect()
-        } else {
-            s.split(delimiter).map(Value::string).collect()
-        };
-        Ok(NativeCallResult::Return(Value::array(parts)))
+        Ok(NativeCallResult::Return(Value::array(string_split_values(
+            s, delimiter,
+        ))))
     }))
+}
+
+pub(crate) fn string_split_values(s: &str, delimiter: &str) -> Vec<Value> {
+    if delimiter.is_empty() {
+        s.chars().map(|c| Value::string(c.to_string())).collect()
+    } else {
+        s.split(delimiter).map(Value::string).collect()
+    }
 }
 
 fn create_string_trim_fn() -> Value {
@@ -1288,6 +1612,7 @@ fn create_array_module(vm: &VM) -> Value {
         (string_key("len"), create_array_len_fn()),
         (string_key("is_empty"), create_array_is_empty_fn()),
         (string_key("get"), create_array_get_fn()),
+        (string_key("set"), create_array_set_fn()),
         (string_key("first"), create_array_first_fn()),
         (string_key("last"), create_array_last_fn()),
         (string_key("push"), create_array_push_fn()),
@@ -1304,6 +1629,7 @@ fn create_array_module(vm: &VM) -> Value {
         (string_key("filter"), create_array_filter_fn()),
         (string_key("reduce"), create_array_reduce_fn()),
         (string_key("iter"), create_array_iter_fn()),
+        (string_key("unpack"), create_array_unpack_fn()),
     ];
     vm.map_with_entries(entries)
 }
@@ -1956,18 +2282,473 @@ fn create_table_remove_fn() -> Value {
     }))
 }
 
+fn create_table_len_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
+        match val {
+            Value::Array(arr) => {
+                let len = crate::bytecode::value::get_specialized_cached_len(&arr)
+                    .unwrap_or_else(|| arr.borrow().len());
+                Ok(NativeCallResult::Return(Value::Int(len as LustInt)))
+            }
+            Value::Map(m) => {
+                let len = m.borrow().len();
+                Ok(NativeCallResult::Return(Value::Int(len as LustInt)))
+            }
+            other => {
+                if let Some(data) = table_data(&other) {
+                    let len = match data {
+                        TableData::Array(a) => a.as_array().map(|v| v.len()).unwrap_or(0),
+                        TableData::Map(m) => m.as_map().map(|v| v.len()).unwrap_or(0),
+                    };
+                    Ok(NativeCallResult::Return(Value::Int(len as LustInt)))
+                } else {
+                    Err(format!(
+                        "table.len expects an array or map, got {:?}",
+                        other.type_of()
+                    ))
+                }
+            }
+        }
+    }))
+}
+
+fn create_table_is_empty_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
+        match val {
+            Value::Array(arr) => {
+                let is_empty = crate::bytecode::value::get_specialized_cached_len(&arr)
+                    .map(|l| l == 0)
+                    .unwrap_or_else(|| arr.borrow().is_empty());
+                Ok(NativeCallResult::Return(Value::Bool(is_empty)))
+            }
+            Value::Map(m) => {
+                let is_empty = m.borrow().is_empty();
+                Ok(NativeCallResult::Return(Value::Bool(is_empty)))
+            }
+            other => {
+                if let Some(data) = table_data(&other) {
+                    let is_empty = match data {
+                        TableData::Array(a) => a.as_array().map(|v| v.is_empty()).unwrap_or(true),
+                        TableData::Map(m) => m.as_map().map(|v| v.is_empty()).unwrap_or(true),
+                    };
+                    Ok(NativeCallResult::Return(Value::Bool(is_empty)))
+                } else {
+                    Err(format!(
+                        "table.is_empty expects an array or map, got {:?}",
+                        other.type_of()
+                    ))
+                }
+            }
+        }
+    }))
+}
+
+fn create_table_get_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 2 {
+            return Err("table.get requires collection and key".to_string());
+        }
+        let val = unwrap_lua_value(args[0].clone());
+        match val {
+            Value::Array(arr) => {
+                let index = args
+                    .get(1)
+                    .map(|v| unwrap_lua_value(v.clone()))
+                    .and_then(|v| v.as_int())
+                    .ok_or_else(|| "table.get expects an integer index for array".to_string())?;
+                if let Some(elem) = crate::bytecode::value::get_specialized_cached_element(&arr, index) {
+                    Ok(NativeCallResult::Return(Value::some(elem)))
+                } else if crate::bytecode::value::get_specialized_cached_len(&arr).is_some() {
+                    Ok(NativeCallResult::Return(Value::none()))
+                } else {
+                    let borrowed = arr.borrow();
+                    if index < 0 || (index as usize) >= borrowed.len() {
+                        Ok(NativeCallResult::Return(Value::none()))
+                    } else {
+                        Ok(NativeCallResult::Return(Value::some(
+                            borrowed[index as usize].clone(),
+                        )))
+                    }
+                }
+            }
+            Value::Map(m) => {
+                let key = ValueKey::from_value(&unwrap_lua_value(args[1].clone()));
+                let borrowed = m.borrow();
+                match borrowed.get(&key) {
+                    Some(v) => Ok(NativeCallResult::Return(Value::some(v.clone()))),
+                    None => Ok(NativeCallResult::Return(Value::none())),
+                }
+            }
+            other => {
+                if let Some(data) = table_data(&other) {
+                    match data {
+                        TableData::Array(a) => {
+                            let index = args
+                                .get(1)
+                                .map(|v| unwrap_lua_value(v.clone()))
+                                .and_then(|v| v.as_int())
+                                .ok_or_else(|| "table.get expects an integer index for array".to_string())?;
+                            let arr = a.as_array().unwrap_or_default();
+                            if index < 0 || (index as usize) >= arr.len() {
+                                Ok(NativeCallResult::Return(Value::none()))
+                            } else {
+                                Ok(NativeCallResult::Return(Value::some(arr[index as usize].clone())))
+                            }
+                        }
+                        TableData::Map(m) => {
+                            let map = m.as_map().unwrap_or_default();
+                            let key = ValueKey::from_value(&unwrap_lua_value(args[1].clone()));
+                            match map.get(&key) {
+                                Some(v) if !matches!(v, Value::Nil) => Ok(NativeCallResult::Return(Value::some(v.clone()))),
+                                _ => Ok(NativeCallResult::Return(Value::none())),
+                            }
+                        }
+                    }
+                } else {
+                    Err(format!(
+                        "table.get expects an array or map, got {:?}",
+                        other.type_of()
+                    ))
+                }
+            }
+        }
+    }))
+}
+
+fn create_table_set_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 3 {
+            return Err("table.set requires collection, key, and value".to_string());
+        }
+        let val = unwrap_lua_value(args[0].clone());
+        let new_val = args[2].clone();
+        match val {
+            Value::Array(arr) => {
+                let index = unwrap_lua_value(args[1].clone())
+                    .as_int()
+                    .ok_or_else(|| "table.set expects an integer index for array".to_string())?;
+                if let Some(res) = crate::bytecode::value::set_specialized_cached_element(&arr, index, &new_val) {
+                    res.map_err(|e| e)?;
+                } else {
+                    let mut borrowed = arr.borrow_mut();
+                    if index < 0 || (index as usize) >= borrowed.len() {
+                        return Err(format!(
+                            "Array index {} out of bounds (length: {})",
+                            index,
+                            borrowed.len()
+                        ));
+                    }
+                    borrowed[index as usize] = new_val.clone();
+                    crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
+                }
+                if !crate::vm::cycle::CycleCollector::is_leaf(&new_val) {
+                    let _ = VM::with_current(|vm| {
+                        vm.cycle_collector.record_mutation();
+                        Ok::<(), String>(())
+                    });
+                }
+                Ok(NativeCallResult::Return(Value::Nil))
+            }
+            Value::Map(m) => {
+                let key = ValueKey::from_value(&unwrap_lua_value(args[1].clone()));
+                let mut borrowed = m.borrow_mut();
+                if !borrowed.contains_key(&key) {
+                    VM::with_current(|vm| {
+                        vm.budgets
+                            .charge_map_entry_estimate()
+                            .map_err(|e| e.to_string())
+                    })?;
+                }
+                if !crate::vm::cycle::CycleCollector::is_leaf(&new_val) {
+                    let _ = VM::with_current(|vm| {
+                        vm.cycle_collector.record_mutation();
+                        Ok::<(), String>(())
+                    });
+                }
+                borrowed.insert(key, new_val);
+                Ok(NativeCallResult::Return(Value::Nil))
+            }
+            other => {
+                if let Some(map_val) = other.struct_get_field("table")
+                    && let Value::Map(m) = map_val
+                {
+                    let key = ValueKey::from_value(&unwrap_lua_value(args[1].clone()));
+                    let mut borrowed = m.borrow_mut();
+                    if !borrowed.contains_key(&key) {
+                        VM::with_current(|vm| {
+                            vm.budgets
+                                .charge_map_entry_estimate()
+                                .map_err(|e| e.to_string())
+                        })?;
+                    }
+                    borrowed.insert(key, new_val);
+                    Ok(NativeCallResult::Return(Value::Nil))
+                } else {
+                    Err(format!(
+                        "table.set expects an array or map, got {:?}",
+                        other.type_of()
+                    ))
+                }
+            }
+        }
+    }))
+}
+
+fn create_table_clear_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
+        match val {
+            Value::Array(arr) => {
+                crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
+                arr.borrow_mut().clear();
+                Ok(NativeCallResult::Return(Value::Nil))
+            }
+            Value::Map(m) => {
+                m.borrow_mut().clear();
+                Ok(NativeCallResult::Return(Value::Nil))
+            }
+            other => {
+                if let Some(map_val) = other.struct_get_field("table")
+                    && let Value::Map(m) = map_val
+                {
+                    m.borrow_mut().clear();
+                    Ok(NativeCallResult::Return(Value::Nil))
+                } else {
+                    Err(format!(
+                        "table.clear expects an array or map, got {:?}",
+                        other.type_of()
+                    ))
+                }
+            }
+        }
+    }))
+}
+
+fn create_table_move_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 4 {
+            return Err("table.move requires at least 4 arguments (a1, f, e, t [, a2])".to_string());
+        }
+        let a1_val = unwrap_lua_value(args[0].clone());
+        let f = unwrap_lua_value(args[1].clone())
+            .as_int()
+            .ok_or_else(|| "table.move expects integer start index (f)".to_string())?;
+        let e = unwrap_lua_value(args[2].clone())
+            .as_int()
+            .ok_or_else(|| "table.move expects integer end index (e)".to_string())?;
+        let t = unwrap_lua_value(args[3].clone())
+            .as_int()
+            .ok_or_else(|| "table.move expects integer destination index (t)".to_string())?;
+        let a2_val = if args.len() >= 5 {
+            unwrap_lua_value(args[4].clone())
+        } else {
+            a1_val.clone()
+        };
+
+        // (c) Inverted range (f > e): evaluates as a no-op; a2 is returned immediately without modifications
+        if f > e {
+            return Ok(NativeCallResult::Return(a2_val));
+        }
+
+        if f < 0 {
+            return Err("table.move source start index out of bounds".to_string());
+        }
+        if t < 0 {
+            return Err("table.move destination index out of bounds".to_string());
+        }
+
+        let Value::Array(arr1) = &a1_val else {
+            return Err(format!("table.move expects an array for a1, got {:?}", a1_val.type_of()));
+        };
+        let Value::Array(arr2) = &a2_val else {
+            return Err(format!("table.move expects an array for a2, got {:?}", a2_val.type_of()));
+        };
+
+        let f_usize = f as usize;
+        let e_usize = e as usize;
+        let t_usize = t as usize;
+        let count = e_usize - f_usize + 1;
+
+        if std::rc::Rc::ptr_eq(arr1, arr2) {
+            // Overlapping in-place copy
+            crate::bytecode::value::sync_specialized_array(arr1);
+            let mut borrowed = arr1.borrow_mut();
+            let a_len = borrowed.len();
+            if e_usize >= a_len {
+                return Err(format!(
+                    "table.move source range {}..={} out of bounds for array of length {}",
+                    f, e, a_len
+                ));
+            }
+            // (a) Target gaps are errors: If t > a2.len(), error
+            if t_usize > a_len {
+                return Err("Cannot move with index gap into dense Array".to_string());
+            }
+
+            let needed_len = t_usize + count;
+            // (b) Contiguous Tail Extension
+            if needed_len > a_len {
+                let old_cap = borrowed.capacity();
+                if needed_len > old_cap {
+                    let new_cap = needed_len.max(old_cap.saturating_mul(2));
+                    VM::with_current(|vm| {
+                        vm.charge_vec_growth::<Value>(old_cap, new_cap)
+                            .map_err(|err| err.to_string())
+                    })?;
+                }
+                borrowed.resize(needed_len, Value::Nil);
+            }
+
+            // (d) Overlapping in-place copy using memmove directionality
+            if t_usize > f_usize {
+                for i in (0..count).rev() {
+                    borrowed[t_usize + i] = borrowed[f_usize + i].clone();
+                }
+            } else {
+                for i in 0..count {
+                    borrowed[t_usize + i] = borrowed[f_usize + i].clone();
+                }
+            }
+            crate::bytecode::value::invalidate_specialized_array_cache(arr1.as_ptr() as usize);
+        } else {
+            // Distinct arrays a1 != a2
+            crate::bytecode::value::sync_specialized_array(arr1);
+            let source_slice = {
+                let borrowed1 = arr1.borrow();
+                let a1_len = borrowed1.len();
+                if e_usize >= a1_len {
+                    return Err(format!(
+                        "table.move source range {}..={} out of bounds for array of length {}",
+                        f, e, a1_len
+                    ));
+                }
+                borrowed1[f_usize..=e_usize].to_vec()
+            };
+
+            crate::bytecode::value::sync_specialized_array(arr2);
+            let mut borrowed2 = arr2.borrow_mut();
+            let a2_len = borrowed2.len();
+            if t_usize > a2_len {
+                return Err("Cannot move with index gap into dense Array".to_string());
+            }
+
+            let needed_len = t_usize + count;
+            if needed_len > a2_len {
+                let old_cap = borrowed2.capacity();
+                if needed_len > old_cap {
+                    let new_cap = needed_len.max(old_cap.saturating_mul(2));
+                    VM::with_current(|vm| {
+                        vm.charge_vec_growth::<Value>(old_cap, new_cap)
+                            .map_err(|err| err.to_string())
+                    })?;
+                }
+            }
+
+            for (i, elem) in source_slice.into_iter().enumerate() {
+                let dest_idx = t_usize + i;
+                if dest_idx < borrowed2.len() {
+                    borrowed2[dest_idx] = elem;
+                } else {
+                    borrowed2.push(elem);
+                }
+            }
+            crate::bytecode::value::invalidate_specialized_array_cache(arr2.as_ptr() as usize);
+        }
+
+        Ok(NativeCallResult::Return(a2_val))
+    }))
+}
+
+fn create_array_set_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 3 {
+            return Err("array.set requires array, index, and value".to_string());
+        }
+        let index = args[1]
+            .as_int()
+            .ok_or_else(|| "array.set expects an integer index".to_string())?;
+        match &args[0] {
+            Value::Array(arr) => {
+                let value = args[2].clone();
+                if let Some(res) = crate::bytecode::value::set_specialized_cached_element(arr, index, &value) {
+                    res.map_err(|e| e)?;
+                } else {
+                    let mut borrowed = arr.borrow_mut();
+                    if index < 0 || (index as usize) >= borrowed.len() {
+                        return Err(format!(
+                            "Array index {} out of bounds (length: {})",
+                            index,
+                            borrowed.len()
+                        ));
+                    }
+                    borrowed[index as usize] = value.clone();
+                    crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
+                }
+                if !crate::vm::cycle::CycleCollector::is_leaf(&args[2]) {
+                    let _ = VM::with_current(|vm| {
+                        vm.cycle_collector.record_mutation();
+                        Ok::<(), String>(())
+                    });
+                }
+                Ok(NativeCallResult::Return(Value::Nil))
+            }
+            other => Err(format!(
+                "array.set expects an array, got {:?}",
+                other.type_of()
+            )),
+        }
+    }))
+}
+
+pub(crate) fn create_array_unpack_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.is_empty() {
+            return Err("array.unpack expects an array".to_string());
+        }
+        let val = unwrap_lua_value(args[0].clone());
+        let seq = match val {
+            Value::Array(arr) => {
+                crate::bytecode::value::sync_specialized_array(&arr);
+                arr.borrow().clone()
+            }
+            other => return Err(format!("array.unpack expects an array, got {:?}", other.type_of())),
+        };
+        let start = args
+            .get(1)
+            .and_then(|v| unwrap_lua_value(v.clone()).as_int())
+            .unwrap_or(0);
+        let end = args
+            .get(2)
+            .and_then(|v| unwrap_lua_value(v.clone()).as_int())
+            .unwrap_or(if seq.is_empty() { -1 } else { (seq.len() - 1) as LustInt });
+        let start_idx = start.max(0) as usize;
+        let end_idx = if end < 0 { 0 } else { (end as usize) + 1 };
+        let mut values: Vec<Value> = Vec::new();
+        for (i, val) in seq.iter().enumerate() {
+            if i < start_idx || i >= end_idx {
+                continue;
+            }
+            values.push(val.clone());
+        }
+        Ok(NativeCallResult::Return(Value::array(values)))
+    }))
+}
+
 fn create_table_module(vm: &VM) -> Value {
     let entries = [
-        (string_key("len"), create_array_len_fn()),
-        (string_key("is_empty"), create_array_is_empty_fn()),
-        (string_key("get"), create_array_get_fn()),
+        (string_key("len"), create_table_len_fn()),
+        (string_key("is_empty"), create_table_is_empty_fn()),
+        (string_key("get"), create_table_get_fn()),
+        (string_key("set"), create_table_set_fn()),
         (string_key("first"), create_array_first_fn()),
         (string_key("last"), create_array_last_fn()),
         (string_key("push"), create_array_push_fn()),
         (string_key("pop"), create_array_pop_fn()),
         (string_key("insert"), create_table_insert_fn()),
         (string_key("remove"), create_table_remove_fn()),
-        (string_key("clear"), create_array_clear_fn()),
+        (string_key("clear"), create_table_clear_fn()),
         (string_key("slice"), create_array_slice_fn()),
         (string_key("concat"), create_array_concat_fn()),
         (string_key("sort"), create_array_sort_fn()),
@@ -1978,8 +2759,25 @@ fn create_table_module(vm: &VM) -> Value {
         (string_key("reduce"), create_array_reduce_fn()),
         (string_key("iter"), create_array_iter_fn()),
         (string_key("unpack"), create_table_unpack_fn()),
+        (string_key("move"), create_table_move_fn()),
     ];
     vm.map_with_entries(entries)
+}
+
+fn create_rx_module(vm: &VM) -> Value {
+    crate::stdlib::rx_test_bridge::create_rx_module(vm)
+}
+
+fn create_rx_subject_fn() -> Value {
+    crate::stdlib::rx_test_bridge::create_rx_subject_fn()
+}
+
+fn create_rx_observable_fn() -> Value {
+    crate::stdlib::rx_test_bridge::create_rx_observable_fn()
+}
+
+fn create_rx_interval_fn() -> Value {
+    crate::stdlib::rx_test_bridge::create_rx_interval_fn()
 }
 
 fn create_effect_module(vm: &VM) -> Value {
@@ -2221,6 +3019,539 @@ fn create_effect_run_sync_fn() -> Value {
     }))
 }
 
+fn extract_file_handle(val: &Value) -> Option<crate::stdlib::effects::fs::FileHandle> {
+    if let Value::Map(m) = val {
+        let b = m.borrow();
+        let handle_id = match b.get(&string_key("handle_id")) {
+            Some(Value::Int(n)) => *n as usize,
+            _ => return None,
+        };
+        let slot_id = match b.get(&string_key("slot_id")) {
+            Some(Value::Int(n)) => *n as usize,
+            _ => return None,
+        };
+        let path = match b.get(&string_key("path")).and_then(|v| v.as_string()) {
+            Some(p) => p.to_string(),
+            _ => String::new(),
+        };
+        let mode = match b.get(&string_key("mode")).and_then(|v| v.as_string()) {
+            Some(m) => m.to_string(),
+            _ => String::new(),
+        };
+        Some(crate::stdlib::effects::fs::FileHandle {
+            handle_id,
+            slot_id,
+            path,
+            mode,
+        })
+    } else {
+        None
+    }
+}
+
+fn create_io_read_file_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let path = match args.first().and_then(|v| v.as_string()) {
+            Some(p) => p,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("path must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::read_to_string(vm, path)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(s) => crate::effect_abi::Exit::Success(Value::string(s)),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_write_file_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let path = match args.first().and_then(|v| v.as_string()) {
+            Some(p) => p,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("path must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let content = match args.get(1) {
+            Some(Value::String(s)) => s.as_str(),
+            Some(_v) => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("content must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+            None => "",
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::write_string(vm, path, content)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(()) => crate::effect_abi::Exit::Success(Value::Nil),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_exists_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let path = match args.first().and_then(|v| v.as_string()) {
+            Some(p) => p,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("path must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::exists(vm, path)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(b) => crate::effect_abi::Exit::Success(Value::Bool(b)),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_remove_file_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let path = match args.first().and_then(|v| v.as_string()) {
+            Some(p) => p,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("path must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::remove_file(vm, path)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(()) => crate::effect_abi::Exit::Success(Value::Nil),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_create_dir_all_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let path = match args.first().and_then(|v| v.as_string()) {
+            Some(p) => p,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("path must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::create_dir_all(vm, path)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(()) => crate::effect_abi::Exit::Success(Value::Nil),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_read_dir_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let path = match args.first().and_then(|v| v.as_string()) {
+            Some(p) => p,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("path must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::read_dir(vm, path)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(items) => {
+                let arr: Vec<Value> = items.into_iter().map(Value::string).collect();
+                crate::effect_abi::Exit::Success(Value::array(arr))
+            }
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_open_scoped_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let path = match args.first().and_then(|v| v.as_string()) {
+            Some(p) => p,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("path must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let mode = match args.get(1).and_then(|v| v.as_string()) {
+            Some(m) => m,
+            None => "r",
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::open_scoped(vm, path, mode)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(handle) => {
+                let handle_map = alloc::vec![
+                    (string_key("__type"), Value::string("FileHandle")),
+                    (string_key("handle_id"), Value::Int(handle.handle_id as i64)),
+                    (string_key("slot_id"), Value::Int(handle.slot_id as i64)),
+                    (string_key("path"), Value::string(&handle.path)),
+                    (string_key("mode"), Value::string(&handle.mode)),
+                ];
+                crate::effect_abi::Exit::Success(Value::map(handle_map.into_iter().collect()))
+            }
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_read_handle_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let handle = match args.first().and_then(extract_file_handle) {
+            Some(h) => h,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("Invalid file handle".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let max_bytes = match args.get(1) {
+            Some(Value::Int(n)) if *n > 0 => *n as usize,
+            _ => 4096,
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::read_handle(vm, &handle, max_bytes)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(bytes) => {
+                let arr: Vec<Value> = bytes.into_iter().map(|b| Value::Int(b as i64)).collect();
+                crate::effect_abi::Exit::Success(Value::array(arr))
+            }
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_write_handle_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let handle = match args.first().and_then(extract_file_handle) {
+            Some(h) => h,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("Invalid file handle".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let bytes: Vec<u8> = match args.get(1) {
+            Some(Value::String(s)) => s.as_bytes().to_vec(),
+            Some(Value::Array(arr)) => arr.borrow().iter().filter_map(|v| match v {
+                Value::Int(i) => Some(*i as u8),
+                _ => None,
+            }).collect(),
+            _ => Vec::new(),
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::write_handle(vm, &handle, &bytes)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(()) => crate::effect_abi::Exit::Success(Value::Nil),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_close_handle_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let handle = match args.first().and_then(extract_file_handle) {
+            Some(h) => h,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("Invalid file handle".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::close_handle(vm, &handle)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(()) => crate::effect_abi::Exit::Success(Value::Nil),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_os_getenv_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let key = match args.first().and_then(|v| v.as_string()) {
+            Some(k) => k,
+            None => {
+                let err = crate::stdlib::effects::env::EnvError::NotFound("Key must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::env::EnvService::var(vm, key)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::env::EnvError::NotFound("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(s) => crate::effect_abi::Exit::Success(Value::string(s)),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_os_setenv_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let key = match args.first().and_then(|v| v.as_string()) {
+            Some(k) => k,
+            None => {
+                let err = crate::stdlib::effects::env::EnvError::NotFound("Key must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let val = match args.get(1).and_then(|v| v.as_string()) {
+            Some(v) => v,
+            None => "",
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::env::EnvService::set_var(vm, key, val)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::env::EnvError::NotFound("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(()) => crate::effect_abi::Exit::Success(Value::Nil),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_os_now_ms_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|_args: &[Value]| {
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::env::EnvService::now_millis(vm)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::env::EnvError::NotFound("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(n) => crate::effect_abi::Exit::Success(Value::Int(n as i64)),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_os_args_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|_args: &[Value]| {
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::env::EnvService::args(vm)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::env::EnvError::NotFound("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(args_list) => {
+                let arr: Vec<Value> = args_list.into_iter().map(Value::string).collect();
+                crate::effect_abi::Exit::Success(Value::array(arr))
+            }
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_random_int_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let min = match args.first() {
+            Some(Value::Int(n)) => *n,
+            _ => 0,
+        };
+        let max = match args.get(1) {
+            Some(Value::Int(n)) => *n,
+            _ => 100,
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::random::RandomService::next_int(vm, min, max)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail("No active VM context".to_string()))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(n) => crate::effect_abi::Exit::Success(Value::Int(n)),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_random_float_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|_args: &[Value]| {
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::random::RandomService::next_float(vm)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail("No active VM context".to_string()))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(f) => crate::effect_abi::Exit::Success(Value::Float(f)),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_random_bool_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|_args: &[Value]| {
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::random::RandomService::next_bool(vm)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail("No active VM context".to_string()))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(b) => crate::effect_abi::Exit::Success(Value::Bool(b)),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_random_bytes_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let len = match args.first() {
+            Some(Value::Int(n)) if *n >= 0 => *n as usize,
+            _ => 16,
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::random::RandomService::fill_bytes(vm, len)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail("No active VM context".to_string()))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(bytes) => {
+                let items: Vec<Value> = bytes.into_iter().map(|b| Value::Int(b as i64)).collect();
+                crate::effect_abi::Exit::Success(Value::array(items))
+            }
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_random_module(vm: &VM) -> Value {
+    let entries = [
+        (string_key("int_effect"), create_random_int_effect_fn()),
+        (string_key("float_effect"), create_random_float_effect_fn()),
+        (string_key("bool_effect"), create_random_bool_effect_fn()),
+        (string_key("bytes_effect"), create_random_bytes_effect_fn()),
+        (string_key("int"), create_random_int_effect_fn()),
+        (string_key("float"), create_random_float_effect_fn()),
+        (string_key("bool"), create_random_bool_effect_fn()),
+        (string_key("bytes"), create_random_bytes_effect_fn()),
+        (string_key("random"), create_math_random_fn()),
+        (string_key("randomseed"), create_math_randomseed_fn()),
+    ];
+    vm.map_with_entries(entries)
+}
+
 fn create_map_module(vm: &VM) -> Value {
     let entries = [
         (string_key("len"), create_map_len_fn()),
@@ -2443,6 +3774,7 @@ fn create_math_module(vm: &VM) -> Value {
         (string_key("tointeger"), create_math_tointeger_fn()),
         (string_key("tofloat"), create_math_tofloat_fn()),
         (string_key("mod"), create_math_mod_fn()),
+        (string_key("pow"), create_math_pow_fn()),
     ];
     vm.map_with_entries(entries)
 }
@@ -2756,6 +4088,141 @@ fn create_math_log_fn() -> Value {
     }))
 }
 
+fn create_math_pow_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 2 {
+            return Err("math.pow requires base and exponent arguments".to_string());
+        }
+        let base_val = unwrap_lua_value(args[0].clone());
+        let exp_val = unwrap_lua_value(args[1].clone());
+        let base = base_val
+            .as_float()
+            .or_else(|| base_val.as_int().map(|i| i as f64))
+            .ok_or_else(|| "math.pow expects number arguments".to_string())?;
+        let exp = exp_val
+            .as_float()
+            .or_else(|| exp_val.as_int().map(|i| i as f64))
+            .ok_or_else(|| "math.pow expects number arguments".to_string())?;
+        Ok(NativeCallResult::Return(Value::Float(base.powf(exp))))
+    }))
+}
+
+fn create_bit_band_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.is_empty() {
+            return Err("bit.band requires at least one argument".to_string());
+        }
+        let mut acc: LustInt = -1;
+        for (idx, arg) in args.iter().enumerate() {
+            let val = unwrap_lua_value(arg.clone());
+            let n = coerce_int(&val).ok_or_else(|| {
+                format!("bit.band expects integer arguments, got arg {}", idx + 1)
+            })?;
+            acc &= n;
+        }
+        Ok(NativeCallResult::Return(Value::Int(acc)))
+    }))
+}
+
+fn create_bit_bor_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.is_empty() {
+            return Err("bit.bor requires at least one argument".to_string());
+        }
+        let mut acc: LustInt = 0;
+        for (idx, arg) in args.iter().enumerate() {
+            let val = unwrap_lua_value(arg.clone());
+            let n = coerce_int(&val).ok_or_else(|| {
+                format!("bit.bor expects integer arguments, got arg {}", idx + 1)
+            })?;
+            acc |= n;
+        }
+        Ok(NativeCallResult::Return(Value::Int(acc)))
+    }))
+}
+
+fn create_bit_bxor_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.is_empty() {
+            return Err("bit.bxor requires at least one argument".to_string());
+        }
+        let mut acc: LustInt = 0;
+        for (idx, arg) in args.iter().enumerate() {
+            let val = unwrap_lua_value(arg.clone());
+            let n = coerce_int(&val).ok_or_else(|| {
+                format!("bit.bxor expects integer arguments, got arg {}", idx + 1)
+            })?;
+            acc ^= n;
+        }
+        Ok(NativeCallResult::Return(Value::Int(acc)))
+    }))
+}
+
+fn create_bit_bnot_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
+        let n = coerce_int(&val)
+            .ok_or_else(|| "bit.bnot expects an integer argument".to_string())?;
+        Ok(NativeCallResult::Return(Value::Int(!n)))
+    }))
+}
+
+fn create_bit_lshift_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 2 {
+            return Err("bit.lshift requires value and shift count".to_string());
+        }
+        let a = coerce_int(&unwrap_lua_value(args[0].clone()))
+            .ok_or_else(|| "bit.lshift expects integer value".to_string())?;
+        let n = coerce_int(&unwrap_lua_value(args[1].clone()))
+            .ok_or_else(|| "bit.lshift expects integer shift count".to_string())?;
+        let shift = (n & 63) as u32;
+        Ok(NativeCallResult::Return(Value::Int(a.wrapping_shl(shift))))
+    }))
+}
+
+fn create_bit_rshift_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 2 {
+            return Err("bit.rshift requires value and shift count".to_string());
+        }
+        let a = coerce_int(&unwrap_lua_value(args[0].clone()))
+            .ok_or_else(|| "bit.rshift expects integer value".to_string())?;
+        let n = coerce_int(&unwrap_lua_value(args[1].clone()))
+            .ok_or_else(|| "bit.rshift expects integer shift count".to_string())?;
+        let shift = (n & 63) as u32;
+        let unsigned = a as u64;
+        Ok(NativeCallResult::Return(Value::Int((unsigned.wrapping_shr(shift)) as LustInt)))
+    }))
+}
+
+fn create_bit_arshift_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 2 {
+            return Err("bit.arshift requires value and shift count".to_string());
+        }
+        let a = coerce_int(&unwrap_lua_value(args[0].clone()))
+            .ok_or_else(|| "bit.arshift expects integer value".to_string())?;
+        let n = coerce_int(&unwrap_lua_value(args[1].clone()))
+            .ok_or_else(|| "bit.arshift expects integer shift count".to_string())?;
+        let shift = (n & 63) as u32;
+        Ok(NativeCallResult::Return(Value::Int(a.wrapping_shr(shift))))
+    }))
+}
+
+fn create_bit_module(vm: &VM) -> Value {
+    let entries = [
+        (string_key("band"), create_bit_band_fn()),
+        (string_key("bor"), create_bit_bor_fn()),
+        (string_key("bxor"), create_bit_bxor_fn()),
+        (string_key("bnot"), create_bit_bnot_fn()),
+        (string_key("lshift"), create_bit_lshift_fn()),
+        (string_key("rshift"), create_bit_rshift_fn()),
+        (string_key("arshift"), create_bit_arshift_fn()),
+    ];
+    vm.map_with_entries(entries)
+}
+
 fn create_math_tointeger_fn() -> Value {
     Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
@@ -3066,7 +4533,7 @@ fn pad_value(value: String, width: Option<usize>, zero_pad: bool) -> String {
     value
 }
 
-fn normalize_range(start: LustInt, end: Option<LustInt>, len: usize) -> (usize, usize) {
+pub(crate) fn normalize_range(start: LustInt, end: Option<LustInt>, len: usize) -> (usize, usize) {
     let len_i = len as LustInt;
     let mut s = if start < 0 { len_i + start + 1 } else { start };
     let mut e = end.unwrap_or(len_i);
@@ -3089,6 +4556,32 @@ fn normalize_range(start: LustInt, end: Option<LustInt>, len: usize) -> (usize, 
 }
 
 fn lua_pattern_to_regex(pattern: &str) -> Result<Regex, String> {
+    with_lua_pattern_regex(pattern, Regex::clone)
+}
+
+fn with_lua_pattern_regex<T>(pattern: &str, use_regex: impl FnOnce(&Regex) -> T) -> Result<T, String> {
+    const CAPACITY: usize = 64;
+    thread_local! {
+        static REGEX_CACHE: RefCell<Vec<(String, Regex)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(index) = cache.iter().position(|(key, _)| key == pattern) {
+            cache[..=index].rotate_right(1);
+        } else {
+            let regex = compile_lua_pattern(pattern)?;
+            if cache.len() == CAPACITY {
+                cache.pop();
+            }
+            cache.insert(0, (pattern.to_owned(), regex));
+        }
+        // Only call internal string operations here. VM callbacks use a cloned regex.
+        Ok(use_regex(&cache[0].1))
+    })
+}
+
+fn compile_lua_pattern(pattern: &str) -> Result<Regex, String> {
     fn is_regex_meta(ch: char) -> bool {
         matches!(
             ch,
@@ -3164,8 +4657,43 @@ fn lua_pattern_to_regex(pattern: &str) -> Result<Regex, String> {
     Regex::new(&out).map_err(|e| e.to_string())
 }
 
-fn build_template_replacement(template: &str, caps: &regex::Captures) -> String {
-    let mut out = String::new();
+pub(crate) fn string_gsub_fast(src: &str, pattern: &str, repl: &str) -> Result<(String, i64), String> {
+    string_gsub_template(src, pattern, repl, i64::MAX)
+}
+
+fn string_gsub_template(
+    src: &str,
+    pattern: &str,
+    repl: &str,
+    limit: i64,
+) -> Result<(String, i64), String> {
+    with_lua_pattern_regex(pattern, |regex| {
+        let mut last_end = 0;
+        let mut count = 0;
+        let mut output = String::with_capacity(src.len());
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        if repl.contains('%') {
+            for caps in regex.captures_iter(src).take(limit) {
+                let mat = caps.get(0).expect("captures include the full match");
+                output.push_str(&src[last_end..mat.start()]);
+                push_template_replacement(&mut output, repl, &caps);
+                last_end = mat.end();
+                count += 1;
+            }
+        } else {
+            for mat in regex.find_iter(src).take(limit) {
+                output.push_str(&src[last_end..mat.start()]);
+                output.push_str(repl);
+                last_end = mat.end();
+                count += 1;
+            }
+        }
+        output.push_str(&src[last_end..]);
+        (output, count)
+    })
+}
+
+fn push_template_replacement(out: &mut String, template: &str, caps: &regex::Captures) {
     let mut chars = template.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '%' {
@@ -3193,7 +4721,6 @@ fn build_template_replacement(template: &str, caps: &regex::Captures) -> String 
             out.push(ch);
         }
     }
-    out
 }
 
 fn to_lua_value(vm: &VM, value: Value) -> Result<Value, String> {
@@ -3302,14 +4829,7 @@ mod tests {
     #[test]
     fn test_table_insert_push_and_remove_pop() {
         let mut vm = VM::with_config(&LustConfig::default());
-        struct VmGuard;
-        impl Drop for VmGuard {
-            fn drop(&mut self) {
-                crate::vm::pop_vm_ptr();
-            }
-        }
-        crate::vm::push_vm_ptr(&mut vm);
-        let _guard = VmGuard;
+        let _guard = crate::vm::CurrentVmGuard::from_vm(&mut vm);
 
         let stdlib = create_stdlib(&LustConfig::default(), &vm);
         let table_mod = stdlib.iter().find(|(name, _)| *name == "table").unwrap().1.clone();

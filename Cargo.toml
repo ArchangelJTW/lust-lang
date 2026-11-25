@@ -1,6 +1,20 @@
 [workspace]
-members = [".", "crates/lust-analyzer", "crates/lust-macros", "crates/lust-fuzz"]
-exclude = ["examples/rust-extension/extensions/**", "tree-sitter-lust"]
+members = [
+  ".",
+  "crates/lust-analyzer",
+  "crates/lust-macros",
+  "crates/lust-fuzz",
+  "crates/lust-tokio",
+  "crates/lust-telemetry-metrics",
+  "crates/lust-telemetry-otel",
+  "crates/lust-telemetry-prometheus",
+  "crates/lust-telemetry-tracing",
+  "crates/lust-napi",
+  "crates/lust-napi-rs",
+  "crates/lust-wasi-runner",
+  "crates/lust-aot-rt",
+]
+exclude = ["examples/rust-extension/extensions/**", "tree-sitter-lust", "tests/compile_fail/fs_gate"]
 
 [package]
 name = "lust-rs"
@@ -45,10 +59,20 @@ name = "lust"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["std", "packages", "bindgen"]
+default = ["std", "cranelift", "packages", "bindgen", "net-services", "cli-mimalloc"]
+cli-mimalloc = ["dep:mimalloc"]
 bindgen = ["std"]
+net-services = [
+  "std",
+  "dep:tokio",
+  "dep:hyper",
+  "dep:hyper-util",
+  "dep:http-body-util",
+  "dep:bytes",
+  "dep:rusqlite",
+]
+test-deopt = ["std", "cranelift"]
 std = [
-  "dep:dynasmrt",
   "dep:toml",
   "serde/std",
   "thiserror/std",
@@ -56,6 +80,8 @@ std = [
   "dep:regex",
   "dep:regex-automata",
   "dep:rand",
+  "dep:serde_json",
+  "dep:tempfile",
 ]
 # Optional Cranelift MIR JIT backend
 cranelift = [
@@ -67,19 +93,45 @@ cranelift = [
   "dep:cranelift-native",
 ]
 # Optional mimalloc global allocator for the CLI binary
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["cli-mimalloc"]
 # JIT for riscv32 targets. Enables `std` because dynasmrt requires it
 # (memmap2, std::sync). Requires a std-capable runtime (e.g. Linux/RISC-V).
 # Floats require the RV32F extension.
 rv32 = ["std", "dep:dynasmrt"]
+legacy-dynasm = ["std", "dep:dynasmrt"]
 libloading = ["std", "dep:libloading"]
 dirs = ["std", "dep:dirs"]
-packages = ["std", "libloading", "dirs", "dep:serde_json", "dep:object"]
+packages = ["std", "libloading", "dirs", "dep:object"]
 lua_transpile = ["std", "dep:full_moon"]
-# ESP32 debugging support - adds logging via esp-println
-esp32c6-logging = ["dep:esp-println", "dep:log"]
+# ESP32 debugging support - adds logging
+esp32c6-logging = ["dep:log"]
 # JSONC optional CST support - off by default (WBS 12C-02)
 jsonc_cst = []
+
+# Telemetry features (Track 2C per RFC_TELEMETRY_AND_METRICS)
+telemetry = []
+telemetry-vm = ["telemetry"]
+telemetry-jit = ["telemetry"]
+telemetry-effects = ["telemetry"]
+telemetry-user = ["telemetry"]
+telemetry-all = ["telemetry-vm", "telemetry-jit", "telemetry-effects", "telemetry-user"]
+
+# WASI features (Track 2G per RFC_WASM_WASI_SUPPORT)
+wasi = ["std"]
+wasi-p2 = ["wasi"]
+
+# Wave 17 opt-in real-backend features (strictly opt-in; never in default/std/net-services)
+jit = ["std", "cranelift"]
+cranelift-aot = ["jit", "cranelift", "dep:cranelift-object", "cranelift-codegen/all-native-arch"]
+telemetry-exporters = [
+  "std",
+  "dep:metrics",
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:prometheus",
+]
+svc-reqwest = ["std", "dep:reqwest"]
+svc-sqlx = ["std", "dep:sqlx"]
 
 [[bin]]
 name = "lust"
@@ -101,6 +153,41 @@ name = "test_framework_bench"
 path = "benchmarks/test_framework_bench.rs"
 required-features = ["std"]
 
+[[bin]]
+name = "tost_equivalence"
+path = "benchmarks/tost_equivalence.rs"
+required-features = ["std"]
+
+[[example]]
+name = "schema_validation"
+path = "examples/schemas/01_schema_validation.rs"
+required-features = ["std"]
+
+[[example]]
+name = "schema_json"
+path = "examples/schemas/02_json_deserialization.rs"
+required-features = ["std"]
+
+[[example]]
+name = "schema_msgpack"
+path = "examples/schemas/03_messagepack_binary.rs"
+required-features = ["std"]
+
+[[example]]
+name = "sim_scheduler"
+path = "examples/simulation/01_deterministic_scheduler.rs"
+required-features = ["std"]
+
+[[example]]
+name = "sim_fault_injection"
+path = "examples/simulation/02_fault_injection_vfs.rs"
+required-features = ["std"]
+
+[[example]]
+name = "sim_replay_bundle"
+path = "examples/simulation/03_replay_bundle_export.rs"
+required-features = ["std"]
+
 [[example]]
 name = "effects_basic"
 path = "examples/effects/01_basic_effects.rs"
@@ -117,18 +204,18 @@ path = "examples/effects/03_acquire_release_and_scopes.rs"
 required-features = ["std"]
 
 [[example]]
-name = "04_testing_with_virtual_clock"
-path = "examples/effects/04_testing_with_virtual_clock.rs"
-required-features = ["std"]
-
-[[example]]
-name = "05_dependency_injection_mocking"
+name = "effects_di_mocking"
 path = "examples/effects/05_dependency_injection_mocking.rs"
 required-features = ["std"]
 
 [[example]]
-name = "06_concurrency_and_supervision"
+name = "effects_supervision"
 path = "examples/effects/06_concurrency_and_supervision.rs"
+required-features = ["std"]
+
+[[example]]
+name = "embed_standalone_vm"
+path = "examples/embedding/standalone_vm.rs"
 required-features = ["std"]
 
 [dependencies]
@@ -163,25 +250,38 @@ cranelift-frontend = { version = "0.137.1", optional = true }
 cranelift-jit = { version = "0.137.1", optional = true }
 cranelift-module = { version = "0.137.1", optional = true }
 cranelift-native = { version = "0.137.1", optional = true }
-esp-println = { version = "0.18.0", optional = true, features = [
-  "esp32c6",
-  "auto",
-  "log-04",
-] }
+cranelift-object = { version = "0.137.1", optional = true }
 log = { version = "0.4", optional = true }
+tempfile = { version = "3.27.0", optional = true }
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
+tokio = { version = "1.53.1", optional = true, features = ["net", "io-util", "rt", "rt-multi-thread", "sync", "time", "macros"] }
+hyper = { version = "1.12.0", optional = true, features = ["http1", "client", "server"] }
+hyper-util = { version = "0.1.21", optional = true, features = ["tokio", "http1", "client-legacy", "server"] }
+http-body-util = { version = "0.1.5", optional = true }
+bytes = { version = "1.12.1", optional = true }
+rusqlite = { version = "0.33.0", optional = true }
+metrics = { version = "0.24.6", optional = true }
+opentelemetry = { version = "0.33.1", optional = true }
+opentelemetry_sdk = { version = "0.33.1", features = ["testing", "experimental_metrics_custom_reader"], optional = true }
+prometheus = { version = "0.14.0", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "sqlite"], optional = true }
 
 [build-dependencies]
-dynasm = "5.1.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tree-sitter = "0.20.10"
+tree-sitter-lust = { path = "tree-sitter-lust" }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen = "0.2.128"
 console_error_panic_hook = "0.1.7"
 web-sys = { version = "0.3.105", features = ["console"] }
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
+
+[target.'cfg(target_os = "wasi")'.dependencies]
+getrandom = { version = "0.4.3" }
 
 [profile.release]
 strip = "symbols"
@@ -191,4 +291,17 @@ debug = 0
 overflow-checks = false
 panic = "abort"
 codegen-units = 1
+
+[profile.nostd_32]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[lints.clippy]
+approx_constant = "allow"
+
+[lints.cargo]
+unused_dependencies = "warn"
 

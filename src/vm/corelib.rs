@@ -1,9 +1,11 @@
-use super::VM;
+use super::{FieldStorage, RuntimeStructInfo, StructLayout, Type, TypeKind, VM};
 use super::task::{TaskInstance, TaskKind, TaskState};
 use crate::LustError;
 use crate::bytecode::value::EnumObject;
 use crate::bytecode::value::IteratorState;
 use crate::bytecode::{NativeCallResult, Value, ValueKey, native_fn};
+#[cfg(feature = "std")]
+use crate::mir::runtime_helpers::{SMALL_INT_STRING_COUNT, format_i64_stack};
 use crate::number::{LustFloat, LustInt};
 use alloc::format;
 use alloc::rc::Rc;
@@ -13,8 +15,65 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 pub(super) fn install_core_builtins(vm: &mut VM) {
+    register_builtin_struct_layouts(vm);
     for (name, value) in core_entries(vm) {
         vm.register_native(name, value);
+    }
+}
+
+fn register_builtin_struct_layouts(vm: &mut VM) {
+    if !vm.struct_metadata.contains_key("LuaTable") {
+        let field_names = vec![
+            Rc::new("table".to_string()),
+            Rc::new("metamethods".to_string()),
+        ];
+        let dummy_type = Type::new(TypeKind::Unknown, crate::ast::Span::dummy());
+        let layout = Rc::new(StructLayout::new(
+            "LuaTable".to_string(),
+            field_names,
+            vec![FieldStorage::Strong, FieldStorage::Strong],
+            vec![dummy_type.clone(), dummy_type],
+            vec![None, None],
+        ));
+        vm.struct_metadata.insert(
+            "LuaTable".to_string(),
+            RuntimeStructInfo { layout },
+        );
+    }
+    if !vm.struct_metadata.contains_key("LuaFunction") {
+        let field_names = vec![Rc::new("handle".to_string())];
+        let dummy_type = Type::new(TypeKind::Unknown, crate::ast::Span::dummy());
+        let layout = Rc::new(StructLayout::new(
+            "LuaFunction".to_string(),
+            field_names,
+            vec![FieldStorage::Strong],
+            vec![dummy_type],
+            vec![None],
+        ));
+        vm.struct_metadata.insert(
+            "LuaFunction".to_string(),
+            RuntimeStructInfo { layout },
+        );
+    }
+    if !vm.struct_metadata.contains_key("TaskInfo") {
+        let field_names = vec![
+            Rc::new("state".to_string()),
+            Rc::new("last_yield".to_string()),
+            Rc::new("last_result".to_string()),
+            Rc::new("error".to_string()),
+        ];
+        let dummy_type = Type::new(TypeKind::Unknown, crate::ast::Span::dummy());
+        let layout = Rc::new(StructLayout::new(
+            "TaskInfo".to_string(),
+            field_names,
+            vec![FieldStorage::Strong; 4],
+            vec![dummy_type.clone(), dummy_type.clone(), dummy_type.clone(), dummy_type],
+            vec![None; 4],
+        ));
+        vm.struct_metadata.insert(
+            "TaskInfo".to_string(),
+            RuntimeStructInfo { layout },
+        );
     }
 }
 
@@ -29,6 +88,15 @@ pub(super) fn core_entries(vm: &VM) -> Vec<(&'static str, Value)> {
         ("pairs", create_pairs_fn()),
         ("ipairs", create_ipairs_fn()),
         ("task", create_task_module(vm)),
+        ("task.run", create_task_run_fn()),
+        ("task.create", create_task_create_fn()),
+        ("task.status", create_task_status_fn()),
+        ("task.info", create_task_info_fn()),
+        ("task.resume", create_task_resume_fn()),
+        ("task.yield", create_task_yield_fn()),
+        ("task.stop", create_task_stop_fn()),
+        ("task.restart", create_task_restart_fn()),
+        ("task.current", create_task_current_fn()),
     ];
     #[cfg(feature = "std")]
     {
@@ -299,8 +367,17 @@ fn create_ipairs_fn() -> Value {
     }))
 }
 
+#[cfg(not(feature = "std"))]
+const SMALL_INT_STRING_COUNT: usize = 256;
+
 thread_local! {
-    static SMALL_INT_STRINGS: [Rc<String>; 256] = core::array::from_fn(|i| Rc::new(i.to_string()));
+    static SMALL_INT_STRINGS: [Rc<String>; SMALL_INT_STRING_COUNT] = core::array::from_fn(|i| {
+        #[cfg(feature = "std")]
+        let text = format_i64_stack(i as i64, &mut [0; 24]).to_string();
+        #[cfg(not(feature = "std"))]
+        let text = i.to_string();
+        Rc::new(text)
+    });
 }
 
 pub(super) fn create_tostring_fn() -> Value {
@@ -310,10 +387,15 @@ pub(super) fn create_tostring_fn() -> Value {
         }
 
         match &args[0] {
-            Value::Int(n) if (0..256).contains(n) => {
+            Value::Int(n) if (0..SMALL_INT_STRING_COUNT as LustInt).contains(n) => {
                 let rc = SMALL_INT_STRINGS.with(|table| table[*n as usize].clone());
                 Ok(NativeCallResult::Return(Value::String(rc)))
             }
+            #[cfg(feature = "std")]
+            Value::Int(n) => Ok(NativeCallResult::Return(Value::string(format_i64_stack(
+                *n,
+                &mut [0; 24],
+            )))),
             Value::Bool(b) => {
                 Ok(NativeCallResult::Return(Value::string(if *b {
                     "true"
@@ -803,8 +885,7 @@ fn create_lua_module(vm: &VM) -> Value {
                                                                                 Ok(vals) if vals.len() == 1 => Ok(crate::bytecode::value::NativeCallResult::Return(vals[0].clone())),
                                                                                 Ok(vals) if vals.is_empty() => Ok(crate::bytecode::value::NativeCallResult::Return(Value::Nil)),
                                                                                 Ok(vals) => {
-                                                                                    let arr = alloc::rc::Rc::new(core::cell::RefCell::new(vals));
-                                                                                    Ok(crate::bytecode::value::NativeCallResult::Return(Value::Array(arr)))
+                                                                                    Ok(crate::bytecode::value::NativeCallResult::Return(Value::array(vals)))
                                                                                 }
                                                                                 Err(e) => Err(e),
                                                                             }
@@ -1233,8 +1314,7 @@ fn create_lua_socket_newtry_fn() -> Value {
             if try_args.len() == 1 {
                 Ok(NativeCallResult::Return(try_args[0].clone()))
             } else {
-                let arr = Rc::new(RefCell::new(try_args.to_vec()));
-                Ok(NativeCallResult::Return(Value::Array(arr)))
+                Ok(NativeCallResult::Return(Value::array(try_args.to_vec())))
             }
         }));
 
@@ -1265,8 +1345,7 @@ fn create_lua_socket_try_fn() -> Value {
         if args.len() == 1 {
             Ok(NativeCallResult::Return(first))
         } else {
-            let arr = Rc::new(RefCell::new(args.to_vec()));
-            Ok(NativeCallResult::Return(Value::Array(arr)))
+            Ok(NativeCallResult::Return(Value::array(args.to_vec())))
         }
     }))
 }
@@ -1446,7 +1525,7 @@ fn task_state_to_status_value(state: &TaskState) -> Value {
     match state {
         TaskState::Ready => Value::enum_unit("TaskStatus", "Ready"),
         TaskState::Running => Value::enum_unit("TaskStatus", "Running"),
-        TaskState::Yielded => Value::enum_unit("TaskStatus", "Yielded"),
+        TaskState::Yielded(_) => Value::enum_unit("TaskStatus", "Yielded"),
         TaskState::Completed => Value::enum_unit("TaskStatus", "Completed"),
         TaskState::Failed => Value::enum_unit("TaskStatus", "Failed"),
         TaskState::Stopped => Value::enum_unit("TaskStatus", "Stopped"),

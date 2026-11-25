@@ -6,7 +6,7 @@ use crate::{
     },
     error::{LustError, Result},
     lexer::{Token, TokenKind},
-    number::{LustInt, parse_float},
+    number::{parse_float_literal, parse_integer_literal},
 };
 use alloc::{
     boxed::Box,
@@ -16,6 +16,15 @@ use alloc::{
     vec::Vec,
 };
 use core::{matches, unreachable};
+
+fn is_placeholder(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Identifier(name) => name == "_",
+        ExprKind::Paren(inner) => is_placeholder(inner),
+        _ => false,
+    }
+}
+
 impl Parser {
     fn span_through_previous(&self, start: Span) -> Span {
         let end = &self.tokens[self.current - 1];
@@ -31,7 +40,12 @@ impl Parser {
             self.current_token().line
         );
 
-        self.parse_assignment()
+        self.with_allow_range(false, |p| p.parse_assignment())
+    }
+
+    #[inline(never)]
+    pub(super) fn parse_for_iterator_expr(&mut self) -> Result<Expr> {
+        self.with_allow_range(true, |p| p.parse_assignment())
     }
 
     #[inline(never)]
@@ -44,54 +58,526 @@ impl Parser {
         let mut expr = self.parse_logical_or()?;
         while self.match_token(&[TokenKind::PipeGreater]) {
             let right = self.parse_logical_or()?;
-            let span = self.span_through_previous(expr.span);
-            match right.kind {
-                ExprKind::Call {
-                    callee,
-                    type_args,
-                    mut args,
-                } => {
+            expr = self.desugar_pipe_step(expr, right)?;
+        }
+
+        self.desugar_currying(expr)
+    }
+
+    fn desugar_pipe_step(&mut self, expr: Expr, right: Expr) -> Result<Expr> {
+        let span = self.span_through_previous(expr.span);
+        if is_placeholder(&expr) {
+            return Err(self.error("Placeholder '_' cannot be used as pipe source expression"));
+        }
+        if is_placeholder(&right) {
+            return Err(self.error("Placeholder '_' cannot be used as pipe target without a call"));
+        }
+
+        let expr = self.desugar_currying(expr)?;
+
+        let is_unwrap = matches!(
+            &right.kind,
+            ExprKind::MethodCall {
+                method,
+                args,
+                ..
+            } if method == "try_unwrap" && args.is_empty()
+        );
+
+        if is_unwrap {
+            let ExprKind::MethodCall { receiver, .. } = right.kind else {
+                unreachable!()
+            };
+            let inner_target = *receiver;
+            let piped_inner = self.pipe_into_target(expr, inner_target, span)?;
+            Ok(Expr::new(
+                ExprKind::MethodCall {
+                    receiver: Box::new(piped_inner),
+                    method: "try_unwrap".to_string(),
+                    type_args: None,
+                    args: vec![],
+                },
+                span,
+            ))
+        } else if let ExprKind::Paren(inner) = right.kind {
+            let piped_inner = self.desugar_pipe_step(expr, *inner)?;
+            Ok(Expr::new(ExprKind::Paren(Box::new(piped_inner)), span))
+        } else {
+            self.pipe_into_target(expr, right, span)
+        }
+    }
+
+    fn pipe_into_target(&mut self, expr: Expr, target: Expr, span: Span) -> Result<Expr> {
+        if is_placeholder(&target) {
+            return Err(self.error("Placeholder '_' cannot be used as pipe target without a call"));
+        }
+
+        if matches!(
+            &target.kind,
+            ExprKind::MethodCall {
+                method,
+                args,
+                ..
+            } if method == "try_unwrap" && args.is_empty()
+        ) {
+            let ExprKind::MethodCall { receiver, .. } = target.kind else {
+                unreachable!()
+            };
+            let piped_inner = self.pipe_into_target(expr, *receiver, span)?;
+            return Ok(Expr::new(
+                ExprKind::MethodCall {
+                    receiver: Box::new(piped_inner),
+                    method: "try_unwrap".to_string(),
+                    type_args: None,
+                    args: vec![],
+                },
+                span,
+            ));
+        }
+
+        if let ExprKind::Paren(inner) = target.kind {
+            let piped_inner = self.pipe_into_target(expr, *inner, span)?;
+            return Ok(Expr::new(ExprKind::Paren(Box::new(piped_inner)), span));
+        }
+
+        match target.kind {
+            ExprKind::Call {
+                callee,
+                type_args,
+                mut args,
+            } => {
+                let placeholder_indices: Vec<usize> = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| is_placeholder(a))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if placeholder_indices.is_empty() {
                     args.insert(0, expr);
-                    expr = Expr::new(
+                } else if placeholder_indices.len() == 1 {
+                    args[placeholder_indices[0]] = expr;
+                } else {
+                    return Err(self.error("Multiple placeholders '_' not allowed in a single pipe expression"));
+                }
+
+                Ok(Expr::new(
+                    ExprKind::Call {
+                        callee,
+                        type_args,
+                        args,
+                    },
+                    span,
+                ))
+            }
+
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                type_args,
+                mut args,
+            } => {
+                let placeholder_indices: Vec<usize> = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| is_placeholder(a))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if placeholder_indices.is_empty() {
+                    args.insert(0, expr);
+                } else if placeholder_indices.len() == 1 {
+                    args[placeholder_indices[0]] = expr;
+                } else {
+                    return Err(self.error("Multiple placeholders '_' not allowed in a single pipe expression"));
+                }
+
+                Ok(Expr::new(
+                    ExprKind::MethodCall {
+                        receiver,
+                        method,
+                        type_args,
+                        args,
+                    },
+                    span,
+                ))
+            }
+
+            _ => Ok(Expr::new(
+                ExprKind::Call {
+                    callee: Box::new(target),
+                    type_args: None,
+                    args: vec![expr],
+                },
+                span,
+            )),
+        }
+    }
+
+    fn desugar_currying(&self, expr: Expr) -> Result<Expr> {
+        let span = expr.span;
+        match expr.kind {
+            ExprKind::Identifier(ref name) if name == "_" => {
+                Err(self.error("Placeholder '_' is only valid in call argument positions"))
+            }
+
+            ExprKind::Call {
+                callee,
+                type_args,
+                args,
+            } => {
+                let callee = Box::new(self.desugar_currying(*callee)?);
+                let desugared_args: Vec<Expr> = args
+                    .into_iter()
+                    .map(|a| self.desugar_currying_arg(a))
+                    .collect::<Result<Vec<Expr>>>()?;
+
+                let placeholder_indices: Vec<usize> = desugared_args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| is_placeholder(a))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if placeholder_indices.is_empty() {
+                    Ok(Expr::new(
                         ExprKind::Call {
                             callee,
                             type_args,
-                            args,
+                            args: desugared_args,
+                        },
+                        span,
+                    ))
+                } else {
+                    let mut params = Vec::new();
+                    let mut final_args = desugared_args;
+                    for (param_idx, &arg_idx) in placeholder_indices.iter().enumerate() {
+                        let param_name = format!("__curry_{}", param_idx);
+                        let param_expr = Expr::new(
+                            ExprKind::Identifier(param_name.clone()),
+                            final_args[arg_idx].span,
+                        );
+                        final_args[arg_idx] = param_expr;
+                        params.push((param_name, None));
+                    }
+
+                    let call_expr = Expr::new(
+                        ExprKind::Call {
+                            callee,
+                            type_args,
+                            args: final_args,
                         },
                         span,
                     );
+
+                    Ok(Expr::new(
+                        ExprKind::Lambda {
+                            params,
+                            return_type: None,
+                            body: Box::new(call_expr),
+                        },
+                        span,
+                    ))
                 }
-                ExprKind::MethodCall {
-                    receiver,
-                    method,
-                    type_args,
-                    mut args,
-                } => {
-                    args.insert(0, expr);
-                    expr = Expr::new(
+            }
+
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                type_args,
+                args,
+            } => {
+                let receiver = Box::new(self.desugar_currying(*receiver)?);
+                let desugared_args: Vec<Expr> = args
+                    .into_iter()
+                    .map(|a| self.desugar_currying_arg(a))
+                    .collect::<Result<Vec<Expr>>>()?;
+
+                let placeholder_indices: Vec<usize> = desugared_args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| is_placeholder(a))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if placeholder_indices.is_empty() {
+                    Ok(Expr::new(
                         ExprKind::MethodCall {
                             receiver,
                             method,
                             type_args,
-                            args,
+                            args: desugared_args,
+                        },
+                        span,
+                    ))
+                } else {
+                    let mut params = Vec::new();
+                    let mut final_args = desugared_args;
+                    for (param_idx, &arg_idx) in placeholder_indices.iter().enumerate() {
+                        let param_name = format!("__curry_{}", param_idx);
+                        let param_expr = Expr::new(
+                            ExprKind::Identifier(param_name.clone()),
+                            final_args[arg_idx].span,
+                        );
+                        final_args[arg_idx] = param_expr;
+                        params.push((param_name, None));
+                    }
+
+                    let method_expr = Expr::new(
+                        ExprKind::MethodCall {
+                            receiver,
+                            method,
+                            type_args,
+                            args: final_args,
                         },
                         span,
                     );
-                }
-                _ => {
-                    expr = Expr::new(
-                        ExprKind::Call {
-                            callee: Box::new(right),
-                            type_args: None,
-                            args: vec![expr],
+
+                    Ok(Expr::new(
+                        ExprKind::Lambda {
+                            params,
+                            return_type: None,
+                            body: Box::new(method_expr),
                         },
                         span,
-                    );
+                    ))
                 }
             }
-        }
 
-        Ok(expr)
+            ExprKind::Binary { left, op, right } => Ok(Expr::new(
+                ExprKind::Binary {
+                    left: Box::new(self.desugar_currying(*left)?),
+                    op,
+                    right: Box::new(self.desugar_currying(*right)?),
+                },
+                span,
+            )),
+
+            ExprKind::Unary { op, operand } => Ok(Expr::new(
+                ExprKind::Unary {
+                    op,
+                    operand: Box::new(self.desugar_currying(*operand)?),
+                },
+                span,
+            )),
+
+            ExprKind::FieldAccess { object, field } => Ok(Expr::new(
+                ExprKind::FieldAccess {
+                    object: Box::new(self.desugar_currying(*object)?),
+                    field,
+                },
+                span,
+            )),
+
+            ExprKind::Index { object, index } => Ok(Expr::new(
+                ExprKind::Index {
+                    object: Box::new(self.desugar_currying(*object)?),
+                    index: Box::new(self.desugar_currying(*index)?),
+                },
+                span,
+            )),
+
+            ExprKind::Array(elements) => {
+                let elements = elements
+                    .into_iter()
+                    .map(|e| self.desugar_currying(e))
+                    .collect::<Result<Vec<Expr>>>()?;
+                Ok(Expr::new(ExprKind::Array(elements), span))
+            }
+
+            ExprKind::Map(pairs) => {
+                let mut desugared_pairs = Vec::new();
+                for (k, v) in pairs {
+                    let k = self.desugar_currying(k)?;
+                    let v = self.desugar_currying(v)?;
+                    desugared_pairs.push((k, v));
+                }
+                Ok(Expr::new(ExprKind::Map(desugared_pairs), span))
+            }
+
+            ExprKind::Tuple(elements) => {
+                let elements = elements
+                    .into_iter()
+                    .map(|e| self.desugar_currying(e))
+                    .collect::<Result<Vec<Expr>>>()?;
+                Ok(Expr::new(ExprKind::Tuple(elements), span))
+            }
+
+            ExprKind::StructLiteral { name, fields } => {
+                let mut desugared_fields = Vec::new();
+                for mut f in fields {
+                    f.value = self.desugar_currying(f.value)?;
+                    desugared_fields.push(f);
+                }
+                Ok(Expr::new(
+                    ExprKind::StructLiteral {
+                        name,
+                        fields: desugared_fields,
+                    },
+                    span,
+                ))
+            }
+
+            ExprKind::EnumConstructor {
+                enum_name,
+                variant,
+                args,
+            } => {
+                let desugared_args: Vec<Expr> = args
+                    .into_iter()
+                    .map(|a| self.desugar_currying_arg(a))
+                    .collect::<Result<Vec<Expr>>>()?;
+
+                let placeholder_indices: Vec<usize> = desugared_args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| is_placeholder(a))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if placeholder_indices.is_empty() {
+                    Ok(Expr::new(
+                        ExprKind::EnumConstructor {
+                            enum_name,
+                            variant,
+                            args: desugared_args,
+                        },
+                        span,
+                    ))
+                } else {
+                    let mut params = Vec::new();
+                    let mut final_args = desugared_args;
+                    for (param_idx, &arg_idx) in placeholder_indices.iter().enumerate() {
+                        let param_name = format!("__curry_{}", param_idx);
+                        let param_expr = Expr::new(
+                            ExprKind::Identifier(param_name.clone()),
+                            final_args[arg_idx].span,
+                        );
+                        final_args[arg_idx] = param_expr;
+                        params.push((param_name, None));
+                    }
+
+                    let enum_expr = Expr::new(
+                        ExprKind::EnumConstructor {
+                            enum_name,
+                            variant,
+                            args: final_args,
+                        },
+                        span,
+                    );
+
+                    Ok(Expr::new(
+                        ExprKind::Lambda {
+                            params,
+                            return_type: None,
+                            body: Box::new(enum_expr),
+                        },
+                        span,
+                    ))
+                }
+            }
+
+            ExprKind::Lambda {
+                params,
+                return_type,
+                body,
+            } => Ok(Expr::new(
+                ExprKind::Lambda {
+                    params,
+                    return_type,
+                    body: Box::new(self.desugar_currying(*body)?),
+                },
+                span,
+            )),
+
+            ExprKind::Paren(inner) => {
+                let inner = self.desugar_currying(*inner)?;
+                Ok(Expr::new(ExprKind::Paren(Box::new(inner)), span))
+            }
+
+            ExprKind::Cast { expr, target_type } => Ok(Expr::new(
+                ExprKind::Cast {
+                    expr: Box::new(self.desugar_currying(*expr)?),
+                    target_type,
+                },
+                span,
+            )),
+
+            ExprKind::TypeCheck { expr, check_type } => Ok(Expr::new(
+                ExprKind::TypeCheck {
+                    expr: Box::new(self.desugar_currying(*expr)?),
+                    check_type,
+                },
+                span,
+            )),
+
+            ExprKind::IsPattern { expr, pattern } => Ok(Expr::new(
+                ExprKind::IsPattern {
+                    expr: Box::new(self.desugar_currying(*expr)?),
+                    pattern,
+                },
+                span,
+            )),
+
+            ExprKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let condition = Box::new(self.desugar_currying(*condition)?);
+                let then_branch = Box::new(self.desugar_currying(*then_branch)?);
+                let else_branch = if let Some(e) = else_branch {
+                    Some(Box::new(self.desugar_currying(*e)?))
+                } else {
+                    None
+                };
+                Ok(Expr::new(
+                    ExprKind::If {
+                        condition,
+                        then_branch,
+                        else_branch,
+                    },
+                    span,
+                ))
+            }
+
+            ExprKind::Block(stmts) => Ok(Expr::new(ExprKind::Block(stmts), span)),
+
+            ExprKind::EffectBlock(stmts) => Ok(Expr::new(ExprKind::EffectBlock(stmts), span)),
+
+            ExprKind::Return(exprs) => {
+                let exprs = exprs
+                    .into_iter()
+                    .map(|e| self.desugar_currying(e))
+                    .collect::<Result<Vec<Expr>>>()?;
+                Ok(Expr::new(ExprKind::Return(exprs), span))
+            }
+
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => Ok(Expr::new(
+                ExprKind::Range {
+                    start: Box::new(self.desugar_currying(*start)?),
+                    end: Box::new(self.desugar_currying(*end)?),
+                    inclusive,
+                },
+                span,
+            )),
+
+            ExprKind::Literal(_) | ExprKind::Identifier(_) | ExprKind::RegexLiteral { .. } => {
+                Ok(Expr::new(expr.kind, span))
+            }
+        }
+    }
+
+    fn desugar_currying_arg(&self, arg: Expr) -> Result<Expr> {
+        if is_placeholder(&arg) {
+            Ok(arg)
+        } else {
+            self.desugar_currying(arg)
+        }
     }
 
     #[inline(never)]
@@ -171,7 +657,7 @@ impl Parser {
 
     fn parse_range(&mut self) -> Result<Expr> {
         let expr = self.parse_bit_or()?;
-        if self.match_token(&[TokenKind::DoubleDot]) {
+        if self.allow_range && self.match_token(&[TokenKind::DoubleDot]) {
             let end = self.parse_bit_or()?;
             let span = self.span_through_previous(expr.span);
             return Ok(Expr::new(
@@ -264,31 +750,9 @@ impl Parser {
         Ok(expr)
     }
 
-    fn is_string_like_expr(expr: &Expr) -> bool {
-        match &expr.kind {
-            ExprKind::Literal(Literal::String(_)) => true,
-            ExprKind::Binary {
-                op: BinaryOp::Concat,
-                ..
-            } => true,
-            _ => false,
-        }
-    }
-
     fn parse_concat(&mut self) -> Result<Expr> {
         let expr = self.parse_term()?;
-        if self.check(TokenKind::DoubleDot) {
-            if !Self::is_string_like_expr(&expr) {
-                let next_is_number = self
-                    .peek_ahead(1)
-                    .map(|next| matches!(next.kind, TokenKind::Integer | TokenKind::Float))
-                    .unwrap_or(false);
-                if next_is_number {
-                    return Ok(expr);
-                }
-            }
-
-            self.advance();
+        if !self.allow_range && self.match_token(&[TokenKind::DoubleDot]) {
             let right = self.parse_concat()?;
             let span = self.span_through_previous(expr.span);
             return Ok(Expr::new(
@@ -358,6 +822,34 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {
+        if self.match_token(&[TokenKind::Ampersand]) {
+            let start_token = self.tokens[self.current - 1].clone();
+            let is_mut =
+                self.check(TokenKind::Identifier) && self.current_token().lexeme == "mut";
+            if is_mut {
+                self.advance();
+            }
+            let operand = self.parse_unary()?;
+            let end_token = self.tokens[self.current - 1].clone();
+            let span = self.make_span(&start_token, &end_token);
+            let callee_name = if is_mut {
+                "__lust_borrow_mut"
+            } else {
+                "__lust_borrow"
+            };
+            return Ok(Expr::new(
+                ExprKind::Call {
+                    callee: Box::new(Expr::new(
+                        ExprKind::Identifier(callee_name.to_string()),
+                        span,
+                    )),
+                    type_args: None,
+                    args: vec![operand],
+                },
+                span,
+            ));
+        }
+
         if self.match_token(&[TokenKind::Minus, TokenKind::Not, TokenKind::Tilde]) {
             let start_token = self.tokens[self.current - 1].clone();
             let op = match start_token.kind {
@@ -366,6 +858,29 @@ impl Parser {
                 TokenKind::Tilde => UnaryOp::BitNot,
                 _ => unreachable!(),
             };
+
+            if op == UnaryOp::Neg && self.check(TokenKind::Integer) {
+                let next_token = self.current_token();
+                let clean: String = next_token.lexeme.chars().filter(|&c| c != '_').collect();
+                #[cfg(feature = "std")]
+                let is_min = clean == "9223372036854775808";
+                #[cfg(not(feature = "std"))]
+                let is_min = clean == "2147483648";
+
+                if is_min {
+                    let end_token = self.advance().clone();
+                    let span = self.make_span(&start_token, &end_token);
+                    #[cfg(feature = "std")]
+                    let min_val: i64 = i64::MIN;
+                    #[cfg(not(feature = "std"))]
+                    let min_val: i32 = i32::MIN;
+                    return Ok(Expr::new(
+                        ExprKind::Literal(Literal::Integer(min_val)),
+                        span,
+                    ));
+                }
+            }
+
             let operand = self.parse_unary()?;
             let end_token = self.tokens[self.current - 1].clone();
             return Ok(Expr::new(
@@ -398,6 +913,59 @@ impl Parser {
         Ok(expr)
     }
 
+    fn parse_call_arg(&mut self) -> Result<Expr> {
+        let mut lookahead = self.current;
+        let mut paren_count = 0;
+        while self.tokens.get(lookahead).is_some_and(|t| t.kind == TokenKind::LeftParen) {
+            paren_count += 1;
+            lookahead += 1;
+        }
+        if self
+            .tokens
+            .get(lookahead)
+            .is_some_and(|t| t.kind == TokenKind::Identifier && t.lexeme == "_")
+        {
+            let mut close_lookahead = lookahead + 1;
+            let mut close_count = 0;
+            while self
+                .tokens
+                .get(close_lookahead)
+                .is_some_and(|t| t.kind == TokenKind::RightParen)
+                && close_count < paren_count
+            {
+                close_count += 1;
+                close_lookahead += 1;
+            }
+            if close_count == paren_count {
+                let mut lparens = Vec::with_capacity(paren_count);
+                for _ in 0..paren_count {
+                    lparens.push(self.advance().clone());
+                }
+                let token = self.advance().clone();
+                let inner_span = Span::new(
+                    token.line,
+                    token.column,
+                    token.line,
+                    token.column.saturating_add(token.lexeme.chars().count()),
+                );
+                let mut expr = Expr::new(ExprKind::Identifier(token.lexeme), inner_span);
+                for i in (0..paren_count).rev() {
+                    let lp = &lparens[i];
+                    let rp = self.advance().clone();
+                    let span = Span::new(
+                        lp.line,
+                        lp.column,
+                        rp.line,
+                        rp.column.saturating_add(rp.lexeme.chars().count()),
+                    );
+                    expr = Expr::new(ExprKind::Paren(Box::new(expr)), span);
+                }
+                return Ok(expr);
+            }
+        }
+        self.parse_expr()
+    }
+
     #[inline(never)]
     fn parse_postfix(&mut self) -> Result<Expr> {
         let mut expr = self.parse_primary()?;
@@ -407,17 +975,43 @@ impl Parser {
                     self.advance();
                     let mut args = Vec::new();
                     if !self.check(TokenKind::RightParen) {
-                        args.push(self.parse_expr()?);
+                        args.push(self.parse_call_arg()?);
                         while self.match_token(&[TokenKind::Comma]) {
-                            args.push(self.parse_expr()?);
+                            args.push(self.parse_call_arg()?);
                         }
                     }
 
                     self.consume(TokenKind::RightParen, "Expected ')' after arguments")?;
                     let span = expr.span;
+                    let callee = match &expr.kind {
+                        ExprKind::FieldAccess { object, field }
+                            if matches!(&object.kind, ExprKind::Identifier(ns) if ns == "view") =>
+                        {
+                            match field.as_str() {
+                                "borrow" => Expr::new(
+                                    ExprKind::Identifier("__lust_borrow".to_string()),
+                                    span,
+                                ),
+                                "borrow_mut" => Expr::new(
+                                    ExprKind::Identifier("__lust_borrow_mut".to_string()),
+                                    span,
+                                ),
+                                "read" => Expr::new(
+                                    ExprKind::Identifier("__lust_view_read".to_string()),
+                                    span,
+                                ),
+                                "materialize" => Expr::new(
+                                    ExprKind::Identifier("__lust_materialize".to_string()),
+                                    span,
+                                ),
+                                _ => expr,
+                            }
+                        }
+                        _ => expr,
+                    };
                     expr = Expr::new(
                         ExprKind::Call {
-                            callee: Box::new(expr),
+                            callee: Box::new(callee),
                             type_args: None,
                             args,
                         },
@@ -430,9 +1024,9 @@ impl Parser {
                     self.consume(TokenKind::LeftParen, "Expected '(' after type arguments")?;
                     let mut args = Vec::new();
                     if !self.check(TokenKind::RightParen) {
-                        args.push(self.parse_expr()?);
+                        args.push(self.parse_call_arg()?);
                         while self.match_token(&[TokenKind::Comma]) {
-                            args.push(self.parse_expr()?);
+                            args.push(self.parse_call_arg()?);
                         }
                     }
                     self.consume(TokenKind::RightParen, "Expected ')' after arguments")?;
@@ -472,9 +1066,9 @@ impl Parser {
                     self.consume(TokenKind::LeftParen, "Expected '(' after method name")?;
                     let mut args = Vec::new();
                     if !self.check(TokenKind::RightParen) {
-                        args.push(self.parse_expr()?);
+                        args.push(self.parse_call_arg()?);
                         while self.match_token(&[TokenKind::Comma]) {
-                            args.push(self.parse_expr()?);
+                            args.push(self.parse_call_arg()?);
                         }
                     }
 
@@ -578,6 +1172,16 @@ impl Parser {
                         self.peek_ahead(1)
                             .map(|t| t.kind == TokenKind::LeftParen)
                             .unwrap_or(false)
+                    } else if matches!(
+                        self.peek_kind(),
+                        TokenKind::Integer
+                            | TokenKind::Float
+                            | TokenKind::String
+                            | TokenKind::True
+                            | TokenKind::False
+                            | TokenKind::Minus
+                    ) {
+                        true
                     } else {
                         false
                     };
@@ -707,17 +1311,15 @@ impl Parser {
         let kind = match self.peek_kind() {
             TokenKind::Integer => {
                 let token = self.advance();
-                let value = token
-                    .lexeme
-                    .parse::<LustInt>()
-                    .map_err(|_| self.error("Invalid integer literal"))?;
+                let value = parse_integer_literal(&token.lexeme)
+                    .map_err(|e| self.error(&format!("{}", e)))?;
                 ExprKind::Literal(Literal::Integer(value))
             }
 
             TokenKind::Float => {
                 let token = self.advance();
-                let value =
-                    parse_float(&token.lexeme).map_err(|_| self.error("Invalid float literal"))?;
+                let value = parse_float_literal(&token.lexeme)
+                    .map_err(|e| self.error(&format!("{}", e)))?;
                 ExprKind::Literal(Literal::Float(value))
             }
 
@@ -760,7 +1362,33 @@ impl Parser {
                 ));
             }
 
+            TokenKind::Handle => {
+                return self.parse_handle_expr(&start_token);
+            }
+
+            TokenKind::Perform => {
+                return self.parse_perform_expr(&start_token);
+            }
+
+            TokenKind::Resume => {
+                return self.parse_resume_expr(&start_token);
+            }
+
             TokenKind::Identifier => {
+                if (self.current_token().lexeme == "regex"
+                    || self.regex_aliases.contains(&self.current_token().lexeme))
+                    && self.peek_ahead(1).is_some_and(|t| t.kind == TokenKind::Bang)
+                    && self.peek_ahead(2).is_some_and(|t| t.kind == TokenKind::String)
+                {
+                    self.advance();
+                    self.advance();
+                    let str_token = self.advance().clone();
+                    let pattern = self.unescape_string_literal(&str_token)?;
+                    let end_token = self.tokens[self.current - 1].clone();
+                    let span = self.make_span(&start_token, &end_token);
+                    return Ok(Expr::new(ExprKind::RegexLiteral { pattern, span }, span));
+                }
+
                 if self.current_token().lexeme == "effect"
                     && (self.peek_ahead(1).is_some_and(|t| t.kind == TokenKind::Do || t.kind == TokenKind::LeftBrace))
                 {
@@ -782,6 +1410,26 @@ impl Parser {
                         ExprKind::EffectBlock(statements),
                         self.make_span(&start_token, &end_token),
                     ));
+                }
+
+                if self.current_token().lexeme == "handle" && self.peek_has_with() {
+                    return self.parse_handle_expr(&start_token);
+                }
+
+                if self.current_token().lexeme == "perform"
+                    && (self.peek_ahead(1).is_some_and(|t| {
+                        t.kind == TokenKind::Identifier
+                            || t.kind == TokenKind::String
+                            || t.kind == TokenKind::LeftParen
+                    }))
+                {
+                    return self.parse_perform_expr(&start_token);
+                }
+
+                if self.current_token().lexeme == "resume"
+                    && self.peek_ahead(1).is_some_and(|t| t.kind == TokenKind::LeftParen)
+                {
+                    return self.parse_resume_expr(&start_token);
                 }
 
                 let name = self.expect_identifier()?;
@@ -811,8 +1459,9 @@ impl Parser {
                 self.consume(TokenKind::RightParen, "Expected ')' after expression")?;
                 if expressions.len() == 1 {
                     let span = self.make_span(&start_token, &end_token);
+                    let inner = expressions.pop().expect("one expression present");
                     return Ok(Expr::new(
-                        ExprKind::Paren(Box::new(expressions.into_iter().next().unwrap())),
+                        ExprKind::Paren(Box::new(inner)),
                         span,
                     ));
                 } else {
@@ -952,7 +1601,9 @@ impl Parser {
                 } else if self.check(TokenKind::Identifier) {
                     let key_token = self.advance().clone();
                     let span = self.make_span(&key_token, &key_token);
-                    self.consume(TokenKind::Equal, "Expected '=' after map key")?;
+                    if !self.match_token(&[TokenKind::Equal, TokenKind::Colon]) {
+                        return Err(self.error("Expected '=' or ':' after map key"));
+                    }
                     let key_expr = Expr::new(
                         ExprKind::Literal(Literal::String(key_token.lexeme.clone())),
                         span,
@@ -1058,6 +1709,44 @@ impl Parser {
                 }
             }
 
+            TokenKind::Minus => {
+                self.advance();
+                match self.peek_kind() {
+                    TokenKind::Integer => {
+                        let token = self.advance().clone();
+                        let clean: String = token.lexeme.chars().filter(|&c| c != '_').collect();
+                        #[cfg(feature = "std")]
+                        let is_min = clean == "9223372036854775808";
+                        #[cfg(not(feature = "std"))]
+                        let is_min = clean == "2147483648";
+
+                        let lit = if is_min {
+                            #[cfg(feature = "std")]
+                            let min_val: i64 = i64::MIN;
+                            #[cfg(not(feature = "std"))]
+                            let min_val: i32 = i32::MIN;
+                            Literal::Integer(min_val)
+                        } else {
+                            let value = parse_integer_literal(&token.lexeme)
+                                .map_err(|e| self.error(&format!("{}", e)))?;
+                            Literal::Integer(
+                                value.checked_neg().ok_or_else(|| {
+                                    self.error("Integer overflow in pattern negation")
+                                })?,
+                            )
+                        };
+                        Ok(Pattern::Literal(lit))
+                    }
+                    TokenKind::Float => {
+                        let token = self.advance().clone();
+                        let value = parse_float_literal(&token.lexeme)
+                            .map_err(|e| self.error(&format!("{}", e)))?;
+                        Ok(Pattern::Literal(Literal::Float(-value)))
+                    }
+                    _ => Err(self.error("Expected integer or float literal after '-' in pattern")),
+                }
+            }
+
             TokenKind::Integer
             | TokenKind::Float
             | TokenKind::String
@@ -1065,8 +1754,16 @@ impl Parser {
             | TokenKind::False => {
                 let token = self.advance().clone();
                 let lit = match token.kind {
-                    TokenKind::Integer => Literal::Integer(token.lexeme.parse().unwrap()),
-                    TokenKind::Float => Literal::Float(token.lexeme.parse().unwrap()),
+                    TokenKind::Integer => {
+                        let value = parse_integer_literal(&token.lexeme)
+                            .map_err(|e| self.error(&format!("{}", e)))?;
+                        Literal::Integer(value)
+                    }
+                    TokenKind::Float => {
+                        let value = parse_float_literal(&token.lexeme)
+                            .map_err(|e| self.error(&format!("{}", e)))?;
+                        Literal::Float(value)
+                    }
                     TokenKind::String => {
                         let s = self.unescape_string_literal(&token)?;
                         Literal::String(s)
@@ -1203,6 +1900,209 @@ impl Parser {
             },
             self.make_span(&start_token, &end_token),
         ))
+    }
+
+    fn peek_has_with(&self) -> bool {
+        let mut i = 1;
+        let mut depth = 0;
+        while let Some(tok) = self.peek_ahead(i) {
+            match tok.kind {
+                TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace | TokenKind::Do => {
+                    depth += 1;
+                }
+                TokenKind::RightParen | TokenKind::RightBracket | TokenKind::RightBrace => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                TokenKind::End => {
+                    if depth > 0 {
+                        depth -= 1;
+                    } else {
+                        return false;
+                    }
+                }
+                TokenKind::With => {
+                    if depth == 0 {
+                        return true;
+                    }
+                }
+                TokenKind::Identifier if tok.lexeme == "with" => {
+                    if depth == 0 {
+                        return true;
+                    }
+                }
+                TokenKind::Semicolon => {
+                    if depth == 0 {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn parse_handle_expr(&mut self, start_token: &Token) -> Result<Expr> {
+        self.advance();
+        let body = if self.match_token(&[TokenKind::Do]) {
+            let mut stmts = Vec::new();
+            while !self.check(TokenKind::End) && !self.is_at_end() {
+                stmts.push(self.parse_stmt()?);
+            }
+            self.consume(TokenKind::End, "Expected 'end' after handle do block")?;
+            let end_tok = self.tokens[self.current - 1].clone();
+            Expr::new(ExprKind::Block(stmts), self.make_span(start_token, &end_tok))
+        } else if self.match_token(&[TokenKind::LeftBrace]) {
+            let mut stmts = Vec::new();
+            while !self.check(TokenKind::RightBrace) && !self.is_at_end() {
+                stmts.push(self.parse_stmt()?);
+            }
+            self.consume(TokenKind::RightBrace, "Expected '}' after handle block")?;
+            let end_tok = self.tokens[self.current - 1].clone();
+            Expr::new(ExprKind::Block(stmts), self.make_span(start_token, &end_tok))
+        } else if self.check(TokenKind::Local)
+            || self.check(TokenKind::While)
+            || self.check(TokenKind::For)
+            || self.check(TokenKind::If)
+            || self.check(TokenKind::Return)
+        {
+            let mut stmts = Vec::new();
+            while !self.check(TokenKind::With)
+                && !(self.check(TokenKind::Identifier) && self.current_token().lexeme == "with")
+                && !self.is_at_end()
+            {
+                stmts.push(self.parse_stmt()?);
+            }
+            let end_tok = self.tokens[self.current - 1].clone();
+            Expr::new(ExprKind::Block(stmts), self.make_span(start_token, &end_tok))
+        } else {
+            self.parse_expr()?
+        };
+
+        if self.check(TokenKind::With) {
+            self.advance();
+        } else if self.check(TokenKind::Identifier) && self.current_token().lexeme == "with" {
+            self.advance();
+        } else {
+            return Err(self.error("Expected 'with' after handle body"));
+        }
+
+        let has_brace = self.match_token(&[TokenKind::LeftBrace]);
+        let mut arms = Vec::new();
+        while !self.check(TokenKind::End)
+            && !(has_brace && self.check(TokenKind::RightBrace))
+            && !self.is_at_end()
+        {
+            let arm_start = self.current_token().clone();
+            if self.check(TokenKind::Identifier) && self.current_token().lexeme == "case" {
+                self.advance();
+            }
+            let effect_name = self.expect_identifier()?;
+            let mut params = Vec::new();
+            if self.match_token(&[TokenKind::LeftParen]) {
+                if !self.check(TokenKind::RightParen) {
+                    loop {
+                        params.push(self.expect_identifier()?);
+                        if !self.match_token(&[TokenKind::Comma]) {
+                            break;
+                        }
+                    }
+                }
+                self.consume(TokenKind::RightParen, "Expected ')' after handler arm parameters")?;
+            }
+            self.consume(TokenKind::FatArrow, "Expected '=>' after handler arm pattern")?;
+            let arm_body = if self.match_token(&[TokenKind::LeftBrace]) {
+                let mut stmts = Vec::new();
+                while !self.check(TokenKind::RightBrace) && !self.is_at_end() {
+                    stmts.push(self.parse_stmt()?);
+                }
+                self.consume(TokenKind::RightBrace, "Expected '}' after handler arm block")?;
+                let arm_end = self.tokens[self.current - 1].clone();
+                Expr::new(ExprKind::Block(stmts), self.make_span(&arm_start, &arm_end))
+            } else {
+                self.parse_expr()?
+            };
+            let arm_end = self.tokens[self.current - 1].clone();
+            let arm_span = self.make_span(&arm_start, &arm_end);
+            arms.push(crate::ast::expr::HandlerArm {
+                effect_name,
+                params,
+                body: Box::new(arm_body),
+                span: arm_span,
+            });
+            self.match_token(&[TokenKind::Comma, TokenKind::Semicolon]);
+        }
+        if has_brace {
+            self.consume(TokenKind::RightBrace, "Expected '}' after handler arms")?;
+        } else {
+            self.consume(TokenKind::End, "Expected 'end' after handler arms")?;
+        }
+        let end_token = self.tokens[self.current - 1].clone();
+        let total_span = self.make_span(start_token, &end_token);
+        Ok(Expr::new_handle(body, arms, total_span))
+    }
+
+    fn parse_perform_expr(&mut self, start_token: &Token) -> Result<Expr> {
+        self.advance();
+        if self.match_token(&[TokenKind::LeftParen]) {
+            let effect_name = if self.check(TokenKind::String) {
+                let token = self.advance().clone();
+                self.unescape_string_literal(&token)?
+            } else {
+                self.expect_identifier()?
+            };
+            let mut args = Vec::new();
+            if self.match_token(&[TokenKind::Comma]) {
+                let first_arg = self.parse_expr()?;
+                if let ExprKind::Array(elems) = first_arg.kind {
+                    args = elems;
+                } else {
+                    args.push(first_arg);
+                    while self.match_token(&[TokenKind::Comma]) {
+                        args.push(self.parse_expr()?);
+                    }
+                }
+            }
+            self.consume(TokenKind::RightParen, "Expected ')' after perform arguments")?;
+            let end_token = self.tokens[self.current - 1].clone();
+            Ok(Expr::new_perform(effect_name, args, self.make_span(start_token, &end_token)))
+        } else {
+            let effect_name = self.expect_identifier()?;
+            let mut args = Vec::new();
+            if self.match_token(&[TokenKind::LeftParen]) {
+                if !self.check(TokenKind::RightParen) {
+                    loop {
+                        args.push(self.parse_expr()?);
+                        if !self.match_token(&[TokenKind::Comma]) {
+                            break;
+                        }
+                    }
+                }
+                self.consume(TokenKind::RightParen, "Expected ')' after effect arguments")?;
+            }
+            let end_token = self.tokens[self.current - 1].clone();
+            Ok(Expr::new_perform(effect_name, args, self.make_span(start_token, &end_token)))
+        }
+    }
+
+    fn parse_resume_expr(&mut self, start_token: &Token) -> Result<Expr> {
+        self.advance();
+        self.consume(TokenKind::LeftParen, "Expected '(' after 'resume'")?;
+        let val = if self.match_token(&[TokenKind::RightParen]) {
+            Expr::new(
+                ExprKind::Literal(Literal::Bool(false)),
+                self.make_span(start_token, &self.tokens[self.current - 1]),
+            )
+        } else {
+            let expr = self.parse_expr()?;
+            self.consume(TokenKind::RightParen, "Expected ')' after resume value")?;
+            expr
+        };
+        let end_token = self.tokens[self.current - 1].clone();
+        Ok(Expr::new_resume(val, self.make_span(start_token, &end_token)))
     }
 }
 
@@ -1416,19 +2316,60 @@ mod tests {
 
     #[test]
     fn test_string_concat_vs_range() {
-        let expr = parse_expression("\"str\" .. 10");
-        match &expr.kind {
-            ExprKind::Binary {
-                op: BinaryOp::Concat,
-                ..
-            } => {}
-            other => panic!("expected Concat for \"str\" .. 10, got {:?}", other),
+        use crate::ast::{ItemKind, StmtKind};
+        for expr_src in ["\"str\" .. 10", "s .. tostring(i % 10)", "a .. b"] {
+            let expr = parse_expression(expr_src);
+            match &expr.kind {
+                ExprKind::Binary {
+                    op: BinaryOp::Concat,
+                    ..
+                } => {}
+                other => panic!("expected Concat for `{expr_src}`, got {:?}", other),
+            }
         }
 
-        let expr = parse_expression("1..10");
-        match &expr.kind {
-            ExprKind::Range { .. } => {}
-            other => panic!("expected Range for 1..10, got {:?}", other),
+        for for_src in ["for i in 1..10 do end", "for i in a..b do end"] {
+            let mut interner = Interner::new();
+            let tokens = Lexer::new(for_src, &mut interner).tokenize().expect("tokenize");
+            let items = Parser::new(tokens).parse().expect("parse");
+            match &items[0].kind {
+                ItemKind::Script(stmts) => match &stmts[0].kind {
+                    StmtKind::ForIn { iterator, .. } => {
+                        assert!(
+                            matches!(iterator.kind, ExprKind::Range { .. }),
+                            "expected Range for `{for_src}`, got {:?}",
+                            iterator.kind
+                        );
+                    }
+                    other => panic!("expected ForIn for `{for_src}`, got {:?}", other),
+                },
+                other => panic!("expected Script for `{for_src}`, got {:?}", other),
+            }
+        }
+
+        let mut interner = Interner::new();
+        let tokens = Lexer::new("for x in split(s .. t) do end", &mut interner)
+            .tokenize()
+            .expect("tokenize");
+        let items = Parser::new(tokens).parse().expect("parse");
+        match &items[0].kind {
+            ItemKind::Script(stmts) => match &stmts[0].kind {
+                StmtKind::ForIn { iterator, .. } => match &iterator.kind {
+                    ExprKind::Call { args, .. } => {
+                        assert_eq!(args.len(), 1);
+                        assert!(matches!(
+                            args[0].kind,
+                            ExprKind::Binary {
+                                op: BinaryOp::Concat,
+                                ..
+                            }
+                        ));
+                    }
+                    other => panic!("expected Call(split, [Concat]), got {:?}", other),
+                },
+                other => panic!("expected ForIn, got {:?}", other),
+            },
+            other => panic!("expected Script, got {:?}", other),
         }
     }
 
@@ -1440,5 +2381,29 @@ mod tests {
         let mut parser = Parser::new(tokens);
         let items = parser.parse().expect("parse items");
         assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn test_algebraic_handlers_parsing() {
+        let code = r#"
+            handle
+                local x = perform Read("foo.txt")
+                return x + 1
+            with
+                case Read(path) => resume(10)
+            end
+        "#;
+        let expr = parse_expression(code);
+        match &expr.kind {
+            ExprKind::Call { callee, args, .. } => {
+                if let ExprKind::Identifier(name) = &callee.kind {
+                    assert_eq!(name, "__lust_handle");
+                    assert_eq!(args.len(), 2);
+                } else {
+                    panic!("expected __lust_handle identifier call");
+                }
+            }
+            other => panic!("expected handle call, got {:?}", other),
+        }
     }
 }

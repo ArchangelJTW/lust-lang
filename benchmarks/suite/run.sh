@@ -1,97 +1,256 @@
 #!/bin/bash
-# Cross-language suite: Lust interpreter, Lust JIT, LuaJIT, Lua.
-# Usage: benchmarks/suite/run.sh [path/to/lust]   (default: target/release/lust)
+# Cross-language suite: Native Rust, Lust C11 AOT (--backend c), Lust AOT
+# (--backend rust|zig|mir|mir-zig|c|mir-c), LuaJIT, Lust Cranelift JIT
+# (--jit=cranelift), Lust Bytecode VM (--jit=off), Lua.
 #
-# Each engine gets at most $TIMEOUT seconds per program (default 120), so one
-# slow row reports "timeout" instead of hanging the suite. Every program is
-# run in a private working directory: the suite writes no files, but that
-# keeps a stray one from changing a later run.
-export D=$(cd "$(dirname "$0")" && pwd)
-export LUST=${1:-"$D/../../target/release/lust"}
+# Usage:
+#   benchmarks/suite/run.sh [path/to/lust] [--backend rust|zig|c|mir-c|mir|mir-zig] [--cache-dir <dir>]
+#
+# Defaults:
+#   LUST        = target/release/lust
+#   AOT_BACKEND = rust (override with --backend or LUST_AOT_BACKEND)
+#   TIMEOUT     = 120 seconds per program
+#
+# Each engine gets at most $TIMEOUT seconds per program, so one slow row reports
+# "timeout" instead of hanging the suite. Every program is run in a private
+# working directory so no stray file can perturb a later run.
+set -euo pipefail
+
+D=$(cd "$(dirname "$0")" && pwd)
+LUST=""
+AOT_BACKEND="${LUST_AOT_BACKEND:-rust}"
+AOT_CACHE_DIR="${LUST_AOT_CACHE_DIR:-}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --backend)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --backend requires an argument (rust, zig, c, mir-c, mir, mir-zig)" >&2
+                exit 2
+            fi
+            AOT_BACKEND="$2"
+            shift 2
+            ;;
+        --backend=*)
+            AOT_BACKEND="${1#--backend=}"
+            shift
+            ;;
+        --cache-dir)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --cache-dir requires a directory argument" >&2
+                exit 2
+            fi
+            AOT_CACHE_DIR="$2"
+            shift 2
+            ;;
+        --cache-dir=*)
+            AOT_CACHE_DIR="${1#--cache-dir=}"
+            shift
+            ;;
+        -h|--help)
+            sed -n '2,16p' "$0"
+            exit 0
+            ;;
+        *)
+            if [[ -z "$LUST" ]]; then
+                LUST="$1"
+                shift
+            else
+                echo "Error: unexpected argument '$1'" >&2
+                exit 2
+            fi
+            ;;
+    esac
+done
+
+LUST="${LUST:-$D/../../target/release/lust}"
 RUST_MANIFEST="$D/rust/Cargo.toml"
 RUST_BIN="$D/rust/target/release/suite-rust"
+TIMEOUT="${TIMEOUT:-120}"
+
 cargo build --release --manifest-path "$RUST_MANIFEST" >&2
-export TIMEOUT=${TIMEOUT:-120}
+
+export D LUST AOT_BACKEND AOT_CACHE_DIR RUST_BIN TIMEOUT
+
 exec python3 - << 'EOF'
-import os, sys, time, subprocess, tempfile
+import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
 
 suite_dir = Path(os.environ["D"])
 lust_bin = Path(os.environ["LUST"])
-rust_bin = suite_dir / "rust/target/release/suite-rust"
+rust_bin = Path(os.environ["RUST_BIN"])
+aot_backend = os.environ.get("AOT_BACKEND", "rust")
+explicit_cache_dir = os.environ.get("AOT_CACHE_DIR", "").strip()
+timeout_s = int(os.environ.get("TIMEOUT", "120"))
 
-programs = ["fields", "array", "sieve", "calls", "methods", "strings", "fib", "nested", "floatmath", "tree"]
+has_luajit = shutil.which("luajit") is not None
+has_lua = shutil.which("lua") is not None
+
+programs = [
+    "fields",
+    "array",
+    "sieve",
+    "calls",
+    "methods",
+    "strings",
+    "fib",
+    "nested",
+    "floatmath",
+    "tree",
+]
 
 with tempfile.TemporaryDirectory(dir="/tmp") as td:
+    td_path = Path(td)
+    rlib_cache_dir = Path(explicit_cache_dir) if explicit_cache_dir else (td_path / "rlib_cache")
+
     def run_cmd(cmd, env=None):
         e = os.environ.copy()
         if env:
             e.update(env)
         start = time.perf_counter_ns()
         try:
-            res = subprocess.run(cmd, cwd=td, env=e, capture_output=True, text=True, timeout=int(os.environ.get("TIMEOUT", 120)))
+            res = subprocess.run(
+                cmd,
+                cwd=td,
+                env=e,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
             dur_ms = (time.perf_counter_ns() - start) / 1_000_000
             last_line = res.stdout.strip().splitlines()[-1] if res.stdout.strip() else ""
             if res.returncode != 0:
-                return "crash/error", f"<exit {res.returncode}>"
-            return f"{dur_ms:6.1f} ms", last_line
-        except FileNotFoundError:
-            return "n/a", ""
+                return None, "crash/error", f"<exit {res.returncode}>"
+            return dur_ms, f"{dur_ms:6.1f} ms", last_line
         except subprocess.TimeoutExpired:
-            return "timeout", "<timeout>"
+            return None, "timeout", "<timeout>"
+        except FileNotFoundError:
+            return None, "n/a", ""
 
     c_bins = {}
     print("Building Lust C11 AOT binaries (--backend c --release-fast)...", file=sys.stderr)
     for prog in programs:
-        bin_path = Path(td) / f"{prog}_c"
-        res = subprocess.run([str(lust_bin), "build", str(suite_dir / f"{prog}.lust"), "--backend", "c", "-o", str(bin_path), "--release-fast"], capture_output=True, text=True)
-        if res.returncode == 0:
+        bin_path = td_path / f"{prog}_c"
+        res = subprocess.run(
+            [
+                str(lust_bin),
+                "build",
+                str(suite_dir / f"{prog}.lust"),
+                "--backend",
+                "c",
+                "-o",
+                str(bin_path),
+                "--release-fast",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0 and bin_path.exists():
             c_bins[prog] = bin_path
             subprocess.run([str(bin_path)], capture_output=True)
         else:
             print(f"Failed to build C11 AOT for {prog}: {res.stderr}", file=sys.stderr)
 
     aot_bins = {}
-    print("Building Lust Zig AOT binaries (--backend zig --release-fast)...", file=sys.stderr)
+    print(
+        f"Building Lust AOT binaries (--backend {aot_backend} --release-fast)...",
+        file=sys.stderr,
+    )
     for prog in programs:
-        bin_path = Path(td) / f"{prog}_aot"
-        res = subprocess.run([str(lust_bin), "build", str(suite_dir / f"{prog}.lust"), "--backend", "zig", "-o", str(bin_path), "--release-fast"], capture_output=True, text=True)
-        if res.returncode == 0:
+        bin_path = td_path / f"{prog}_aot"
+        build_cmd = [
+            str(lust_bin),
+            "build",
+            str(suite_dir / f"{prog}.lust"),
+            "--backend",
+            aot_backend,
+            "-o",
+            str(bin_path),
+            "--release-fast",
+        ]
+        if aot_backend.lower() == "rust":
+            build_cmd.extend(["--cache-dir", str(rlib_cache_dir)])
+        res = subprocess.run(build_cmd, capture_output=True, text=True)
+        if res.returncode == 0 and bin_path.exists():
             aot_bins[prog] = bin_path
             # One warmup execution to prime dyld / code signing cache
             subprocess.run([str(bin_path)], capture_output=True)
         else:
-            print(f"Failed to build Zig AOT for {prog}: {res.stderr}", file=sys.stderr)
+            print(f"Failed to build AOT ({aot_backend}) for {prog}: {res.stderr}", file=sys.stderr)
 
-    print(f"{'program':<10} {'rust':>9} {'lust-c':>10} {'lust-zig':>10} {'luajit':>9} {'lust-jit':>10} {'lust-vm':>10} {'lua':>9}   outputs")
+    print(
+        f"{'program':<10} {'rust':>9} {'lust-c':>10} {'lust-aot':>10} {'aot/rust':>8} {'luajit':>9} {'lust-jit':>10} {'lust-vm':>10} {'lua':>9}   outputs"
+    )
 
+    had_lust_mismatch = False
     for prog in programs:
-        t_rust, o_rust = run_cmd([str(rust_bin), prog])
+        ms_rust, t_rust, o_rust = run_cmd([str(rust_bin), prog])
         if prog in c_bins:
-            t_c, o_c = run_cmd([str(c_bins[prog])])
+            _, t_c, o_c = run_cmd([str(c_bins[prog])])
         else:
             t_c, o_c = "n/a", ""
         if prog in aot_bins:
-            t_aot, o_aot = run_cmd([str(aot_bins[prog])])
+            ms_aot, t_aot, o_aot = run_cmd([str(aot_bins[prog])])
         else:
-            t_aot, o_aot = "n/a", ""
-        t_jit, o_jit = run_cmd([str(lust_bin), str(suite_dir / f"{prog}.lust")], {"LUST_JIT": "1"})
-        t_vm, o_vm = run_cmd([str(lust_bin), str(suite_dir / f"{prog}.lust")], {"LUST_JIT": "0"})
-        t_lj, o_lj = run_cmd(["luajit", str(suite_dir / f"{prog}.lua")])
-        t_lua, o_lua = run_cmd(["lua", str(suite_dir / f"{prog}.lua")])
-        
-        outputs = [("rust", t_rust, o_rust), ("c", t_c, o_c), ("zig", t_aot, o_aot), ("jit", t_jit, o_jit), ("luajit", t_lj, o_lj), ("vm", t_vm, o_vm), ("lua", t_lua, o_lua)]
-        reference = outputs[0][2]
-        def match_val(a, b):
+            ms_aot, t_aot, o_aot = None, "n/a", ""
+
+        if ms_rust and ms_aot is not None and ms_rust > 0:
+            ratio_str = f"{ms_aot / ms_rust:7.2f}x"
+        else:
+            ratio_str = "     n/a"
+
+        _, t_jit, o_jit = run_cmd(
+            [str(lust_bin), "run", str(suite_dir / f"{prog}.lust"), "--jit=cranelift"]
+        )
+        _, t_vm, o_vm = run_cmd(
+            [str(lust_bin), "run", str(suite_dir / f"{prog}.lust"), "--jit=off"]
+        )
+        if has_luajit:
+            _, t_lj, o_lj = run_cmd(["luajit", str(suite_dir / f"{prog}.lua")])
+        else:
+            t_lj, o_lj = "n/a", ""
+        if has_lua:
+            _, t_lua, o_lua = run_cmd(["lua", str(suite_dir / f"{prog}.lua")])
+        else:
+            t_lua, o_lua = "n/a", ""
+
+        lust_outputs = [("aot", o_aot), ("jit", o_jit), ("vm", o_vm)]
+        if t_c != "n/a":
+            lust_outputs.insert(0, ("c", o_c))
+        ext_outputs = []
+        if has_luajit:
+            ext_outputs.append(("luajit", o_lj))
+        if has_lua:
+            ext_outputs.append(("lua", o_lua))
+
+        def match_val(a, b, exact_only=False):
             if a == b:
                 return True
+            if exact_only:
+                return False
             try:
                 fa, fb = float(a), float(b)
-                import math
                 return math.isclose(fa, fb, rel_tol=1e-6)
             except ValueError:
                 return False
-        diff = [name for name, timing, output in outputs[1:] if timing != "n/a" and not match_val(reference, output)]
+
+        lust_diff = [name for name, output in lust_outputs if not match_val(o_rust, output, exact_only=True)]
+        ext_diff = [name for name, output in ext_outputs if not match_val(o_rust, output, exact_only=False)]
+        diff = lust_diff + ext_diff
+        if lust_diff:
+            had_lust_mismatch = True
+
         status = "same" if not diff else "DIFF: rust!=" + ",".join(diff)
-        print(f"{prog:<10} {t_rust:>9} {t_c:>10} {t_aot:>10} {t_lj:>9} {t_jit:>10} {t_vm:>10} {t_lua:>9}   {status}")
+        print(
+            f"{prog:<10} {t_rust:>9} {t_c:>10} {t_aot:>10} {ratio_str:>8} {t_lj:>9} {t_jit:>10} {t_vm:>10} {t_lua:>9}   {status}"
+        )
+
+    if had_lust_mismatch:
+        sys.exit(1)
 EOF

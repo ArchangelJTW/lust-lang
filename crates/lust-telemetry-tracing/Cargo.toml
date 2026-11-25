@@ -1,0 +1,14 @@
+[package]
+name = "lust-telemetry-tracing"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Tracing subscriber and exporter adapter for Lust Runtime"
+
+[features]
+default = ["tracing-crate"]
+tracing-crate = ["dep:tracing", "dep:tracing-subscriber"]
+
+[dependencies]
+tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi"], optional = true }

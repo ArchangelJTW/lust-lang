@@ -1,0 +1,45 @@
+-- Lust Test Framework - Lifecycle Hooks & Nested Suites Showcase
+-- Demonstrates suite-level execution with before_each, after_each, before_all, after_all, and nested describe blocks.
+
+suite "User Repository & Session Manager" do
+    before_all do
+        local pool_size = 10
+    end
+
+    after_all do
+        local pool_drained = true
+    end
+
+    before_each do
+        local tx_id = 42
+    end
+
+    after_each do
+        local tx_clean = true
+    end
+
+    test "creates and verifies active user session" do
+        local session_id = 999
+        assert(session_id > 0)
+        assert(session_id == 999)
+    end
+
+    test "handles expired tokens gracefully" do
+        local is_expired = true
+        assert(is_expired, "Token must be expired")
+    end
+
+    describe "Security & Rate Limiting" do
+        before_each do
+            local rate_limit_window_ms = 1000
+        end
+
+        test "blocks requests exceeding threshold" do
+            local attempts = 15
+            local max_allowed = 10
+            assert(attempts > max_allowed)
+        end
+    end
+end
+
+println("All lifecycle hook suite declarations verified!")

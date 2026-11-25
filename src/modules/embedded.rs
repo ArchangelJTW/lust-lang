@@ -407,7 +407,10 @@ fn collect_deps_from_lua_require_expr(expr: &crate::ast::Expr, deps: &mut HashSe
             collect_deps_from_lua_require_expr(start, deps);
             collect_deps_from_lua_require_expr(end, deps);
         }
-        ExprKind::Literal(Literal::String(_)) | ExprKind::Literal(_) | ExprKind::Identifier(_) => {}
+        ExprKind::Literal(Literal::String(_))
+        | ExprKind::Literal(_)
+        | ExprKind::Identifier(_)
+        | ExprKind::RegexLiteral { .. } => {}
         ExprKind::EffectBlock(stmts) => {
             for stmt in stmts {
                 collect_deps_from_lua_require_stmt(stmt, deps);
@@ -550,6 +553,30 @@ fn finalize_module(
     let mut module = registry
         .remove(module_name)
         .ok_or_else(|| LustError::Unknown(format!("Unknown module '{}'", module_name)))?;
+
+    for item in &module.items {
+        match &item.kind {
+            ItemKind::Function(func) => {
+                if func.visibility == crate::ast::Visibility::Public {
+                    let fq = format!("{}.{}", module_name, func.name);
+                    module.exports.functions.insert(func.name.clone(), fq);
+                }
+            }
+            ItemKind::Struct(s) => {
+                if s.visibility == crate::ast::Visibility::Public {
+                    let fq = format!("{}.{}", module_name, s.name);
+                    module.exports.types.insert(s.name.clone(), fq);
+                }
+            }
+            ItemKind::Enum(e) => {
+                if e.visibility == crate::ast::Visibility::Public {
+                    let fq = format!("{}.{}", module_name, e.name);
+                    module.exports.types.insert(e.name.clone(), fq);
+                }
+            }
+            _ => {}
+        }
+    }
 
     let registry_ref = ModuleRegistryView { modules: registry };
     for item in &module.items {
@@ -910,7 +937,7 @@ fn validate_dynamic_imports_in_expr(expr: &crate::ast::Expr, config: &crate::con
             validate_dynamic_imports_in_expr(start, config)?;
             validate_dynamic_imports_in_expr(end, config)?;
         }
-        ExprKind::Literal(_) | ExprKind::Identifier(_) => {}
+        ExprKind::Literal(_) | ExprKind::Identifier(_) | ExprKind::RegexLiteral { .. } => {}
         ExprKind::EffectBlock(stmts) => {
             for s in stmts {
                 validate_dynamic_imports_in_stmt(s, config)?;

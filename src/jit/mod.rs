@@ -1,9 +1,3 @@
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
-pub mod codegen;
-#[cfg(all(feature = "std", target_arch = "aarch64"))]
-pub mod codegen_aarch64;
-#[cfg(all(feature = "rv32", target_arch = "riscv32"))]
-pub mod codegen_rv32;
 pub mod function;
 pub mod layout;
 pub mod optimizer;
@@ -12,26 +6,35 @@ pub mod specialization;
 pub mod trace;
 use crate::VM;
 use crate::bytecode::Value;
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
-pub use codegen::JitCompiler;
-#[cfg(all(feature = "std", target_arch = "aarch64"))]
-pub use codegen_aarch64::JitCompiler;
-#[cfg(all(feature = "rv32", target_arch = "riscv32"))]
-pub use codegen_rv32::JitCompiler;
-#[cfg(not(any(
-    all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
-    all(feature = "rv32", target_arch = "riscv32")
-)))]
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Dynasm retirement flag: defaults to true (Dynasm retired in favor of Cranelift).
+/// All legacy Dynasm/dynasmrt usage has been removed from src/jit; calls safely fall back.
+pub static DYNASM_RETIRED: AtomicBool = AtomicBool::new(true);
+
+#[inline]
+pub fn is_dynasm_retired() -> bool {
+    DYNASM_RETIRED.load(Ordering::SeqCst)
+}
+
+pub fn set_dynasm_retired(retired: bool) {
+    DYNASM_RETIRED.store(retired, Ordering::SeqCst);
+}
+
+#[inline]
+pub fn is_rv32_execution_blocked() -> bool {
+    // RV32 execution is a separate BLOCKED sub-gate on this host (no rv32 runner/hardware)
+    true
+}
+
+#[derive(Default, Debug, Clone)]
 pub struct JitCompiler;
 use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
 use hashbrown::{HashMap, HashSet};
 pub use optimizer::TraceOptimizer;
 pub use profiler::{HotSpot, Profiler};
 pub use trace::{Trace, TraceOp, TraceRecorder};
-#[cfg(not(any(
-    all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
-    all(feature = "rv32", target_arch = "riscv32")
-)))]
+
 impl JitCompiler {
     pub fn new() -> Self {
         Self
@@ -49,7 +52,21 @@ impl JitCompiler {
         _hoisted_constants: Vec<(u8, Value)>,
     ) -> crate::Result<CompiledTrace> {
         Err(crate::LustError::RuntimeError {
-            message: "JIT is unavailable: enable `std` (x86_64/aarch64) or `rv32` (riscv32)".into(),
+            message: "Dynasm JIT is retired: safe fallback to Cranelift/interpreter active".into(),
+        })
+    }
+
+    pub fn compile_function(
+        &mut self,
+        _trace: &Trace,
+        _trace_id: TraceId,
+        _register_count: u8,
+        _entry_table: usize,
+        _result_type: Option<crate::jit::trace::ValueType>,
+        _hoisted_constants: Vec<(u8, Value)>,
+    ) -> crate::Result<CompiledTrace> {
+        Err(crate::LustError::RuntimeError {
+            message: "Dynasm JIT is retired: safe fallback to Cranelift/interpreter active".into(),
         })
     }
 }
@@ -192,12 +209,7 @@ pub struct CompiledTrace {
     /// `(registers, vm, record, result)`: the record and the result slot
     /// are what a native caller passes (see `compile_call_direct`); the
     /// interpreter passes null for both.
-    entry: extern "C" fn(*mut Value, *mut VM, *const crate::bytecode::Function, *mut Value) -> i32,
-    #[cfg(any(
-        all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
-        all(feature = "rv32", target_arch = "riscv32")
-    ))]
-    _executable: dynasmrt::ExecutableBuffer,
+    entry: Option<extern "C" fn(*mut Value, *mut VM, *const crate::bytecode::Function, *mut Value) -> i32>,
     _data: Vec<JitData>,
     pub trace: Trace,
     pub guards: Vec<Guard>,
@@ -215,7 +227,11 @@ impl CompiledTrace {
         vm: *mut VM,
         function: *const crate::bytecode::Function,
     ) -> i32 {
-        (self.entry)(registers, vm, function, core::ptr::null_mut())
+        if let Some(entry) = self.entry {
+            (entry)(registers, vm, function, core::ptr::null_mut())
+        } else {
+            -1
+        }
     }
 }
 
@@ -479,7 +495,7 @@ impl JitState {
         allow(dead_code)
     )]
     pub(crate) fn store_function_code(&mut self, func_idx: usize, code: CompiledTrace) {
-        let entry = code.entry as usize;
+        let entry = code.entry.map(|e| e as usize).unwrap_or(0);
         self.function_code[func_idx] = Some(Rc::new(code));
         self.function_entries[func_idx].store(entry, core::sync::atomic::Ordering::Release);
         self.stats.functions_compiled = self.stats.functions_compiled.saturating_add(1);

@@ -12,10 +12,7 @@ use alloc::{format, vec};
 use alloc::{string::String, vec::Vec};
 use hashbrown::{HashMap, HashSet};
 #[cfg(feature = "std")]
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default)]
 pub struct ModuleImports {
     pub function_aliases: HashMap<String, String>,
@@ -73,14 +70,63 @@ use crate::vm::VM;
 /// vm.call_function("__script", &[])?;
 /// ```
 pub fn compile_program_with_config(program: Program, config: &LustConfig) -> crate::Result<VM> {
+    let mut config = config.clone();
+    for module in &program.modules {
+        for target in module.imports.module_aliases.values() {
+            if crate::builtins::is_virtual_std_module(target) {
+                let canon = crate::builtins::canonical_std_module_name(target);
+                if config.is_std_module_allowed(canon) {
+                    config.enable_module(canon);
+                }
+            }
+        }
+        for target in module.imports.function_aliases.values() {
+            if let Some((mod_part, _)) = target.split_once('.') {
+                if crate::builtins::is_virtual_std_module(mod_part) {
+                    let canon = crate::builtins::canonical_std_module_name(mod_part);
+                    if config.is_std_module_allowed(canon) {
+                        config.enable_module(canon);
+                    }
+                }
+            }
+        }
+    }
+
     // Build imports map
     let mut imports_map: HashMap<String, ModuleImports> = HashMap::new();
     for module in &program.modules {
-        imports_map.insert(module.path.clone(), module.imports.clone());
+        let mut imports = module.imports.clone();
+        for target in imports.module_aliases.values() {
+            if crate::builtins::canonical_std_module_name(target) == "table" {
+                imports
+                    .type_aliases
+                    .entry("Table".to_string())
+                    .or_insert_with(|| "std.table.Table".to_string());
+                imports
+                    .type_aliases
+                    .entry("LuaTable".to_string())
+                    .or_insert_with(|| "std.table.LuaTable".to_string());
+            }
+        }
+        for (alias, target) in &imports.function_aliases {
+            if target == "std.table.Table" || target == "table.Table" {
+                imports
+                    .type_aliases
+                    .entry(alias.clone())
+                    .or_insert_with(|| "std.table.Table".to_string());
+            }
+            if target == "std.table.LuaTable" || target == "table.LuaTable" {
+                imports
+                    .type_aliases
+                    .entry(alias.clone())
+                    .or_insert_with(|| "std.table.LuaTable".to_string());
+            }
+        }
+        imports_map.insert(module.path.clone(), imports);
     }
 
     // Phase 1: Type check
-    let mut typechecker = TypeChecker::with_config(config);
+    let mut typechecker = TypeChecker::with_config(&config);
     typechecker.set_imports_by_module(imports_map.clone());
     typechecker.check_program(&program.modules)?;
     let option_coercions = typechecker.take_option_coercions();
@@ -112,22 +158,31 @@ pub fn compile_program_with_config(program: Program, config: &LustConfig) -> cra
     compiler.set_checked_array_indices(checked_array_indices);
     compiler.set_lambda_return_types(lambda_return_types);
     compiler.set_numeric_types(numeric_types);
-    compiler.configure_stdlib(config);
+    compiler.configure_stdlib(&config);
     compiler.set_imports_by_module(imports_map);
     compiler.set_entry_module(program_entry_module.clone());
     compiler.set_function_signatures(signatures);
+    compiler.set_struct_defs(struct_defs.clone());
     compiler.set_minimal_runtime_types(config.minimal_runtime_types());
     compiler.set_use_mir(config.use_mir());
+    compiler.set_collect_mir(config.use_mir() || config.cranelift_jit());
     compiler.set_strict_mir(config.strict_mir());
     let functions = compiler.compile_module(&wrapped_items)?;
+    let mir_functions = compiler.take_mir_functions();
     let trait_impls = compiler.get_trait_impls().to_vec();
     // AST no longer needed
     drop(wrapped_items);
 
     // Phase 4: Create VM
-    let mut vm = VM::with_config(config);
+    let mut vm = VM::with_config(&config);
     vm.load_functions(functions);
     vm.register_structs(&struct_defs);
+    // `Compiler::compile_module` already compiled eligible MIR functions into `functions`
+    // with struct layouts, field slots, and direct callee indices when `config.use_mir()` is
+    // enabled. Register MIR candidates without overwriting the compiled bytecode.
+    for mir_fn in mir_functions {
+        vm.register_mir_candidate(mir_fn);
+    }
     for (type_name, trait_name) in trait_impls {
         vm.register_trait_impl(type_name, trait_name);
     }
@@ -160,6 +215,7 @@ pub struct ModuleLoader {
     module_roots: HashMap<String, Vec<ModuleRoot>>,
     config: LustConfig,
     data_cache: HashMap<PathBuf, (u64, crate::data::DataValue)>,
+    pub vfs: std::sync::Arc<dyn crate::vfs::VirtualFileSystem>,
 }
 
 #[cfg(feature = "std")]
@@ -180,7 +236,21 @@ impl ModuleLoader {
             module_roots: HashMap::new(),
             config: LustConfig::default(),
             data_cache: HashMap::new(),
+            vfs: crate::vfs::current_vfs(),
         }
+    }
+
+    pub fn with_vfs(mut self, vfs: std::sync::Arc<dyn crate::vfs::VirtualFileSystem>) -> Self {
+        self.vfs = vfs;
+        self
+    }
+
+    pub fn set_vfs(&mut self, vfs: std::sync::Arc<dyn crate::vfs::VirtualFileSystem>) {
+        self.vfs = vfs;
+    }
+
+    pub fn vfs(&self) -> &std::sync::Arc<dyn crate::vfs::VirtualFileSystem> {
+        &self.vfs
     }
 
     pub fn with_config(mut self, config: LustConfig) -> Self {
@@ -296,7 +366,7 @@ impl ModuleLoader {
         let bytes = if let Some(src) = self.source_overrides.get(&resolved) {
             src.as_bytes().to_vec()
         } else {
-            match fs::read(&resolved) {
+            match self.vfs.read(&resolved) {
                 Ok(b) => b,
                 Err(e) => {
                     return Err(LustError::CompileError(format!(
@@ -501,7 +571,7 @@ impl ModuleLoader {
                             p.to_path_buf()
                         } else {
                             let rel = current_file.parent().unwrap_or(Path::new(".")).join(&import_path);
-                            if rel.exists() || self.source_overrides.contains_key(&rel) {
+                            if self.vfs.exists(&rel) || self.source_overrides.contains_key(&rel) {
                                 rel
                             } else {
                                 self.base_dir.join(&import_path)
@@ -525,7 +595,7 @@ impl ModuleLoader {
         let raw_source = if let Some(src) = self.source_overrides.get(&file) {
             src.clone()
         } else {
-            match fs::read_to_string(&file) {
+            match self.vfs.read_to_string(&file) {
                 Ok(src) => src,
                 Err(e) => {
                     // For non-entry modules, allow missing files and create stub
@@ -1003,7 +1073,8 @@ impl ModuleLoader {
             }
             ExprKind::Literal(Literal::String(_))
             | ExprKind::Literal(_)
-            | ExprKind::Identifier(_) => {}
+            | ExprKind::Identifier(_)
+            | ExprKind::RegexLiteral { .. } => {}
             ExprKind::EffectBlock(stmts) => {
                 for stmt in stmts {
                     self.collect_deps_from_lua_require_stmt(stmt, deps);
@@ -1302,7 +1373,7 @@ impl ModuleLoader {
                 self.validate_dynamic_imports_in_expr(start)?;
                 self.validate_dynamic_imports_in_expr(end)?;
             }
-            ExprKind::Literal(_) | ExprKind::Identifier(_) => {}
+            ExprKind::Literal(_) | ExprKind::Identifier(_) | ExprKind::RegexLiteral { .. } => {}
             ExprKind::EffectBlock(stmts) => {
                 for s in stmts {
                     self.validate_dynamic_imports_in_stmt(s)?;
@@ -1366,7 +1437,7 @@ impl ModuleLoader {
         }
     }
 
-    fn process_use_tree(&self, tree: &UseTree, imports: &mut ModuleImports) -> Result<()> {
+    fn process_use_tree(&mut self, tree: &UseTree, imports: &mut ModuleImports) -> Result<()> {
         match tree {
             UseTree::Path { path, alias, .. } => {
                 let full = path.join(".");
@@ -1384,10 +1455,19 @@ impl ModuleLoader {
                         )));
                     }
                     let canon = crate::builtins::canonical_std_module_name(&full);
+                    self.config.enable_module(canon);
                     let alias_name = alias.clone().unwrap_or_else(|| canon.to_string());
                     imports
                         .module_aliases
                         .insert(alias_name, canon.to_string());
+                    if canon == "table" {
+                        imports
+                            .type_aliases
+                            .insert("Table".to_string(), "std.table.Table".to_string());
+                        imports
+                            .type_aliases
+                            .insert("LuaTable".to_string(), "std.table.LuaTable".to_string());
+                    }
                 } else if path.len() > 1 {
                     let module = path[..path.len() - 1].join(".");
                     let item = path.last().unwrap().clone();
@@ -1399,6 +1479,8 @@ impl ModuleLoader {
                                 module
                             )));
                         }
+                        let canon = crate::builtins::canonical_std_module_name(&module);
+                        self.config.enable_module(canon);
                         let fq = crate::builtins::resolve_std_function(&module, &item)
                             .map(String::from)
                             .unwrap_or_else(|| {
@@ -1408,6 +1490,11 @@ impl ModuleLoader {
                                     item
                                 )
                             });
+                        if canon == "table" && (item == "Table" || item == "LuaTable") {
+                            imports
+                                .type_aliases
+                                .insert(alias_name.clone(), format!("std.table.{}", item));
+                        }
                         imports.function_aliases.insert(alias_name, fq);
                     } else {
                         let classification = self.classify_import_target(&module, &item);
@@ -1435,6 +1522,8 @@ impl ModuleLoader {
                             module
                         )));
                     }
+                    let canon = crate::builtins::canonical_std_module_name(&module);
+                    self.config.enable_module(canon);
                     for item in items {
                         if item.path.is_empty() {
                             continue;
@@ -1450,6 +1539,11 @@ impl ModuleLoader {
                                     item_name
                                 )
                             });
+                        if canon == "table" && (item_name == "Table" || item_name == "LuaTable") {
+                            imports
+                                .type_aliases
+                                .insert(alias_name.clone(), format!("std.table.{}", item_name));
+                        }
                         imports.function_aliases.insert(alias_name, fq);
                     }
                 } else {
@@ -1503,10 +1597,19 @@ impl ModuleLoader {
                         )));
                     }
                     let canon = crate::builtins::canonical_std_module_name(&module);
+                    self.config.enable_module(canon);
                     for (fn_name, fq) in crate::builtins::virtual_std_module_functions(&module) {
                         imports.function_aliases.insert(fn_name.to_string(), fq.to_string());
                     }
                     imports.module_aliases.insert(canon.to_string(), canon.to_string());
+                    if canon == "table" {
+                        imports
+                            .type_aliases
+                            .insert("Table".to_string(), "std.table.Table".to_string());
+                        imports
+                            .type_aliases
+                            .insert("LuaTable".to_string(), "std.table.LuaTable".to_string());
+                    }
                 } else {
                     if let Some(loaded) = self.cache.get(&module) {
                         for (name, fq) in &loaded.exports.functions {
@@ -1669,7 +1772,7 @@ impl ModuleLoader {
     }
 
     fn module_source_known(&self, module_path: &str, file: &Path) -> bool {
-        file.exists()
+        self.vfs.exists(file)
             || self.source_overrides.contains_key(file)
             || self.cache.contains_key(module_path)
     }
@@ -1700,7 +1803,7 @@ impl ModuleLoader {
             let mut fallback: Option<PathBuf> = None;
             for (root, consumed) in candidates.iter().rev() {
                 let candidate = Self::path_from_root(root, &segments, *consumed);
-                if candidate.exists() {
+                if self.vfs.exists(&candidate) {
                     return candidate;
                 }
                 if fallback.is_none() {
@@ -1793,6 +1896,7 @@ impl ModuleLoader {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use super::*;
     use std::fs;

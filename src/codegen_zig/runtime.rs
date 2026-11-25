@@ -303,16 +303,19 @@ pub fn __lust_assert(cond: bool, msg: []const u8) void {
 
 pub const PRINT_RUNTIME_SRC: &str = r#"pub fn __lust_print(val: anytype) void {
     const T = @TypeOf(val);
+    if (T == void) {
+        _ = std.c.write(1, "nil", 3);
+        return;
+    }
     switch (@typeInfo(T)) {
         .pointer => |ptr_info| {
             if (ptr_info.child == u8) {
-                const s = std.fmt.allocPrint(__lust_allocator, "{s}", .{val}) catch return;
-                _ = std.c.write(1, s.ptr, s.len);
+                _ = std.c.write(1, val.ptr, val.len);
                 return;
             }
             if (@typeInfo(ptr_info.child) == .array and @typeInfo(ptr_info.child).array.child == u8) {
-                const s = std.fmt.allocPrint(__lust_allocator, "{s}", .{val}) catch return;
-                _ = std.c.write(1, s.ptr, s.len);
+                const slice: []const u8 = val;
+                _ = std.c.write(1, slice.ptr, slice.len);
                 return;
             }
         },
@@ -324,16 +327,21 @@ pub const PRINT_RUNTIME_SRC: &str = r#"pub fn __lust_print(val: anytype) void {
 
 pub fn __lust_println(val: anytype) void {
     const T = @TypeOf(val);
+    if (T == void) {
+        _ = std.c.write(1, "nil\n", 4);
+        return;
+    }
     switch (@typeInfo(T)) {
         .pointer => |ptr_info| {
             if (ptr_info.child == u8) {
-                const s = std.fmt.allocPrint(__lust_allocator, "{s}\n", .{val}) catch return;
-                _ = std.c.write(1, s.ptr, s.len);
+                _ = std.c.write(1, val.ptr, val.len);
+                _ = std.c.write(1, "\n", 1);
                 return;
             }
             if (@typeInfo(ptr_info.child) == .array and @typeInfo(ptr_info.child).array.child == u8) {
-                const s = std.fmt.allocPrint(__lust_allocator, "{s}\n", .{val}) catch return;
-                _ = std.c.write(1, s.ptr, s.len);
+                const slice: []const u8 = val;
+                _ = std.c.write(1, slice.ptr, slice.len);
+                _ = std.c.write(1, "\n", 1);
                 return;
             }
         },

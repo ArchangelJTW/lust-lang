@@ -49,6 +49,88 @@ impl Expr {
             _ => None,
         }
     }
+
+    pub fn new_handle(body: Expr, arms: Vec<HandlerArm>, span: Span) -> Self {
+        Self::desugar_handle(body, arms, span)
+    }
+
+    pub fn new_perform(effect_name: String, args: Vec<Expr>, span: Span) -> Self {
+        Self::desugar_perform(effect_name, args, span)
+    }
+
+    pub fn new_resume(value: Expr, span: Span) -> Self {
+        Self::desugar_resume(value, span)
+    }
+
+    pub fn desugar_handle(body: Expr, arms: Vec<HandlerArm>, span: Span) -> Self {
+        let body_span = body.span;
+        let body_thunk = Expr::new(
+            ExprKind::Lambda {
+                params: Vec::new(),
+                return_type: None,
+                body: Box::new(body),
+            },
+            body_span,
+        );
+        let mut arm_tuples = Vec::new();
+        for arm in arms {
+            let arm_span = arm.span;
+            let arm_fn = Expr::new(
+                ExprKind::Lambda {
+                    params: arm.params.into_iter().map(|p| (p, None)).collect(),
+                    return_type: None,
+                    body: arm.body,
+                },
+                arm_span,
+            );
+            let name_lit = Expr::new(ExprKind::Literal(Literal::String(arm.effect_name)), arm_span);
+            let tuple = Expr::new(ExprKind::Tuple(vec![name_lit, arm_fn]), arm_span);
+            arm_tuples.push(tuple);
+        }
+        let arms_array = Expr::new(ExprKind::Array(arm_tuples), span);
+        Expr::new(
+            ExprKind::Call {
+                callee: Box::new(Expr::new(
+                    ExprKind::Identifier("__lust_handle".to_string()),
+                    span,
+                )),
+                type_args: None,
+                args: vec![body_thunk, arms_array],
+            },
+            span,
+        )
+    }
+
+    pub fn desugar_perform(effect_name: String, args: Vec<Expr>, span: Span) -> Self {
+        let name_lit = Expr::new(ExprKind::Literal(Literal::String(effect_name)), span);
+        let args_arr = Expr::new(ExprKind::Array(args), span);
+        Expr::new(
+            ExprKind::Call {
+                callee: Box::new(Expr::new(
+                    ExprKind::Identifier("__lust_perform".to_string()),
+                    span,
+                )),
+                type_args: None,
+                args: vec![name_lit, args_arr],
+            },
+            span,
+        )
+    }
+
+    pub fn desugar_resume(value: Expr, span: Span) -> Self {
+        let val_span = value.span;
+        Expr::new(
+            ExprKind::Call {
+                callee: Box::new(Expr::new(
+                    ExprKind::Identifier("__lust_resume".to_string()),
+                    span,
+                )),
+                type_args: None,
+                args: vec![value],
+            },
+            val_span,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,12 +208,44 @@ pub enum ExprKind {
         end: Box<Expr>,
         inclusive: bool,
     },
+    RegexLiteral {
+        pattern: String,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructLiteralField {
     pub name: String,
     pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandlerArm {
+    pub effect_name: String,
+    pub params: Vec<String>,
+    pub body: Box<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandleExpr {
+    pub body: Box<Expr>,
+    pub arms: Vec<HandlerArm>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResumeExpr {
+    pub value: Box<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerformExpr {
+    pub effect_name: String,
+    pub args: Vec<Expr>,
     pub span: Span,
 }
 

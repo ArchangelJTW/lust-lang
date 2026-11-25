@@ -1292,6 +1292,7 @@ pub fn estimate_data_value_bytes(val: &DataValue) -> usize {
             }
         }
         DataValue::Document(doc) => {
+            bytes += doc.entries.capacity() * std::mem::size_of::<(String, DataValue)>();
             for (k, v) in doc.iter() {
                 bytes += k.capacity() + estimate_data_value_bytes(v);
             }

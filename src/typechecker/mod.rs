@@ -1,5 +1,6 @@
 mod expr_checker;
 mod item_checker;
+pub mod lifetime;
 mod stmt_checker;
 mod type_env;
 use crate::modules::{LoadedModule, ModuleImports};
@@ -43,6 +44,8 @@ pub struct TypeChecker {
     loop_depth_in_defer: usize,
     current_function_return_spec: Option<crate::ast::ReturnSpec>,
     effect_block_stack: Vec<EffectBlockContext>,
+    pub(crate) current_function_name: Option<String>,
+    pub(crate) handler_arm_depth: usize,
 }
 
 pub fn normalize_requirements(reqs: &[Type]) -> Vec<Type> {
@@ -109,6 +112,8 @@ impl TypeChecker {
             loop_depth_in_defer: 0,
             current_function_return_spec: None,
             effect_block_stack: Vec::new(),
+            current_function_name: None,
+            handler_arm_depth: 0,
         }
     }
 
@@ -135,6 +140,7 @@ impl TypeChecker {
         }
 
         self.env.pop_scope();
+        lifetime::check_module_lifetimes(items, &self.current_module)?;
         Ok(())
     }
 
@@ -173,6 +179,7 @@ impl TypeChecker {
             self.env.pop_scope();
         }
 
+        lifetime::check_program_lifetimes(modules)?;
         self.current_module = None;
         Ok(())
     }
@@ -960,6 +967,70 @@ impl TypeChecker {
                 self.env.register_service(s.name.clone(), canonical_target)?;
             }
 
+            ItemKind::Schema(schema_def) => {
+                let mut struct_fields: Vec<StructField> = Vec::new();
+                for f in &schema_def.fields {
+                    struct_fields.push(StructField {
+                        name: f.name.clone(),
+                        ty: self.canonicalize_type(&f.ty),
+                        visibility: Visibility::Public,
+                        ownership: FieldOwnership::Strong,
+                        weak_target: None,
+                    });
+                }
+                let mut struct_name = schema_def.name.clone();
+                if let Some(module) = &self.current_module
+                    && !struct_name.contains('.')
+                {
+                    struct_name = format!("{}.{}", module, struct_name);
+                }
+                let struct_def = StructDef {
+                    name: struct_name.clone(),
+                    type_params: vec![],
+                    trait_bounds: vec![],
+                    fields: struct_fields,
+                    visibility: schema_def.visibility,
+                    doc: schema_def.doc.clone(),
+                };
+                self.env.register_struct(&struct_def)?;
+
+                let schema_type = Type::new(
+                    TypeKind::Schema {
+                        input: Box::new(Type::new(TypeKind::Named(struct_name.clone()), schema_def.span)),
+                        output: Box::new(Type::new(TypeKind::Named(struct_name.clone()), schema_def.span)),
+                        fields: Some(
+                            schema_def
+                                .fields
+                                .iter()
+                                .map(|f| {
+                                    (
+                                        f.name.clone(),
+                                        Box::new(self.canonicalize_type(&f.ty)),
+                                        Box::new(self.canonicalize_type(&f.ty)),
+                                    )
+                                })
+                                .collect(),
+                        ),
+                    },
+                    schema_def.span,
+                );
+                let _ = self.env.declare_variable(struct_name.clone(), schema_type.clone());
+                if struct_name != schema_def.name {
+                    let _ = self.env.declare_variable(schema_def.name.clone(), schema_type);
+                }
+            }
+
+            ItemKind::TypeAlias { name, ty, .. } => {
+                let canon_ty = self.canonicalize_type(ty);
+                let mut alias_name = name.clone();
+                if let Some(module) = &self.current_module
+                    && !alias_name.contains('.')
+                {
+                    alias_name = format!("{}.{}", module, alias_name);
+                }
+                self.env.register_type_alias(alias_name, canon_ty);
+            }
+
             _ => {}
         }
 
@@ -1009,12 +1080,22 @@ impl TypeChecker {
         }
     }
 
+    pub(crate) fn is_in_main(&self) -> bool {
+        self.current_function_name
+            .as_deref()
+            .map_or(false, |n| n == "main" || n.ends_with(".main"))
+    }
+
     pub fn record_effect_call(
         &mut self,
         requirements: &[Type],
         error_type: Option<&Type>,
         span: Span,
     ) -> Result<()> {
+        if self.is_in_main() {
+            return Ok(());
+        }
+
         if let Some(ctx_idx) = self.effect_block_stack.len().checked_sub(1) {
             for req in requirements {
                 if self.scoped_depth > 0 && req.to_string() == "Scope" { continue; }
@@ -1135,6 +1216,12 @@ impl TypeChecker {
             }
             TK::Named(name) => {
                 let resolved = self.resolve_type_key(name);
+                if let Some(alias) = self.env.lookup_type_alias(&resolved) {
+                    return self.canonicalize_type(alias);
+                }
+                if let Some(alias) = self.env.lookup_type_alias(name) {
+                    return self.canonicalize_type(alias);
+                }
                 if self.env.lookup_trait(&resolved).is_some() {
                     Type::new(TK::Trait(resolved), ty.span)
                 } else {
@@ -1195,6 +1282,22 @@ impl TypeChecker {
                     .iter()
                     .map(|arg| self.canonicalize_type(arg))
                     .collect();
+                if (resolved == "Table" || resolved == "std.table.Table")
+                    && canonical_args.len() == 1
+                {
+                    return Type::new(
+                        TK::Array(Box::new(canonical_args.into_iter().next().unwrap())),
+                        ty.span,
+                    );
+                }
+                if (resolved == "Table" || resolved == "std.table.Table")
+                    && canonical_args.len() == 2
+                {
+                    let mut args_iter = canonical_args.into_iter();
+                    let k = args_iter.next().unwrap();
+                    let v = args_iter.next().unwrap();
+                    return Type::new(TK::Map(Box::new(k), Box::new(v)), ty.span);
+                }
                 Type::new(
                     TK::GenericInstance {
                         name: resolved,
@@ -1217,6 +1320,88 @@ impl TypeChecker {
                 ),
                 ty.span,
             ),
+            TK::Effect {
+                success,
+                error,
+                requirements,
+            } => Type::new(
+                TK::Effect {
+                    success: Box::new(self.canonicalize_type(success)),
+                    error: Box::new(self.canonicalize_type(error)),
+                    requirements: requirements
+                        .iter()
+                        .map(|req| self.canonicalize_type(req))
+                        .collect(),
+                },
+                ty.span,
+            ),
+            TK::Typeof(var_name) => {
+                let resolved = self.resolve_value_key(var_name);
+                if let Some(var_ty) = self
+                    .env
+                    .lookup_variable(&resolved)
+                    .or_else(|| self.env.lookup_variable(var_name))
+                {
+                    self.canonicalize_type(&var_ty)
+                } else {
+                    ty.clone()
+                }
+            }
+            TK::InferType(inner) | TK::InferOutput(inner) => {
+                let canon = self.canonicalize_type(inner);
+                match &canon.kind {
+                    TK::Schema { output, .. } => self.canonicalize_type(output),
+                    TK::Named(name) => {
+                        if let Some(var_ty) = self.env.lookup_variable(name) {
+                            let canon_var = self.canonicalize_type(&var_ty);
+                            if let TK::Schema { output, .. } = &canon_var.kind {
+                                return self.canonicalize_type(output);
+                            }
+                        }
+                        canon
+                    }
+                    _ => canon,
+                }
+            }
+            TK::InferInput(inner) => {
+                let canon = self.canonicalize_type(inner);
+                match &canon.kind {
+                    TK::Schema { input, .. } => self.canonicalize_type(input),
+                    TK::Named(name) => {
+                        if let Some(var_ty) = self.env.lookup_variable(name) {
+                            let canon_var = self.canonicalize_type(&var_ty);
+                            if let TK::Schema { input, .. } = &canon_var.kind {
+                                return self.canonicalize_type(input);
+                            }
+                        }
+                        canon
+                    }
+                    _ => canon,
+                }
+            }
+            TK::Schema { input, output, fields } => {
+                let c_in = self.canonicalize_type(input);
+                let c_out = self.canonicalize_type(output);
+                let c_fields = fields.as_ref().map(|flds| {
+                    flds.iter()
+                        .map(|(n, i, o)| {
+                            (
+                                n.clone(),
+                                Box::new(self.canonicalize_type(i)),
+                                Box::new(self.canonicalize_type(o)),
+                            )
+                        })
+                        .collect()
+                });
+                Type::new(
+                    TK::Schema {
+                        input: Box::new(c_in),
+                        output: Box::new(c_out),
+                        fields: c_fields,
+                    },
+                    ty.span,
+                )
+            }
             _ => ty.clone(),
         }
     }
@@ -1355,6 +1540,7 @@ impl TypeChecker {
                     && self.env.lookup_enum(name).is_none()
                     && !self.env.is_builtin_type(name)
                     && self.env.lookup_service(name).is_none()
+                    && self.env.lookup_type_alias(name).is_none()
                 {
                     return Err(self.type_error_at(format!("Undefined type '{}'", name), ty.span));
                 }
@@ -1459,6 +1645,26 @@ impl TypeChecker {
                 for r in requirements {
                     self.validate_type(r)?;
                 }
+            }
+            TypeKind::Typeof(var_name) => {
+                let resolved = self.resolve_value_key(var_name);
+                if self.env.lookup_variable(&resolved).is_none()
+                    && self.env.lookup_variable(var_name).is_none()
+                {
+                    return Err(self.type_error_at(
+                        format!("Undefined variable in typeof '{}'", var_name),
+                        ty.span,
+                    ));
+                }
+            }
+            TypeKind::InferType(inner)
+            | TypeKind::InferInput(inner)
+            | TypeKind::InferOutput(inner) => {
+                self.validate_type(inner)?;
+            }
+            TypeKind::Schema { input, output, .. } => {
+                self.validate_type(input)?;
+                self.validate_type(output)?;
             }
         }
         Ok(())

@@ -1,0 +1,56 @@
+-- Example: Deterministic Preemptive Fiber Scheduling in Simulation Testing (DST).
+-- Ported from `examples/simulation/01_deterministic_scheduler.rs`.
+
+function next_prng(state: int): int
+    return (state * 1103515245 + 12345) % 2147483647
+end
+
+function run_simulation(seed: int): string
+    local prng = seed
+    local f1 = 0
+    local f2 = 0
+    local limit = 10
+    local quantum = 2
+    local steps = 0
+    local trace = "seed=" .. tostring(seed) .. ":"
+    while f1 < limit or f2 < limit do
+        prng = next_prng(prng)
+        local pick = prng % 2
+        if pick == 0 and f1 < limit then
+            local q = 0
+            while q < quantum and f1 < limit do
+                f1 = f1 + 1
+                q = q + 1
+                steps = steps + 1
+            end
+            trace = trace .. "F1(" .. tostring(f1) .. "),"
+        elseif f2 < limit then
+            local q = 0
+            while q < quantum and f2 < limit do
+                f2 = f2 + 1
+                q = q + 1
+                steps = steps + 1
+            end
+            trace = trace .. "F2(" .. tostring(f2) .. "),"
+        else
+            local q = 0
+            while q < quantum and f1 < limit do
+                f1 = f1 + 1
+                q = q + 1
+                steps = steps + 1
+            end
+            trace = trace .. "F1(" .. tostring(f1) .. "),"
+        end
+    end
+    return trace .. "steps=" .. tostring(steps)
+end
+
+println("--- [Deterministic Simulation Scheduler Example] ---")
+local run1 = run_simulation(42)
+local run2 = run_simulation(42)
+local run43 = run_simulation(43)
+assert(run1 == run2, "Seed 42 runs must match byte-for-byte")
+assert(run1 != run43, "Seed 43 must diverge from Seed 42")
+println("RUN42=" .. run1)
+println("RUN43=" .. run43)
+println("All simulation scheduler assertions passed!")

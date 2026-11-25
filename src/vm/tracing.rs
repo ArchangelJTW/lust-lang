@@ -1,4 +1,55 @@
 use super::*;
+
+#[cfg(feature = "std")]
+use std::cell::{Cell, RefCell};
+
+#[cfg(feature = "std")]
+pub struct TraceHooks {
+    pub instruction_hook: Option<Box<dyn FnMut(&str, usize, usize) + 'static>>,
+    pub call_hook: Option<Box<dyn FnMut(&str, usize, usize) + 'static>>,
+    pub return_hook: Option<Box<dyn FnMut(&str, usize, usize) + 'static>>,
+    pub error_hook: Option<Box<dyn FnMut(&str, usize, &str) + 'static>>,
+}
+
+#[cfg(feature = "std")]
+impl TraceHooks {
+    #[inline]
+    fn has_any(&self) -> bool {
+        self.instruction_hook.is_some()
+            || self.call_hook.is_some()
+            || self.return_hook.is_some()
+            || self.error_hook.is_some()
+    }
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+    static ACTIVE_TRACE_HOOKS: RefCell<Option<TraceHooks>> = const { RefCell::new(None) };
+    static HAS_ANY_TRACE_HOOK: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn sync_trace_hook_flag(opt: &mut Option<TraceHooks>) {
+    let any = opt.as_ref().is_some_and(TraceHooks::has_any);
+    if !any {
+        *opt = None;
+    }
+    HAS_ANY_TRACE_HOOK.with(|flag| flag.set(any));
+}
+
+#[inline(always)]
+pub(crate) fn has_trace_hook() -> bool {
+    #[cfg(feature = "std")]
+    {
+        HAS_ANY_TRACE_HOOK.with(|flag| flag.get())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        false
+    }
+}
+
 impl VM {
     /// A unit enum value (`Option.None`): the one shared object for these
     /// names, so the value is a count bump and compares by pointer.
@@ -61,7 +112,170 @@ impl VM {
         frames
     }
 
+    #[inline(always)]
+    pub fn has_trace_hook(&self) -> bool {
+        has_trace_hook()
+    }
+
+    #[cfg(feature = "std")]
+    pub fn set_instruction_hook(
+        &mut self,
+        hook: Option<Box<dyn FnMut(&str, usize, usize) + 'static>>,
+    ) {
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            if let Some(hooks) = opt.as_mut() {
+                hooks.instruction_hook = hook;
+            } else if hook.is_some() {
+                *opt = Some(TraceHooks {
+                    instruction_hook: hook,
+                    call_hook: None,
+                    return_hook: None,
+                    error_hook: None,
+                });
+            }
+            sync_trace_hook_flag(&mut opt);
+        });
+    }
+
+    #[cfg(feature = "std")]
+    pub fn set_call_hook(
+        &mut self,
+        hook: Option<Box<dyn FnMut(&str, usize, usize) + 'static>>,
+    ) {
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            if let Some(hooks) = opt.as_mut() {
+                hooks.call_hook = hook;
+            } else if hook.is_some() {
+                *opt = Some(TraceHooks {
+                    instruction_hook: None,
+                    call_hook: hook,
+                    return_hook: None,
+                    error_hook: None,
+                });
+            }
+            sync_trace_hook_flag(&mut opt);
+        });
+    }
+
+    #[cfg(feature = "std")]
+    pub fn set_return_hook(
+        &mut self,
+        hook: Option<Box<dyn FnMut(&str, usize, usize) + 'static>>,
+    ) {
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            if let Some(hooks) = opt.as_mut() {
+                hooks.return_hook = hook;
+            } else if hook.is_some() {
+                *opt = Some(TraceHooks {
+                    instruction_hook: None,
+                    call_hook: None,
+                    return_hook: hook,
+                    error_hook: None,
+                });
+            }
+            sync_trace_hook_flag(&mut opt);
+        });
+    }
+
+    #[cfg(feature = "std")]
+    pub fn set_error_hook(
+        &mut self,
+        hook: Option<Box<dyn FnMut(&str, usize, &str) + 'static>>,
+    ) {
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            if let Some(hooks) = opt.as_mut() {
+                hooks.error_hook = hook;
+            } else if hook.is_some() {
+                *opt = Some(TraceHooks {
+                    instruction_hook: None,
+                    call_hook: None,
+                    return_hook: None,
+                    error_hook: hook,
+                });
+            }
+            sync_trace_hook_flag(&mut opt);
+        });
+    }
+
+    #[cfg(feature = "std")]
+    pub fn clear_trace_hooks(&mut self) {
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            *opt = None;
+            sync_trace_hook_flag(&mut opt);
+        });
+    }
+
+    pub(crate) fn dispatch_instruction_hook(&self, function: &str, line: usize, ip: usize) {
+        #[cfg(feature = "std")]
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            if let Ok(mut opt) = cell.try_borrow_mut() {
+                if let Some(hooks) = opt.as_mut() {
+                    if let Some(hook) = hooks.instruction_hook.as_mut() {
+                        hook(function, line, ip);
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) fn dispatch_call_hook(&self, function: &str, line: usize, depth: usize) {
+        #[cfg(feature = "std")]
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            if let Ok(mut opt) = cell.try_borrow_mut() {
+                if let Some(hooks) = opt.as_mut() {
+                    if let Some(hook) = hooks.call_hook.as_mut() {
+                        hook(function, line, depth);
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) fn dispatch_return_hook(&self, function: &str, line: usize, depth: usize) {
+        #[cfg(feature = "std")]
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            if let Ok(mut opt) = cell.try_borrow_mut() {
+                if let Some(hooks) = opt.as_mut() {
+                    if let Some(hook) = hooks.return_hook.as_mut() {
+                        hook(function, line, depth);
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) fn dispatch_error_hook(&self, function: &str, line: usize, error: &str) {
+        #[cfg(feature = "std")]
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            if let Ok(mut opt) = cell.try_borrow_mut() {
+                if let Some(hooks) = opt.as_mut() {
+                    if let Some(hook) = hooks.error_hook.as_mut() {
+                        hook(function, line, error);
+                    }
+                }
+            }
+        });
+    }
+
     pub(super) fn annotate_runtime_error(&self, err: LustError) -> LustError {
+        #[cfg(feature = "std")]
+        if has_trace_hook() {
+            let (func_name, line) = if let Some(frame) = self.call_stack.last() {
+                let function = &self.functions[frame.function_idx];
+                let ip_index = frame.ip.saturating_sub(1);
+                let line = function.chunk.lines.get(ip_index).copied().unwrap_or(0);
+                (function.name.clone(), line)
+            } else {
+                ("<unknown>".to_string(), 0)
+            };
+            self.dispatch_error_hook(&func_name, line, &err.to_string());
+        }
+
         match err {
             LustError::RuntimeError { message } => {
                 if let Some(frame) = self.call_stack.last() {
@@ -423,41 +637,70 @@ pub unsafe extern "C" fn jit_materialize_inline_frames(
         }
     }
     let vm = unsafe { &mut *vm };
+    let old_vm_regs_ptr = vm.vm_registers.as_ptr() as usize;
+    let value_size = core::mem::size_of::<Value>();
+    let old_vm_regs_end = old_vm_regs_ptr + vm.vm_registers.len() * value_size;
+    let root_regs_addr = root_regs as usize;
+    let root_regs_vm_offset = if root_regs_addr >= old_vm_regs_ptr && root_regs_addr < old_vm_regs_end
+    {
+        Some((root_regs_addr - old_vm_regs_ptr) / value_size)
+    } else {
+        None
+    };
     for (r, site, regs) in chain.into_iter().rev() {
         let register_count = vm
             .functions
             .get(site.function_idx)
-            .map(|f| f.register_count)
-            .unwrap_or(site.value_count as u8);
+            .map(|f| if f.register_count > 0 { f.register_count as u16 } else { 256 })
+            .unwrap_or(site.value_count as u16)
+            .max(site.value_count as u16);
+        let caller_regs_addr = r.caller_regs as usize;
+        let caller_vm_offset = if caller_regs_addr >= old_vm_regs_ptr && caller_regs_addr < old_vm_regs_end {
+            Some((caller_regs_addr - old_vm_regs_ptr) / value_size)
+        } else {
+            None
+        };
+        if let Some(caller) = vm.call_stack.last_mut() {
+            caller.ip = site.caller_resume_ip;
+        }
         // The frames were live inside the trace already; the depth limit
         // was checked when they were called.
-        let mut frame = match vm.take_frame(
+        let frame_idx = vm.push_call_frame(
             site.function_idx,
-            Some(site.return_dest as Register),
             register_count,
-        ) {
-            Ok(frame) => frame,
-            Err(_) => CallFrame::new(
-                site.function_idx,
-                Some(site.return_dest as Register),
-                register_count,
-            ),
-        };
+            Some(site.return_dest as Register),
+        );
+        let base_reg = vm.call_stack[frame_idx].base_reg;
         for i in 0..site.value_count {
             let slot = unsafe { regs.add(i) };
-            frame.registers[i] = if i < 64 && site.alias_mask & (1 << i) != 0 {
+            vm.vm_registers[base_reg + i] = if i < 64 && site.alias_mask & (1 << i) != 0 {
                 unsafe { (*slot).clone() }
             } else {
                 unsafe { core::ptr::read(slot) }
             };
+            if !vm.vm_registers[base_reg + i].is_plain() {
+                vm.call_stack[frame_idx].mark_non_plain(i);
+            }
+        }
+        if let Some(vm_off) = caller_vm_offset {
+            if let Value::Closure(closure) = &vm.vm_registers[vm_off + site.callee_reg] {
+                let upvalues = closure.upvalues.iter().map(|uv| uv.get()).collect();
+                let shared_upvalues = closure.upvalues.clone();
+                let frame = &mut vm.call_stack[frame_idx];
+                frame.upvalues = upvalues;
+                frame.shared_upvalues = shared_upvalues;
+            }
+            continue;
         }
         if let Value::Closure(closure) = unsafe { &*r.caller_regs.add(site.callee_reg) } {
+            let frame = &mut vm.call_stack[frame_idx];
             frame.upvalues = closure.upvalues.iter().map(|uv| uv.get()).collect();
+            frame.shared_upvalues = closure.upvalues.clone();
         }
-        if let Some(caller) = vm.call_stack.last_mut() {
-            caller.ip = site.caller_resume_ip;
-        }
-        vm.call_stack.push(frame);
     }
-    root_regs
+    if let Some(off) = root_regs_vm_offset {
+        vm.vm_registers[off..].as_mut_ptr()
+    } else {
+        root_regs
+    }
 }

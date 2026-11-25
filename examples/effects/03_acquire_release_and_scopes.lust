@@ -1,0 +1,143 @@
+-- Example 3: Safe Resource Management with acquire_release and Structured Scopes.
+-- Demonstrates interrupt masking during acquire, LIFO finalization,
+-- and the Gate-NEG-02 guarantee.
+
+use std.test
+use std.table
+
+enum Cause
+    Fail(string),
+    Die(string),
+    Interrupted(string),
+end
+
+enum Exit
+    Success(int),
+    Failure(Cause),
+end
+
+struct FileHandle
+    fd: int
+end
+
+function file_open(fd: int, tracker: Array<bool>): FileHandle
+    println(string.format("  [Resource] Opened file descriptor #%d", fd))
+    tracker[0] = true
+    return FileHandle { fd = fd }
+end
+
+function file_close(fd: int, tracker: Array<bool>)
+    tracker[0] = false
+    println(string.format("  [Cleanup] Executing finalizer: Closing file descriptor #%d", fd))
+end
+
+suite "acquire_release & Structured Scopes Suite" do
+    test "acquire_release with interrupt masking and deferred cancellation" do
+        local fiber = test.fiber_new(101, 1)
+        local scope = test.scope_new(1)
+        local tracker = [false]
+
+        -- 1. Enter interrupt mask during acquisition
+        test.fiber_enter_mask(fiber)
+        assert(test.fiber_is_masked(fiber), "Fiber must be masked during acquire")
+
+        local handle = file_open(42, tracker)
+        local res_item = test.resource_new("FileDescriptor #42")
+        test.scope_register_finalizer(scope, res_item)
+
+        -- Simulating cancellation arriving mid-acquisition
+        local delivered = test.fiber_request_interrupt(fiber, "Cancelled")
+        assert_eq(delivered, false) -- Must be deferred!
+
+        -- Exit mask: deferred interrupt delivered upon unmasking
+        local deferred = test.fiber_exit_mask(fiber)
+        assert_eq(deferred, "Cancelled")
+        assert_eq(test.fiber_state(fiber), "Interrupted")
+
+        local outcome = Exit.Failure(Cause.Interrupted("Cancelled"))
+        local matched = false
+        if outcome is Failure(c) then
+            if c is Interrupted(reason) then
+                assert_eq(reason, "Cancelled")
+                matched = true
+            end
+        end
+        assert(matched)
+    end
+
+    test "structured scope teardown and Gate-NEG-02 invariant" do
+        local scope = test.scope_new(1)
+        local res_item = test.resource_new("FileDescriptor #42")
+        test.scope_register_finalizer(scope, res_item)
+
+        -- Advance scope to Joining
+        test.scope_mark_joining(scope)
+        assert_eq(test.scope_teardown_state(scope), "Joining")
+
+        -- Gate-NEG-02: No resources released while in Joining state
+        local current_rel = test.scope_current_releases(scope)
+        assert_eq(current_rel, [])
+
+        -- Scope finalize triggers releases
+        local releases = test.scope_finalize(scope)
+        assert_eq(test.scope_teardown_state(scope), "Done")
+        assert_eq(test.resource_is_active(res_item), false)
+        assert_eq(releases, ["release:FileDescriptor #42"])
+    end
+
+    test "LIFO finalization order of multiple acquired resources" do
+        local scope = test.scope_new(2)
+        local r1 = test.resource_new("Resource A")
+        local r2 = test.resource_new("Resource B")
+        local r3 = test.resource_new("Resource C")
+
+        test.scope_register_finalizer(scope, r1)
+        test.scope_register_finalizer(scope, r2)
+        test.scope_register_finalizer(scope, r3)
+
+        local releases = test.scope_finalize(scope)
+        -- Must finalize in reverse order: C -> B -> A
+        assert_eq(releases, [
+            "release:Resource C",
+            "release:Resource B",
+            "release:Resource A"
+        ])
+    end
+end
+
+function run_example_main()
+    println("--- [Example 3: acquire_release & Structured Scopes] ---")
+
+    local fiber = test.fiber_new(101, 1)
+    local scope = test.scope_new(1)
+    local file_open_tracker = [false]
+
+    println("1. Executing acquire_release with interrupt masking:")
+    test.fiber_enter_mask(fiber)
+    local handle = file_open(42, file_open_tracker)
+
+    local delivered = test.fiber_request_interrupt(fiber, "Cancelled")
+    println(string.format("  [Interrupt] Cancellation signal arrived during acquire. Delivered immediately? %s", tostring(delivered)))
+    println(string.format("  [Interrupt] Is fiber currently masked? %s", tostring(test.fiber_is_masked(fiber))))
+
+    local res_item = test.resource_new("FileDescriptor #42")
+    test.scope_register_finalizer(scope, res_item)
+
+    local deferred = test.fiber_exit_mask(fiber)
+    println(string.format("Acquire phase outcome (deferred interrupt delivered upon unmasking): Exit.Failure(Cause.Interrupted(\"%s\"))", deferred))
+    println("Finalizers registered in Scope: 1")
+
+    println("\n2. Scope Teardown Invariant (Gate-NEG-02):")
+    println("  Closing parent scope triggers LIFO finalization of all acquired resources:")
+    test.scope_mark_joining(scope)
+    local current_rel = test.scope_current_releases(scope)
+    assert(table.len(current_rel) == 0, "No releases while in Joining state")
+
+    local releases = test.scope_finalize(scope)
+    file_close(handle.fd, file_open_tracker)
+
+    println(string.format("  Scope teardown completed successfully! Resource open state: %s", tostring(file_open_tracker[0]:unwrap())))
+    println("All acquire_release and scope assertions passed!")
+end
+
+run_example_main()

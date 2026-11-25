@@ -1,0 +1,277 @@
+-- Example: Strict RFC 8259 JSON Deserialization and Fail-Closed Validation
+-- Demonstrates parsing valid JSON into structured documents, Gate-SCHEMA-01
+-- duplicate key rejection (fail-closed), and round-trip serialization.
+
+use std.table
+
+struct JsonDocument
+    fields: Map<string, unknown>
+    key_order: Array<string>
+end
+
+struct JsonDecoder
+    pos: int
+    src: string
+    len: int
+end
+
+function is_digit_or_minus(c: string): bool
+    return c == "0" or c == "1" or c == "2" or c == "3" or c == "4" or c == "5" or c == "6" or c == "7" or c == "8" or c == "9" or c == "-"
+end
+
+impl JsonDecoder
+    function new(src: string): JsonDecoder
+        return JsonDecoder {
+            pos = 1,
+            src = src,
+            len = string.len(src)
+        }
+    end
+
+    function skip_whitespace(self): ()
+        while self.pos <= self.len do
+            local ch = string.sub(self.src, self.pos, self.pos)
+            if ch == " " or ch == "\t" or ch == "\n" or ch == "\r" then
+                self.pos = self.pos + 1
+            else
+                break
+            end
+        end
+    end
+
+    function parse_string(self): Result<string, string>
+        self:skip_whitespace()
+        if self.pos > self.len or string.sub(self.src, self.pos, self.pos) != "\"" then
+            return Result.Err("Expected '\"' at start of string")
+        end
+        self.pos = self.pos + 1
+        local start = self.pos
+        while self.pos <= self.len do
+            local ch = string.sub(self.src, self.pos, self.pos)
+            if ch == "\"" then
+                local res = string.sub(self.src, start, self.pos - 1)
+                self.pos = self.pos + 1
+                return Result.Ok(res)
+            end
+            self.pos = self.pos + 1
+        end
+        return Result.Err("Unterminated string literal")
+    end
+
+    function parse_value(self): Result<unknown, string>
+        self:skip_whitespace()
+        if self.pos > self.len then
+            return Result.Err("Unexpected end of input")
+        end
+        local ch = string.sub(self.src, self.pos, self.pos)
+
+        if ch == "{" then
+            local obj_res = self:parse_object()
+            if obj_res is Err(err) then return Result.Err(err) end
+            return Result.Ok(obj_res:unwrap())
+        elseif ch == "[" then
+            local arr_res = self:parse_array()
+            if arr_res is Err(err) then return Result.Err(err) end
+            return Result.Ok(arr_res:unwrap())
+        elseif ch == "\"" then
+            local s_res = self:parse_string()
+            if s_res is Err(err) then return Result.Err(err) end
+            return Result.Ok(s_res:unwrap())
+        elseif ch == "t" and string.sub(self.src, self.pos, self.pos + 3) == "true" then
+            self.pos = self.pos + 4
+            return Result.Ok(true)
+        elseif ch == "f" and string.sub(self.src, self.pos, self.pos + 4) == "false" then
+            self.pos = self.pos + 5
+            return Result.Ok(false)
+        else
+            -- Parse integer / number
+            local start = self.pos
+            while self.pos <= self.len do
+                local c = string.sub(self.src, self.pos, self.pos)
+                if is_digit_or_minus(c) then
+                    self.pos = self.pos + 1
+                else
+                    break
+                end
+            end
+            if self.pos > start then
+                local num_str = string.sub(self.src, start, self.pos - 1)
+                local num_val = tonumber(num_str)
+                return Result.Ok(num_val)
+            end
+            return Result.Err(string.format("Unexpected token at position %d: '%s'", self.pos, ch))
+        end
+    end
+
+    function parse_array(self): Result<Array<unknown>, string>
+        self.pos = self.pos + 1 -- skip '['
+        local items = []
+        self:skip_whitespace()
+        if self.pos <= self.len and string.sub(self.src, self.pos, self.pos) == "]" then
+            self.pos = self.pos + 1
+            return Result.Ok(items)
+        end
+
+        while self.pos <= self.len do
+            local val_res = self:parse_value()
+            if val_res is Err(err) then return Result.Err(err) end
+            table.push(items, val_res:unwrap())
+
+            self:skip_whitespace()
+            if self.pos <= self.len and string.sub(self.src, self.pos, self.pos) == "," then
+                self.pos = self.pos + 1
+            elseif self.pos <= self.len and string.sub(self.src, self.pos, self.pos) == "]" then
+                self.pos = self.pos + 1
+                return Result.Ok(items)
+            else
+                return Result.Err("Expected ',' or ']' in array")
+            end
+        end
+        return Result.Err("Unterminated array")
+    end
+
+    function parse_object(self): Result<JsonDocument, string>
+        self.pos = self.pos + 1 -- skip '{'
+        local fields: Map<string, unknown> = {}
+        local key_order = []
+
+        self:skip_whitespace()
+        if self.pos <= self.len and string.sub(self.src, self.pos, self.pos) == "}" then
+            self.pos = self.pos + 1
+            return Result.Ok(JsonDocument { fields = fields, key_order = key_order })
+        end
+
+        while self.pos <= self.len do
+            local offset = self.pos
+            local key_res = self:parse_string()
+            if key_res is Err(err) then return Result.Err(err) end
+            local key = key_res:unwrap()
+
+            -- Gate-SCHEMA-01: Fail-closed rejection of duplicate object keys
+            if map.has(fields, key) then
+                return Result.Err(string.format("DuplicateKey('%s', offset %d) - Gate-SCHEMA-01 violation", key, offset))
+            end
+
+            self:skip_whitespace()
+            if self.pos > self.len or string.sub(self.src, self.pos, self.pos) != ":" then
+                return Result.Err("Expected ':' after object key")
+            end
+            self.pos = self.pos + 1 -- skip ':'
+
+            local val_res = self:parse_value()
+            if val_res is Err(err) then return Result.Err(err) end
+
+            map.set(fields, key, val_res:unwrap())
+            table.push(key_order, key)
+
+            self:skip_whitespace()
+            if self.pos <= self.len and string.sub(self.src, self.pos, self.pos) == "," then
+                self.pos = self.pos + 1
+            elseif self.pos <= self.len and string.sub(self.src, self.pos, self.pos) == "}" then
+                self.pos = self.pos + 1
+                return Result.Ok(JsonDocument { fields = fields, key_order = key_order })
+            else
+                return Result.Err("Expected ',' or '}' in object")
+            end
+        end
+        return Result.Err("Unterminated object")
+    end
+end
+
+function serialize_json(doc: JsonDocument): string
+    local parts = ["{"]
+    local num_keys = table.len(doc.key_order)
+    for i = 0, num_keys - 1 do
+        local k = doc.key_order[i]:unwrap()
+        local v = map.get(doc.fields, k):unwrap()
+        local val_str = ""
+        if v == true then
+            val_str = "true"
+        elseif v == false then
+            val_str = "false"
+        else
+            local t = tostring(type(v))
+            if string.contains(t, "(string)") then
+                val_str = string.format("\"%s\"", tostring(v))
+            elseif string.contains(t, "(array)") then
+                local arr_parts = ["["]
+                local arr: Array<unknown> = v
+                local arr_len = table.len(arr)
+                for j = 0, arr_len - 1 do
+                    local item = arr[j]:unwrap()
+                    local item_t = tostring(type(item))
+                    if string.contains(item_t, "(string)") then
+                        table.push(arr_parts, string.format("\"%s\"", tostring(item)))
+                    else
+                        table.push(arr_parts, tostring(item))
+                    end
+                    if j < arr_len - 1 then table.push(arr_parts, ", ") end
+                end
+                table.push(arr_parts, "]")
+                val_str = table.concat(arr_parts, "")
+            else
+                val_str = tostring(v)
+            end
+        end
+
+        table.push(parts, string.format("\"%s\": %s", k, val_str))
+        if i < num_keys - 1 then
+            table.push(parts, ", ")
+        end
+    end
+    table.push(parts, "}")
+    return table.concat(parts, "")
+end
+
+suite "JSON Deserialization & Fail-Closed Gate-SCHEMA-01 Suite" do
+    test "parse valid JSON document with mixed primitives and arrays" do
+        local json_src = "{\"service\": \"order-gateway\", \"port\": 8080, \"tls_enabled\": true, \"tags\": [\"web\", \"rpc\", \"production\"]}"
+        local decoder = JsonDecoder.new(json_src)
+        local res = decoder:parse_object()
+
+        assert(res:is_ok())
+        local doc = res:unwrap()
+
+        assert_eq(table.len(doc.key_order), 4)
+        assert_eq(map.get(doc.fields, "service"):unwrap(), "order-gateway")
+        assert_eq(map.get(doc.fields, "port"):unwrap(), 8080)
+        assert_eq(map.get(doc.fields, "tls_enabled"):unwrap(), true)
+        assert_eq(map.get(doc.fields, "tags"):unwrap(), ["web", "rpc", "production"])
+    end
+
+    test "duplicate key rejection fails closed under Gate-SCHEMA-01" do
+        local dup_json = "{\"account_id\": \"ACC-1001\", \"balance\": 500, \"balance\": 999999}"
+        local decoder = JsonDecoder.new(dup_json)
+        local res = decoder:parse_object()
+
+        assert(res:is_err())
+        if res is Err(err_msg) then
+            assert(string.contains(err_msg, "DuplicateKey"))
+            assert(string.contains(err_msg, "balance"))
+            assert(string.contains(err_msg, "Gate-SCHEMA-01"))
+        else
+            assert(false, "Expected Err for duplicate key")
+        end
+    end
+
+    test "round-trip serialization produces valid JSON representation" do
+        local json_src = "{\"service\": \"order-gateway\", \"port\": 8080, \"tls_enabled\": true, \"tags\": [\"web\", \"rpc\", \"production\"]}"
+        local decoder = JsonDecoder.new(json_src)
+        local doc = decoder:parse_object():unwrap()
+
+        local serialized = serialize_json(doc)
+        assert(string.len(serialized) > 20)
+        assert(string.contains(serialized, "\"service\": \"order-gateway\""))
+        assert(string.contains(serialized, "\"port\": 8080"))
+        assert(string.contains(serialized, "\"tls_enabled\": true"))
+
+        -- Re-parse serialized output
+        local re_decoder = JsonDecoder.new(serialized)
+        local re_doc = re_decoder:parse_object():unwrap()
+        assert_eq(map.get(re_doc.fields, "service"):unwrap(), "order-gateway")
+        assert_eq(map.get(re_doc.fields, "port"):unwrap(), 8080)
+        assert_eq(map.get(re_doc.fields, "tls_enabled"):unwrap(), true)
+    end
+end
+
+println("All JSON deserialization assertions passed!")

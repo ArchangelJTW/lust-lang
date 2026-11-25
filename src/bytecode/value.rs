@@ -17,7 +17,7 @@ use crate::jit;
 use crate::number::{
     LustFloat, LustInt, float_from_int, float_is_nan, float_to_hash_bits, int_from_float,
 };
-use crate::vm::{VM, pop_vm_ptr, push_vm_ptr};
+use crate::vm::VM;
 use alloc::{
     borrow::ToOwned,
     format,
@@ -26,7 +26,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::cell::RefCell;
+use core::cell::{BorrowError, BorrowMutError, Cell, Ref, RefCell, RefMut};
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::{ptr, slice, str};
@@ -50,10 +50,11 @@ pub struct ValueKey {
 }
 
 impl ValueKey {
+    #[inline]
     pub fn from_value(value: &Value) -> Self {
         ValueKey {
-            original: value.clone(),
-            hashed: value.clone(),
+            original: value.fast_clone(),
+            hashed: value.fast_clone(),
         }
     }
 
@@ -69,11 +70,30 @@ impl ValueKey {
     }
 
     pub fn to_value(&self) -> Value {
-        self.original.clone()
+        self.original.fast_clone()
     }
 
-    pub(crate) fn owned_values(&self) -> (&Value, &Value) {
+    pub fn owned_values(&self) -> (&Value, &Value) {
         (&self.original, &self.hashed)
+    }
+}
+
+/// Zero-copy lookup key wrapper for `LustMap` (`HashMap<ValueKey, Value, DefaultHashBuilder>`).
+/// Avoids cloning `Value` / bumping `Rc` refcounts twice on every `map.get` / `OP_GET_FIELD`.
+#[derive(Clone, Copy)]
+pub struct ValueKeyRef<'a>(pub &'a Value);
+
+impl Hash for ValueKeyRef<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_value_for_key(self.0, state);
+    }
+}
+
+impl hashbrown::Equivalent<ValueKey> for ValueKeyRef<'_> {
+    #[inline]
+    fn equivalent(&self, key: &ValueKey) -> bool {
+        value_key_eq(self.0, &key.hashed)
     }
 }
 
@@ -97,9 +117,10 @@ impl fmt::Display for ValueKey {
 }
 
 impl From<Value> for ValueKey {
+    #[inline]
     fn from(value: Value) -> Self {
         ValueKey {
-            original: value.clone(),
+            original: value.fast_clone(),
             hashed: value,
         }
     }
@@ -180,24 +201,15 @@ fn unwrap_lua_value_for_key(value: &Value) -> Value {
     value.clone()
 }
 
+#[inline]
 fn value_key_eq(left: &Value, right: &Value) -> bool {
     use Value::*;
 
-    // Check if either side is a LuaValue enum and unwrap if needed
-    let is_lua_value_left = matches!(left, Enum(object) if object.enum_name == "LuaValue");
-    let is_lua_value_right = matches!(right, Enum(object) if object.enum_name == "LuaValue");
-
-    // If either side is a LuaValue, unwrap both and compare
-    if is_lua_value_left || is_lua_value_right {
-        let unwrapped_left = unwrap_lua_value_for_key(left);
-        let unwrapped_right = unwrap_lua_value_for_key(right);
-        return value_key_eq(&unwrapped_left, &unwrapped_right);
-    }
-
     match (left, right) {
+        (Int(a), Int(b)) => a == b,
+        (String(a), String(b)) => Rc::ptr_eq(a, b) || a == b,
         (Nil, Nil) => true,
         (Bool(a), Bool(b)) => a == b,
-        (Int(a), Int(b)) => a == b,
         (Float(a), Float(b)) => {
             if float_is_nan(*a) && float_is_nan(*b) {
                 true
@@ -205,12 +217,20 @@ fn value_key_eq(left: &Value, right: &Value) -> bool {
                 a == b
             }
         }
-        (String(a), String(b)) => a == b,
         (Array(a), Array(b)) => Rc::ptr_eq(a, b),
         (Tuple(a), Tuple(b)) => Rc::ptr_eq(a, b),
         (Map(a), Map(b)) => Rc::ptr_eq(a, b),
         (Struct(a), Struct(b)) => Rc::ptr_eq(a, b),
         (WeakStruct(a), WeakStruct(b)) => Weak::ptr_eq(a.inner(), b.inner()),
+        (Enum(a), _) if a.enum_name == "LuaValue" => {
+            let unwrapped_left = unwrap_lua_value_for_key(left);
+            let unwrapped_right = unwrap_lua_value_for_key(right);
+            value_key_eq(&unwrapped_left, &unwrapped_right)
+        }
+        (_, Enum(b)) if b.enum_name == "LuaValue" => {
+            let unwrapped_right = unwrap_lua_value_for_key(right);
+            value_key_eq(left, &unwrapped_right)
+        }
         // Two enum values are the same value or two unit values of the
         // same variant; a payload is identity, not contents.
         (Enum(a), Enum(b)) => {
@@ -229,16 +249,19 @@ fn value_key_eq(left: &Value, right: &Value) -> bool {
     }
 }
 
+#[inline]
 fn hash_value_for_key<H: Hasher>(value: &Value, state: &mut H) {
     use Value::*;
 
-    // Check if this is a LuaValue enum and unwrap it for consistent hashing
-    if matches!(value, Enum(object) if object.enum_name == "LuaValue") {
-        let unwrapped = unwrap_lua_value_for_key(value);
-        return hash_value_for_key(&unwrapped, state);
-    }
-
     match value {
+        Int(i) => {
+            2u8.hash(state);
+            i.hash(state);
+        }
+        String(s) => {
+            4u8.hash(state);
+            s.hash(state);
+        }
         Nil => {
             0u8.hash(state);
         }
@@ -246,21 +269,14 @@ fn hash_value_for_key<H: Hasher>(value: &Value, state: &mut H) {
             1u8.hash(state);
             b.hash(state);
         }
-        Int(i) => {
-            2u8.hash(state);
-            i.hash(state);
-        }
         Float(f) => {
             3u8.hash(state);
             if float_is_nan(*f) {
                 u64::MAX.hash(state);
             } else {
-                float_to_hash_bits(*f).hash(state);
+                let norm = if *f == 0.0 { 0.0 } else { *f };
+                float_to_hash_bits(norm).hash(state);
             }
-        }
-        String(s) => {
-            4u8.hash(state);
-            s.hash(state);
         }
         Array(arr) => {
             5u8.hash(state);
@@ -281,6 +297,10 @@ fn hash_value_for_key<H: Hasher>(value: &Value, state: &mut H) {
         WeakStruct(weak) => {
             9u8.hash(state);
             (weak.object_ptr() as usize).hash(state);
+        }
+        Enum(object) if object.enum_name == "LuaValue" => {
+            let unwrapped = unwrap_lua_value_for_key(value);
+            hash_value_for_key(&unwrapped, state);
         }
         Enum(object) => {
             10u8.hash(state);
@@ -718,6 +738,683 @@ impl From<Name> for String {
     }
 }
 
+/// Homogeneous primitive element tag for cached Cranelift flat-array views (`PERF-T4-3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlatArrayElemTag {
+    Int,
+    Float,
+    Bool,
+}
+
+/// Heap-backed flat Cranelift-compatible array buffer (`[len, cap, elem0, elem1, ...]`).
+/// Owned behind `Rc<FlatArrayBuffer>` so active native invocations can pin it cleanly
+/// until after `MirContextGuard::drop` unregisters its borrowed provenance record.
+#[derive(Debug)]
+pub struct FlatArrayBuffer {
+    words: Vec<i64>,
+}
+
+impl FlatArrayBuffer {
+    pub fn new(words: Vec<i64>) -> Self {
+        Self { words }
+    }
+
+    #[inline]
+    pub fn as_ptr(&self) -> *const i64 {
+        self.words.as_ptr()
+    }
+
+    #[inline]
+    pub fn word_len(&self) -> usize {
+        self.words.len()
+    }
+
+    #[inline]
+    pub fn elem_len(&self) -> usize {
+        self.words.len().saturating_sub(2)
+    }
+}
+
+/// Cached read-only flat array view validated against `LustArray::generation`.
+#[derive(Debug, Clone)]
+pub struct CachedFlatArray {
+    pub generation: u64,
+    pub elem_tag: FlatArrayElemTag,
+    pub buf: Rc<FlatArrayBuffer>,
+}
+
+/// Typed unboxed primitive storage for homogeneous `LustArray` instances (`NG-W10-1`).
+///
+/// Keeps `bool` arrays at 1 byte per element (`Vec<u8>`) and `int`/`float` arrays
+/// at 8 bytes per element (`Vec<i64>`/`Vec<f64>`) without boxing into 16-byte `Value`s.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnboxedArrayData {
+    None,
+    Int(Vec<i64>),
+    Float(Vec<f64>),
+    Bool(Vec<u8>),
+}
+
+#[inline]
+fn synthetic_borrow_error() -> BorrowError {
+    let tmp = RefCell::new(());
+    let _m = tmp.borrow_mut();
+    tmp.try_borrow().unwrap_err()
+}
+
+#[inline]
+fn synthetic_borrow_mut_error() -> BorrowMutError {
+    let tmp = RefCell::new(());
+    let _r = tmp.borrow();
+    tmp.try_borrow_mut().unwrap_err()
+}
+
+/// Compiler-enforced encapsulated Lust array (`PERF-T4-3`, `NG-W10-1`).
+///
+/// Every mutable access (`borrow_mut` / `try_borrow_mut` / unboxed mutators)
+/// unconditionally increments `generation` and clears `flat_cache` BEFORE
+/// returning (or before completing mutation), eliminating stale cached flat
+/// views even across external Rust mutations outside VM opcodes.
+/// `elements` is placed first under `#[repr(C)]` so `jit::layout::rc_vec_layout` probes
+/// the `RefCell<Vec<Value>>` header deterministically at offset 0 of `LustArray`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct LustArray {
+    elements: RefCell<Vec<Value>>,
+    generation: Cell<u64>,
+    has_flat_cache: Cell<bool>,
+    flat_cache: RefCell<Option<CachedFlatArray>>,
+    unboxed: RefCell<UnboxedArrayData>,
+}
+
+const _: () = assert!(core::mem::offset_of!(LustArray, elements) == 0);
+
+impl LustArray {
+    #[inline]
+    pub fn new(elements: Vec<Value>) -> Self {
+        Self {
+            elements: RefCell::new(elements),
+            generation: Cell::new(1),
+            has_flat_cache: Cell::new(false),
+            flat_cache: RefCell::new(None),
+            unboxed: RefCell::new(UnboxedArrayData::None),
+        }
+    }
+
+    #[inline]
+    pub fn with_capacity(cap: usize) -> Self {
+        Self::new(Vec::with_capacity(cap))
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
+    /// Read-only stable address identity for cache/registry keying (never exposes `*mut Vec<Value>`).
+    #[inline]
+    pub fn as_ptr(&self) -> *const Self {
+        self as *const Self
+    }
+
+    #[inline(always)]
+    fn invalidate_flat_cache(&self) {
+        let next = self.generation.get().wrapping_add(1).max(1);
+        self.generation.set(next);
+        if !self.has_flat_cache.get() {
+            return;
+        }
+        self.has_flat_cache.set(false);
+        self.flat_cache.replace(None);
+    }
+
+    #[inline]
+    fn materialize_into(elems: &mut Vec<Value>, unb: &mut UnboxedArrayData) {
+        match core::mem::replace(unb, UnboxedArrayData::None) {
+            UnboxedArrayData::None => {}
+            UnboxedArrayData::Int(v) => {
+                debug_assert!(
+                    elems.is_empty(),
+                    "LustArray invariant violated: elements non-empty while unboxed Int active"
+                );
+                elems.reserve(v.len());
+                elems.extend(v.into_iter().map(|x| Value::Int(x as LustInt)));
+            }
+            UnboxedArrayData::Float(v) => {
+                debug_assert!(
+                    elems.is_empty(),
+                    "LustArray invariant violated: elements non-empty while unboxed Float active"
+                );
+                elems.reserve(v.len());
+                elems.extend(v.into_iter().map(|x| Value::Float(x as LustFloat)));
+            }
+            UnboxedArrayData::Bool(v) => {
+                debug_assert!(
+                    elems.is_empty(),
+                    "LustArray invariant violated: elements non-empty while unboxed Bool active"
+                );
+                elems.reserve(v.len());
+                elems.extend(v.into_iter().map(|b| Value::Bool(b != 0)));
+            }
+        }
+    }
+
+    #[inline]
+    pub fn sync_unboxed_to_elements(&self) {
+        let has_unboxed = !matches!(*self.unboxed.borrow(), UnboxedArrayData::None);
+        if has_unboxed {
+            let mut elems = self.elements.borrow_mut();
+            let mut unb = self.unboxed.borrow_mut();
+            Self::materialize_into(&mut elems, &mut unb);
+        }
+    }
+
+    #[inline]
+    pub fn is_unboxed(&self) -> bool {
+        !matches!(*self.unboxed.borrow(), UnboxedArrayData::None)
+    }
+
+    /// Read-only inspection of the backing boxed `elements` vector without
+    /// triggering lazy materialization from `unboxed`.
+    #[inline]
+    pub fn borrow_elements_without_sync(&self) -> Ref<'_, Vec<Value>> {
+        self.elements.borrow()
+    }
+
+    #[inline]
+    pub fn with_unboxed_data<R>(&self, f: impl FnOnce(&UnboxedArrayData) -> R) -> R {
+        let unb = self.unboxed.borrow();
+        f(&unb)
+    }
+
+    #[inline]
+    pub fn len_fast(&self) -> usize {
+        match &*self.unboxed.borrow() {
+            UnboxedArrayData::None => self.elements.borrow().len(),
+            UnboxedArrayData::Int(v) => v.len(),
+            UnboxedArrayData::Float(v) => v.len(),
+            UnboxedArrayData::Bool(v) => v.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty_fast(&self) -> bool {
+        self.len_fast() == 0
+    }
+
+    #[inline]
+    pub fn get_value_fast(&self, idx: usize) -> Option<Value> {
+        match &*self.unboxed.borrow() {
+            UnboxedArrayData::None => self.elements.borrow().get(idx).cloned(),
+            UnboxedArrayData::Int(v) => v.get(idx).map(|&x| Value::Int(x as LustInt)),
+            UnboxedArrayData::Float(v) => v.get(idx).map(|&x| Value::Float(x as LustFloat)),
+            UnboxedArrayData::Bool(v) => v.get(idx).map(|&b| Value::Bool(b != 0)),
+        }
+    }
+
+    #[inline]
+    pub fn push_int(&self, val: i64) {
+        let needs_materialize = {
+            let mut unb = self.unboxed.borrow_mut();
+            match &mut *unb {
+                UnboxedArrayData::Int(v) => {
+                    v.push(val);
+                    false
+                }
+                UnboxedArrayData::None => {
+                    if self.elements.borrow().is_empty() {
+                        *unb = UnboxedArrayData::Int(vec![val]);
+                        false
+                    } else {
+                        true
+                    }
+                }
+                UnboxedArrayData::Float(v) if v.is_empty() => {
+                    *unb = UnboxedArrayData::Int(vec![val]);
+                    false
+                }
+                UnboxedArrayData::Bool(v) if v.is_empty() => {
+                    *unb = UnboxedArrayData::Int(vec![val]);
+                    false
+                }
+                UnboxedArrayData::Float(_) | UnboxedArrayData::Bool(_) => true,
+            }
+        };
+        if needs_materialize {
+            self.sync_unboxed_to_elements();
+            self.elements.borrow_mut().push(Value::Int(val as LustInt));
+        }
+        self.invalidate_flat_cache();
+    }
+
+    #[inline]
+    pub fn push_float(&self, val: f64) {
+        let needs_materialize = {
+            let mut unb = self.unboxed.borrow_mut();
+            match &mut *unb {
+                UnboxedArrayData::Float(v) => {
+                    v.push(val);
+                    false
+                }
+                UnboxedArrayData::None => {
+                    if self.elements.borrow().is_empty() {
+                        *unb = UnboxedArrayData::Float(vec![val]);
+                        false
+                    } else {
+                        true
+                    }
+                }
+                UnboxedArrayData::Int(v) if v.is_empty() => {
+                    *unb = UnboxedArrayData::Float(vec![val]);
+                    false
+                }
+                UnboxedArrayData::Bool(v) if v.is_empty() => {
+                    *unb = UnboxedArrayData::Float(vec![val]);
+                    false
+                }
+                UnboxedArrayData::Int(_) | UnboxedArrayData::Bool(_) => true,
+            }
+        };
+        if needs_materialize {
+            self.sync_unboxed_to_elements();
+            self.elements
+                .borrow_mut()
+                .push(Value::Float(val as LustFloat));
+        }
+        self.invalidate_flat_cache();
+    }
+
+    #[inline]
+    pub fn push_bool(&self, val: bool) {
+        let byte = u8::from(val);
+        let needs_materialize = {
+            let mut unb = self.unboxed.borrow_mut();
+            match &mut *unb {
+                UnboxedArrayData::Bool(v) => {
+                    v.push(byte);
+                    false
+                }
+                UnboxedArrayData::None => {
+                    if self.elements.borrow().is_empty() {
+                        *unb = UnboxedArrayData::Bool(vec![byte]);
+                        false
+                    } else {
+                        true
+                    }
+                }
+                UnboxedArrayData::Int(v) if v.is_empty() => {
+                    *unb = UnboxedArrayData::Bool(vec![byte]);
+                    false
+                }
+                UnboxedArrayData::Float(v) if v.is_empty() => {
+                    *unb = UnboxedArrayData::Bool(vec![byte]);
+                    false
+                }
+                UnboxedArrayData::Int(_) | UnboxedArrayData::Float(_) => true,
+            }
+        };
+        if needs_materialize {
+            self.sync_unboxed_to_elements();
+            self.elements.borrow_mut().push(Value::Bool(val));
+        }
+        self.invalidate_flat_cache();
+    }
+
+    #[inline]
+    pub fn push_value_fast(&self, val: Value) {
+        match val {
+            Value::Int(i) => self.push_int(i as i64),
+            Value::Float(f) => self.push_float(f as f64),
+            Value::Bool(b) => self.push_bool(b),
+            other => {
+                self.sync_unboxed_to_elements();
+                self.elements.borrow_mut().push(other);
+                self.invalidate_flat_cache();
+            }
+        }
+    }
+
+    #[inline]
+    pub fn set_int(&self, idx: usize, val: i64) -> Result<(), usize> {
+        let outcome = {
+            let mut unb = self.unboxed.borrow_mut();
+            match &mut *unb {
+                UnboxedArrayData::Int(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    v[idx] = val;
+                    None
+                }
+                UnboxedArrayData::None => Some(false),
+                UnboxedArrayData::Float(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    Some(true)
+                }
+                UnboxedArrayData::Bool(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    Some(true)
+                }
+            }
+        };
+        if let Some(needs_sync) = outcome {
+            if needs_sync {
+                self.sync_unboxed_to_elements();
+            }
+            let mut elems = self.elements.borrow_mut();
+            if idx >= elems.len() {
+                return Err(elems.len());
+            }
+            elems[idx] = Value::Int(val as LustInt);
+        }
+        self.invalidate_flat_cache();
+        Ok(())
+    }
+
+    #[inline]
+    pub fn set_float(&self, idx: usize, val: f64) -> Result<(), usize> {
+        let outcome = {
+            let mut unb = self.unboxed.borrow_mut();
+            match &mut *unb {
+                UnboxedArrayData::Float(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    v[idx] = val;
+                    None
+                }
+                UnboxedArrayData::None => Some(false),
+                UnboxedArrayData::Int(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    Some(true)
+                }
+                UnboxedArrayData::Bool(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    Some(true)
+                }
+            }
+        };
+        if let Some(needs_sync) = outcome {
+            if needs_sync {
+                self.sync_unboxed_to_elements();
+            }
+            let mut elems = self.elements.borrow_mut();
+            if idx >= elems.len() {
+                return Err(elems.len());
+            }
+            elems[idx] = Value::Float(val as LustFloat);
+        }
+        self.invalidate_flat_cache();
+        Ok(())
+    }
+
+    #[inline]
+    pub fn set_bool(&self, idx: usize, val: bool) -> Result<(), usize> {
+        let outcome = {
+            let mut unb = self.unboxed.borrow_mut();
+            match &mut *unb {
+                UnboxedArrayData::Bool(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    v[idx] = u8::from(val);
+                    None
+                }
+                UnboxedArrayData::None => Some(false),
+                UnboxedArrayData::Int(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    Some(true)
+                }
+                UnboxedArrayData::Float(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    Some(true)
+                }
+            }
+        };
+        if let Some(needs_sync) = outcome {
+            if needs_sync {
+                self.sync_unboxed_to_elements();
+            }
+            let mut elems = self.elements.borrow_mut();
+            if idx >= elems.len() {
+                return Err(elems.len());
+            }
+            elems[idx] = Value::Bool(val);
+        }
+        self.invalidate_flat_cache();
+        Ok(())
+    }
+
+    #[inline]
+    pub fn set_value_fast(&self, idx: usize, val: Value) -> Result<(), usize> {
+        match val {
+            Value::Int(i) => self.set_int(idx, i as i64),
+            Value::Float(f) => self.set_float(idx, f as f64),
+            Value::Bool(b) => self.set_bool(idx, b),
+            other => {
+                let len = self.len_fast();
+                if idx >= len {
+                    return Err(len);
+                }
+                self.sync_unboxed_to_elements();
+                self.elements.borrow_mut()[idx] = other;
+                self.invalidate_flat_cache();
+                Ok(())
+            }
+        }
+    }
+
+    #[inline]
+    pub fn clear(&self) {
+        {
+            let mut unb = self.unboxed.borrow_mut();
+            *unb = UnboxedArrayData::None;
+        }
+        {
+            let mut elems = self.elements.borrow_mut();
+            elems.clear();
+        }
+        self.invalidate_flat_cache();
+    }
+
+    #[inline]
+    pub fn borrow(&self) -> Ref<'_, Vec<Value>> {
+        self.sync_unboxed_to_elements();
+        self.elements.borrow()
+    }
+
+    #[inline]
+    pub fn try_borrow(&self) -> Result<Ref<'_, Vec<Value>>, BorrowError> {
+        let has_unboxed = {
+            let unb = self.unboxed.try_borrow()?;
+            !matches!(*unb, UnboxedArrayData::None)
+        };
+        if has_unboxed {
+            let mut elems = self
+                .elements
+                .try_borrow_mut()
+                .map_err(|_| synthetic_borrow_error())?;
+            let mut unb = self
+                .unboxed
+                .try_borrow_mut()
+                .map_err(|_| synthetic_borrow_error())?;
+            Self::materialize_into(&mut elems, &mut unb);
+        }
+        self.elements.try_borrow()
+    }
+
+    #[inline]
+    pub fn borrow_mut(&self) -> RefMut<'_, Vec<Value>> {
+        self.sync_unboxed_to_elements();
+        let guard = self.elements.borrow_mut();
+        self.invalidate_flat_cache();
+        guard
+    }
+
+    #[inline]
+    pub fn try_borrow_mut(&self) -> Result<RefMut<'_, Vec<Value>>, BorrowMutError> {
+        let has_unboxed = {
+            let unb = self
+                .unboxed
+                .try_borrow()
+                .map_err(|_| synthetic_borrow_mut_error())?;
+            !matches!(*unb, UnboxedArrayData::None)
+        };
+        let mut guard = self.elements.try_borrow_mut()?;
+        if has_unboxed {
+            let mut unb = self.unboxed.try_borrow_mut()?;
+            Self::materialize_into(&mut guard, &mut unb);
+        }
+        self.invalidate_flat_cache();
+        Ok(guard)
+    }
+
+    #[inline]
+    pub fn cached_flat(&self, expected_tag: FlatArrayElemTag) -> Option<Rc<FlatArrayBuffer>> {
+        if !self.has_flat_cache.get() {
+            return None;
+        }
+        let cache = self.flat_cache.borrow();
+        match cache.as_ref() {
+            Some(c) if c.generation == self.generation.get() && c.elem_tag == expected_tag => {
+                Some(Rc::clone(&c.buf))
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn has_cached_flat(&self) -> bool {
+        self.has_flat_cache.get()
+    }
+
+    #[inline]
+    pub fn set_cached_flat(&self, elem_tag: FlatArrayElemTag, buf: Rc<FlatArrayBuffer>) {
+        self.flat_cache.replace(Some(CachedFlatArray {
+            generation: self.generation.get(),
+            elem_tag,
+            buf,
+        }));
+        self.has_flat_cache.set(true);
+    }
+
+    #[inline]
+    pub fn clear_cached_flat(&self) {
+        self.has_flat_cache.set(false);
+        self.flat_cache.replace(None);
+    }
+}
+
+impl Default for LustArray {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+impl PartialEq for LustArray {
+    fn eq(&self, other: &Self) -> bool {
+        if core::ptr::eq(self, other) {
+            return true;
+        }
+        let len = self.len_fast();
+        if len != other.len_fast() {
+            return false;
+        }
+        let fast = {
+            let a = self.unboxed.borrow();
+            let b = other.unboxed.borrow();
+            match (&*a, &*b) {
+                (UnboxedArrayData::Int(va), UnboxedArrayData::Int(vb)) => Some(va == vb),
+                (UnboxedArrayData::Float(va), UnboxedArrayData::Float(vb)) => Some(va == vb),
+                (UnboxedArrayData::Bool(va), UnboxedArrayData::Bool(vb)) => Some(va == vb),
+                (UnboxedArrayData::None, UnboxedArrayData::None) => None,
+                (
+                    UnboxedArrayData::Int(_)
+                    | UnboxedArrayData::Float(_)
+                    | UnboxedArrayData::Bool(_),
+                    UnboxedArrayData::Int(_)
+                    | UnboxedArrayData::Float(_)
+                    | UnboxedArrayData::Bool(_),
+                ) => Some(len == 0),
+                (UnboxedArrayData::Int(va), UnboxedArrayData::None) => {
+                    let vb = other.elements.borrow();
+                    Some(
+                        va.len() == vb.len()
+                            && va
+                                .iter()
+                                .zip(vb.iter())
+                                .all(|(&x, y)| matches!(y, Value::Int(yi) if (*yi as i64) == x)),
+                    )
+                }
+                (UnboxedArrayData::None, UnboxedArrayData::Int(vb)) => {
+                    let va = self.elements.borrow();
+                    Some(
+                        va.len() == vb.len()
+                            && va
+                                .iter()
+                                .zip(vb.iter())
+                                .all(|(x, &y)| matches!(x, Value::Int(xi) if (*xi as i64) == y)),
+                    )
+                }
+                (UnboxedArrayData::Float(va), UnboxedArrayData::None) => {
+                    let vb = other.elements.borrow();
+                    Some(
+                        va.len() == vb.len()
+                            && va.iter().zip(vb.iter()).all(
+                                |(&x, y)| matches!(y, Value::Float(yf) if (*yf as f64) == x),
+                            ),
+                    )
+                }
+                (UnboxedArrayData::None, UnboxedArrayData::Float(vb)) => {
+                    let va = self.elements.borrow();
+                    Some(
+                        va.len() == vb.len()
+                            && va.iter().zip(vb.iter()).all(
+                                |(x, &y)| matches!(x, Value::Float(xf) if (*xf as f64) == y),
+                            ),
+                    )
+                }
+                (UnboxedArrayData::Bool(va), UnboxedArrayData::None) => {
+                    let vb = other.elements.borrow();
+                    Some(
+                        va.len() == vb.len()
+                            && va
+                                .iter()
+                                .zip(vb.iter())
+                                .all(|(&x, y)| matches!(y, Value::Bool(yb) if *yb == (x != 0))),
+                    )
+                }
+                (UnboxedArrayData::None, UnboxedArrayData::Bool(vb)) => {
+                    let va = self.elements.borrow();
+                    Some(
+                        va.len() == vb.len()
+                            && va
+                                .iter()
+                                .zip(vb.iter())
+                                .all(|(x, &y)| matches!(x, Value::Bool(xb) if *xb == (y != 0))),
+                    )
+                }
+            }
+        };
+        if let Some(eq) = fast {
+            return eq;
+        }
+        *self.elements.borrow() == *other.elements.borrow()
+    }
+}
+
 // Every heap variant is one thin `Rc`, so a `Value` is a tag and an 8-byte
 // payload: the JIT lays registers out at that stride and copies values as
 // one 16-byte pair, and everything that holds nothing owned is a scalar,
@@ -732,7 +1429,7 @@ pub enum Value {
     Int(LustInt),
     Float(LustFloat),
     String(Rc<String>),
-    Array(Rc<RefCell<Vec<Value>>>),
+    Array(Rc<LustArray>),
     Tuple(Rc<Vec<Value>>),
     Map(Rc<RefCell<LustMap>>),
     Struct(Rc<StructObject>),
@@ -745,6 +1442,40 @@ pub enum Value {
     Task(TaskHandle),
 }
 
+/// Returns `true` when `value` holds no strong references to any mutable container
+/// (`Array`, `Map`, `Struct`, `Closure`, `Iterator`, or non-plain `Enum`/`Tuple`).
+/// Used to decide whether a `StructObject` can be classified as an all-leaf struct.
+#[inline(always)]
+pub fn is_strict_scalar_leaf(value: &Value) -> bool {
+    match value {
+        Value::Nil
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::String(_)
+        | Value::Function(_)
+        | Value::NativeFunction(_)
+        | Value::WeakStruct(_)
+        | Value::Task(_) => true,
+        Value::Enum(obj) => obj
+            .values
+            .as_ref()
+            .is_none_or(|vals| vals.iter().all(Value::is_plain)),
+        Value::Tuple(items) => items.iter().all(Value::is_plain),
+        _ => false,
+    }
+}
+
+/// Returns `true` when `value` cannot participate in a reference cycle and can safely
+/// skip `CycleCollector::register_value` (including all-leaf `StructObject` instances).
+#[inline(always)]
+pub fn is_cycle_leaf_value(value: &Value) -> bool {
+    match value {
+        Value::Struct(s) => s.is_leaf_struct.get(),
+        other => is_strict_scalar_leaf(other),
+    }
+}
+
 /// A struct value: its name, its layout and its fields, in one allocation
 /// that every clone of the value shares.
 #[repr(C)]
@@ -752,14 +1483,19 @@ pub struct StructObject {
     pub name: Name,
     pub layout: Rc<StructLayout>,
     pub fields: RefCell<Vec<Value>>,
+    /// `true` while every field holds a strict scalar leaf value (cannot close a cycle).
+    /// Cleared to `false` on the first write of a non-leaf value via `SetField` / `SetFieldSlot`.
+    pub is_leaf_struct: Cell<bool>,
 }
 
 impl StructObject {
     pub fn new(name: impl Into<Name>, layout: Rc<StructLayout>, fields: Vec<Value>) -> Rc<Self> {
+        let is_leaf = fields.iter().all(is_strict_scalar_leaf);
         Rc::new(Self {
             name: name.into(),
             layout,
             fields: RefCell::new(fields),
+            is_leaf_struct: Cell::new(is_leaf),
         })
     }
 }
@@ -887,10 +1623,12 @@ impl Upvalue {
         }
     }
 
+    #[inline]
     pub fn get(&self) -> Value {
-        self.value.borrow().clone()
+        self.value.borrow().fast_clone()
     }
 
+    #[inline]
     pub fn set(&self, value: Value) {
         *self.value.borrow_mut() = value;
     }
@@ -906,10 +1644,19 @@ impl fmt::Debug for Upvalue {
     }
 }
 
+impl PartialEq for Upvalue {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.value, &other.value) || *self.value.borrow() == *other.value.borrow()
+    }
+}
+
+impl Eq for Upvalue {}
+
 #[derive(Debug, Clone)]
 pub enum NativeCallResult {
     Return(Value),
     Yield(Value),
+    YieldTimer(core::time::Duration, Value),
     Stop(Value),
 }
 
@@ -1066,7 +1813,19 @@ impl Value {
             Value::Array(arr) => {
                 #[cfg(feature = "std")]
                 sync_specialized_array(arr);
-                Some(arr.borrow().clone())
+                let unboxed_vec = arr.with_unboxed_data(|unb| match unb {
+                    UnboxedArrayData::None => None,
+                    UnboxedArrayData::Int(v) => {
+                        Some(v.iter().map(|&x| Value::Int(x as LustInt)).collect())
+                    }
+                    UnboxedArrayData::Float(v) => {
+                        Some(v.iter().map(|&x| Value::Float(x as LustFloat)).collect())
+                    }
+                    UnboxedArrayData::Bool(v) => {
+                        Some(v.iter().map(|&b| Value::Bool(b != 0)).collect())
+                    }
+                });
+                Some(unboxed_vec.unwrap_or_else(|| arr.borrow().clone()))
             }
             _ => None,
         }
@@ -1076,7 +1835,7 @@ impl Value {
         match self {
             Value::Array(arr) => {
                 sync_specialized_array(arr);
-                Some(arr.borrow().len())
+                Some(arr.len_fast())
             }
             _ => None,
         }
@@ -1086,7 +1845,7 @@ impl Value {
         match self {
             Value::Array(arr) => {
                 sync_specialized_array(arr);
-                arr.borrow().get(index).cloned()
+                arr.get_value_fast(index)
             }
             _ => None,
         }
@@ -1100,7 +1859,7 @@ impl Value {
                     sync_specialized_array(arr);
                     invalidate_specialized_array_cache(arr.as_ptr() as usize);
                 }
-                arr.borrow_mut().push(value);
+                arr.push_value_fast(value);
                 Ok(())
             }
 
@@ -1173,7 +1932,7 @@ impl Value {
     }
 
     pub fn array(values: Vec<Value>) -> Self {
-        Value::Array(Rc::new(RefCell::new(values)))
+        Value::Array(Rc::new(LustArray::new(values)))
     }
 
     pub fn tuple(values: Vec<Value>) -> Self {
@@ -1300,6 +2059,9 @@ impl Value {
                 let mut borrowed = object.fields.borrow_mut();
                 if index < borrowed.len() {
                     let canonical = object.layout.canonicalize_field_value(index, value)?;
+                    if !is_strict_scalar_leaf(&canonical) {
+                        object.is_leaf_struct.set(false);
+                    }
                     borrowed[index] = canonical;
                     Ok(())
                 } else {
@@ -1370,6 +2132,51 @@ impl Value {
     }
 }
 
+#[cfg(feature = "std")]
+thread_local! {
+    static VISITED_DEBUG: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    static VISITED_DISPLAY: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    static VISITED_EQ_PAIRS: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(feature = "std")]
+fn debug_cycle_guard(ptr: usize) -> core::mem::DropGuard<usize, fn(usize)> {
+    core::mem::DropGuard::new(ptr, |ptr| {
+        VISITED_DEBUG.with(|cell| {
+            let mut v = cell.borrow_mut();
+            if let Some(pos) = v.iter().rposition(|p| *p == ptr) {
+                v.remove(pos);
+            }
+        });
+    })
+}
+
+#[cfg(feature = "std")]
+fn display_cycle_guard(ptr: usize) -> core::mem::DropGuard<usize, fn(usize)> {
+    core::mem::DropGuard::new(ptr, |ptr| {
+        VISITED_DISPLAY.with(|cell| {
+            let mut v = cell.borrow_mut();
+            if let Some(pos) = v.iter().rposition(|p| *p == ptr) {
+                v.remove(pos);
+            }
+        });
+    })
+}
+
+#[cfg(feature = "std")]
+fn eq_cycle_guard(
+    pair: (usize, usize),
+) -> core::mem::DropGuard<(usize, usize), fn((usize, usize))> {
+    core::mem::DropGuard::new(pair, |pair| {
+        VISITED_EQ_PAIRS.with(|cell| {
+            let mut v = cell.borrow_mut();
+            if let Some(pos) = v.iter().rposition(|p| *p == pair) {
+                v.remove(pos);
+            }
+        });
+    })
+}
+
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1381,15 +2188,119 @@ impl fmt::Debug for Value {
             Value::Array(arr) => {
                 #[cfg(feature = "std")]
                 sync_specialized_array(arr);
-                write!(f, "Array({:?})", arr.borrow())
+                let ptr = Rc::as_ptr(arr) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DEBUG.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(f, "Array([...])");
+                }
+                #[cfg(feature = "std")]
+                VISITED_DEBUG.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = debug_cycle_guard(ptr);
+
+                write!(f, "Array([")?;
+                let formatted_unboxed = arr.with_unboxed_data(|unb| match unb {
+                    UnboxedArrayData::None => Ok(false),
+                    UnboxedArrayData::Int(v) => {
+                        for (i, &val) in v.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{:?}", Value::Int(val as LustInt))?;
+                        }
+                        Ok(true)
+                    }
+                    UnboxedArrayData::Float(v) => {
+                        for (i, &val) in v.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{:?}", Value::Float(val as LustFloat))?;
+                        }
+                        Ok(true)
+                    }
+                    UnboxedArrayData::Bool(v) => {
+                        for (i, &val) in v.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{:?}", Value::Bool(val != 0))?;
+                        }
+                        Ok(true)
+                    }
+                })?;
+                if !formatted_unboxed {
+                    let borrowed = arr.borrow();
+                    for (i, val) in borrowed.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{:?}", val)?;
+                    }
+                }
+                write!(f, "])")
             }
-            Value::Tuple(values) => write!(f, "Tuple({:?})", values),
-            Value::Map(map) => write!(f, "Map({:?})", map.borrow()),
+            Value::Tuple(values) => {
+                let ptr = Rc::as_ptr(values) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DEBUG.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(f, "Tuple([...])");
+                }
+                #[cfg(feature = "std")]
+                VISITED_DEBUG.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = debug_cycle_guard(ptr);
+
+                write!(f, "Tuple([")?;
+                for (i, val) in values.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}", val)?;
+                }
+                write!(f, "])")
+            }
+            Value::Map(map) => {
+                let ptr = Rc::as_ptr(map) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DEBUG.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(f, "Map({{...}})");
+                }
+                #[cfg(feature = "std")]
+                VISITED_DEBUG.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = debug_cycle_guard(ptr);
+
+                write!(f, "Map({{")?;
+                let borrowed = map.borrow();
+                for (i, (k, v)) in borrowed.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}: {:?}", k, v)?;
+                }
+                write!(f, "}})")
+            }
             Value::Struct(object) => {
+                let ptr = Rc::as_ptr(object) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DEBUG.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(
+                        f,
+                        "Struct {{ name: {:?}, fields: [...] }}",
+                        object.name.as_str()
+                    );
+                }
+                #[cfg(feature = "std")]
+                VISITED_DEBUG.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = debug_cycle_guard(ptr);
+
                 let StructObject {
                     name,
                     layout,
                     fields,
+                    ..
                 } = object.as_ref();
                 let borrowed = fields.borrow();
                 let mut display_fields = Vec::with_capacity(borrowed.len());
@@ -1457,20 +2368,72 @@ impl fmt::Display for Value {
             Value::Array(arr) => {
                 #[cfg(feature = "std")]
                 sync_specialized_array(arr);
-                write!(f, "[")?;
-                let borrowed = arr.borrow();
-                for (i, val) in borrowed.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
+                let ptr = Rc::as_ptr(arr) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DISPLAY.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(f, "[...]");
+                }
+                #[cfg(feature = "std")]
+                VISITED_DISPLAY.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = display_cycle_guard(ptr);
 
-                    write!(f, "{}", val)?;
+                write!(f, "[")?;
+                let formatted_unboxed = arr.with_unboxed_data(|unb| match unb {
+                    UnboxedArrayData::None => Ok(false),
+                    UnboxedArrayData::Int(v) => {
+                        for (i, &val) in v.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{}", Value::Int(val as LustInt))?;
+                        }
+                        Ok(true)
+                    }
+                    UnboxedArrayData::Float(v) => {
+                        for (i, &val) in v.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{}", Value::Float(val as LustFloat))?;
+                        }
+                        Ok(true)
+                    }
+                    UnboxedArrayData::Bool(v) => {
+                        for (i, &val) in v.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{}", Value::Bool(val != 0))?;
+                        }
+                        Ok(true)
+                    }
+                })?;
+                if !formatted_unboxed {
+                    let borrowed = arr.borrow();
+                    for (i, val) in borrowed.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+
+                        write!(f, "{}", val)?;
+                    }
                 }
 
                 write!(f, "]")
             }
 
             Value::Tuple(values) => {
+                let ptr = Rc::as_ptr(values) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DISPLAY.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(f, "(...)");
+                }
+                #[cfg(feature = "std")]
+                VISITED_DISPLAY.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = display_cycle_guard(ptr);
+
                 write!(f, "(")?;
                 for (i, val) in values.iter().enumerate() {
                     if i > 0 {
@@ -1484,6 +2447,16 @@ impl fmt::Display for Value {
             }
 
             Value::Map(map) => {
+                let ptr = Rc::as_ptr(map) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DISPLAY.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(f, "{{...}}");
+                }
+                #[cfg(feature = "std")]
+                VISITED_DISPLAY.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = display_cycle_guard(ptr);
+
                 write!(f, "{{")?;
                 let borrowed = map.borrow();
                 for (i, (k, v)) in borrowed.iter().enumerate() {
@@ -1498,10 +2471,21 @@ impl fmt::Display for Value {
             }
 
             Value::Struct(object) => {
+                let ptr = Rc::as_ptr(object) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DISPLAY.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(f, "{} {{ ... }}", object.name);
+                }
+                #[cfg(feature = "std")]
+                VISITED_DISPLAY.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = display_cycle_guard(ptr);
+
                 let StructObject {
                     name,
                     layout,
                     fields,
+                    ..
                 } = object.as_ref();
                 let borrowed = fields.borrow();
                 write!(f, "{} {{", name)?;
@@ -1565,10 +2549,90 @@ impl PartialEq for Value {
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
-            (Value::Array(a), Value::Array(b)) => *a.borrow() == *b.borrow(),
-            (Value::Tuple(a), Value::Tuple(b)) => *a == *b,
-            (Value::Map(a), Value::Map(b)) => *a.borrow() == *b.borrow(),
+            (Value::Array(a), Value::Array(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
+                if a.is_unboxed() || b.is_unboxed() {
+                    return **a == **b;
+                }
+                let pair = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+                #[cfg(feature = "std")]
+                {
+                    if VISITED_EQ_PAIRS.with(|c| c.borrow().contains(&pair)) {
+                        return true;
+                    }
+                    VISITED_EQ_PAIRS.with(|c| c.borrow_mut().push(pair));
+                }
+                #[cfg(feature = "std")]
+                let _guard = eq_cycle_guard(pair);
+                let b_a = a.borrow();
+                let b_b = b.borrow();
+                if b_a.len() != b_b.len() {
+                    return false;
+                }
+                b_a.iter().zip(b_b.iter()).all(|(x, y)| x == y)
+            }
+            (Value::Tuple(a), Value::Tuple(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
+                let pair = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+                #[cfg(feature = "std")]
+                {
+                    if VISITED_EQ_PAIRS.with(|c| c.borrow().contains(&pair)) {
+                        return true;
+                    }
+                    VISITED_EQ_PAIRS.with(|c| c.borrow_mut().push(pair));
+                }
+                #[cfg(feature = "std")]
+                let _guard = eq_cycle_guard(pair);
+                if a.len() != b.len() {
+                    return false;
+                }
+                a.iter().zip(b.iter()).all(|(x, y)| x == y)
+            }
+            (Value::Map(a), Value::Map(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
+                let pair = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+                #[cfg(feature = "std")]
+                {
+                    if VISITED_EQ_PAIRS.with(|c| c.borrow().contains(&pair)) {
+                        return true;
+                    }
+                    VISITED_EQ_PAIRS.with(|c| c.borrow_mut().push(pair));
+                }
+                #[cfg(feature = "std")]
+                let _guard = eq_cycle_guard(pair);
+                let b_a = a.borrow();
+                let b_b = b.borrow();
+                if b_a.len() != b_b.len() {
+                    return false;
+                }
+                for (k, v1) in b_a.iter() {
+                    match b_b.get(k) {
+                        Some(v2) if v1 == v2 => {}
+                        _ => return false,
+                    }
+                }
+                true
+            }
             (Value::Struct(a), Value::Struct(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
+                let pair = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+                #[cfg(feature = "std")]
+                {
+                    if VISITED_EQ_PAIRS.with(|c| c.borrow().contains(&pair)) {
+                        return true;
+                    }
+                    VISITED_EQ_PAIRS.with(|c| c.borrow_mut().push(pair));
+                }
+                #[cfg(feature = "std")]
+                let _guard = eq_cycle_guard(pair);
                 let (n1, l1, f1) = (&a.name, &a.layout, &a.fields);
                 let (n2, l2, f2) = (&b.name, &b.layout, &b.fields);
                 if n1 != n2 {
@@ -1628,6 +2692,63 @@ impl PartialEq for Value {
         }
     }
 }
+
+impl From<bool> for Value {
+    #[inline]
+    fn from(b: bool) -> Self {
+        Value::Bool(b)
+    }
+}
+
+impl From<LustInt> for Value {
+    #[inline]
+    fn from(i: LustInt) -> Self {
+        Value::Int(i)
+    }
+}
+
+impl From<LustFloat> for Value {
+    #[inline]
+    fn from(f: LustFloat) -> Self {
+        Value::Float(f)
+    }
+}
+
+impl From<String> for Value {
+    #[inline]
+    fn from(s: String) -> Self {
+        Value::String(Rc::new(s))
+    }
+}
+
+impl From<&str> for Value {
+    #[inline]
+    fn from(s: &str) -> Self {
+        Value::String(Rc::new(s.to_owned()))
+    }
+}
+
+impl From<Rc<String>> for Value {
+    #[inline]
+    fn from(s: Rc<String>) -> Self {
+        Value::String(s)
+    }
+}
+
+impl From<Vec<Value>> for Value {
+    #[inline]
+    fn from(v: Vec<Value>) -> Self {
+        Value::Array(Rc::new(LustArray::new(v)))
+    }
+}
+
+impl From<LustMap> for Value {
+    #[inline]
+    fn from(m: LustMap) -> Self {
+        Value::Map(Rc::new(RefCell::new(m)))
+    }
+}
+
 
 #[inline]
 unsafe fn replace_value(dest: *mut Value, value: Value) {
@@ -2080,7 +3201,7 @@ pub unsafe extern "C" fn jit_array_push_safe(
 /// rebox publishes it back into that same array object, wherever the
 /// register that held the array has moved on to by then. Zeroed = empty.
 #[cfg(feature = "std")]
-type ArrayRef = Rc<RefCell<Vec<Value>>>;
+type ArrayRef = Rc<LustArray>;
 
 #[cfg(feature = "std")]
 #[repr(C)]
@@ -2088,7 +3209,7 @@ pub struct JitVecSlot {
     pub ptr: *mut LustInt,
     pub len: usize,
     pub cap: usize,
-    pub array: *const RefCell<Vec<Value>>,
+    pub array: *const LustArray,
 }
 
 #[cfg(feature = "std")]
@@ -2165,51 +3286,343 @@ impl JitVecSlot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct VmId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct ArraySequenceId(pub u64);
+
+pub type SpecializedCacheKey = (VmId, ArraySequenceId);
+
 #[cfg(feature = "std")]
 thread_local! {
-    static SPECIALIZED_BOOL_CACHE: RefCell<HashMap<usize, (Vec<u8>, bool, Weak<RefCell<Vec<Value>>>)>> = RefCell::new(HashMap::new());
-    static SPECIALIZED_INT_CACHE: RefCell<HashMap<usize, (Vec<LustInt>, bool, Weak<RefCell<Vec<Value>>>)>> = RefCell::new(HashMap::new());
-    static SPECIALIZED_FLOAT_CACHE: RefCell<HashMap<usize, (Vec<LustFloat>, bool, Weak<RefCell<Vec<Value>>>)>> = RefCell::new(HashMap::new());
+    static SPECIALIZED_BOOL_CACHE: RefCell<HashMap<SpecializedCacheKey, (Vec<u8>, bool, Weak<LustArray>)>> = RefCell::new(HashMap::new());
+    static SPECIALIZED_INT_CACHE: RefCell<HashMap<SpecializedCacheKey, (Vec<LustInt>, bool, Weak<LustArray>)>> = RefCell::new(HashMap::new());
+    static SPECIALIZED_FLOAT_CACHE: RefCell<HashMap<SpecializedCacheKey, (Vec<LustFloat>, bool, Weak<LustArray>)>> = RefCell::new(HashMap::new());
+    static SPECIALIZED_ACTIVE_ENTRIES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static FALLBACK_ARRAY_MAP: RefCell<HashMap<usize, ArraySequenceId>> = RefCell::new(HashMap::new());
+    static NEXT_FALLBACK_SEQ: core::cell::Cell<u64> = const { core::cell::Cell::new(1) };
+}
+
+#[cfg(all(test, feature = "std"))]
+thread_local! {
+    static SPECIALIZED_CACHE_HASHMAP_PROBES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 #[cfg(feature = "std")]
-pub fn invalidate_specialized_array_cache(arr_ptr: usize) {
-    SPECIALIZED_BOOL_CACHE.with(|c| c.borrow_mut().remove(&arr_ptr));
-    SPECIALIZED_INT_CACHE.with(|c| c.borrow_mut().remove(&arr_ptr));
-    SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow_mut().remove(&arr_ptr));
+#[inline(always)]
+fn record_specialized_cache_probe() {
+    #[cfg(test)]
+    SPECIALIZED_CACHE_HASHMAP_PROBES.with(|c| c.set(c.get() + 1));
 }
 
-pub fn get_specialized_cached_element(arr: &Rc<RefCell<Vec<Value>>>, idx: i64) -> Option<Value> {
+#[cfg(feature = "std")]
+static SPECIALIZED_ACTIVE_GLOBAL: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "std")]
+#[inline(always)]
+fn specialized_cache_inc() {
+    SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.set(c.get() + 1));
+    SPECIALIZED_ACTIVE_GLOBAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "std")]
+#[inline(always)]
+fn specialized_cache_sub(removed: usize) {
+    if removed > 0 {
+        SPECIALIZED_ACTIVE_ENTRIES.with(|c| {
+            let cur = c.get();
+            debug_assert!(
+                cur >= removed,
+                "SPECIALIZED_ACTIVE_ENTRIES underflow: cur={cur}, removed={removed}"
+            );
+            c.set(cur.saturating_sub(removed));
+        });
+        SPECIALIZED_ACTIVE_GLOBAL.fetch_sub(removed, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Fast-path inline check for whether any specialized JIT array cache is currently active.
+/// Returns `false` via a single relaxed atomic load whenever `--jit=off` or `--backend cranelift`
+/// is running with no Dynasm specialized array caches populated.
+#[inline(always)]
+pub fn has_active_specialized_caches() -> bool {
     #[cfg(feature = "std")]
     {
-        let arr_key = arr.as_ptr() as usize;
-        SPECIALIZED_BOOL_CACHE.with(|c| {
-            c.borrow().get(&arr_key).and_then(|(vec, _, _)| {
-                if idx >= 0 && (idx as usize) < vec.len() {
-                    Some(Value::Bool(vec[idx as usize] != 0))
-                } else {
-                    None
-                }
+        SPECIALIZED_ACTIVE_GLOBAL.load(core::sync::atomic::Ordering::Relaxed) != 0
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        false
+    }
+}
+
+/// Returns the number of active entries currently tracked across the thread-local
+/// specialized bool, int, and float array caches.
+#[inline(always)]
+pub fn specialized_cache_active_entries() -> usize {
+    #[cfg(feature = "std")]
+    {
+        SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        0
+    }
+}
+
+pub fn resolve_array_key_from_ptr(arr_ptr: usize) -> SpecializedCacheKey {
+    #[cfg(feature = "std")]
+    {
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &*vm_ptr };
+            vm.get_or_register_array_id(arr_ptr)
+        } else {
+            FALLBACK_ARRAY_MAP.with(|m| {
+                let mut map = m.borrow_mut();
+                let seq = *map.entry(arr_ptr).or_insert_with(|| {
+                    NEXT_FALLBACK_SEQ.with(|c| {
+                        let id = c.get();
+                        c.set(id.saturating_add(1));
+                        ArraySequenceId(id)
+                    })
+                });
+                (VmId(0), seq)
             })
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        (VmId(0), ArraySequenceId(arr_ptr as u64))
+    }
+}
+
+#[cfg(feature = "std")]
+fn primary_array_key_from_ptr_opt(arr_ptr: usize) -> Option<SpecializedCacheKey> {
+    if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+        let vm = unsafe { &*vm_ptr };
+        vm.array_id_map
+            .borrow()
+            .get(&arr_ptr)
+            .copied()
+            .map(|seq| (vm.id, seq))
+    } else {
+        fallback_array_key_from_ptr(arr_ptr)
+    }
+}
+
+#[cfg(feature = "std")]
+fn fallback_array_key_from_ptr(arr_ptr: usize) -> Option<SpecializedCacheKey> {
+    FALLBACK_ARRAY_MAP.with(|m| {
+        m.borrow()
+            .get(&arr_ptr)
+            .copied()
+            .map(|seq| (VmId(0), seq))
+    })
+}
+
+#[cfg(feature = "std")]
+fn matching_keys_in_cache<T>(
+    cache: &HashMap<SpecializedCacheKey, (Vec<T>, bool, Weak<LustArray>)>,
+    arr_ptr: usize,
+    primary: Option<SpecializedCacheKey>,
+) -> Vec<SpecializedCacheKey> {
+    let mut keys = Vec::new();
+    if let Some(pk) = primary
+        && cache.contains_key(&pk)
+    {
+        keys.push(pk);
+    }
+    if let Some(fk) = fallback_array_key_from_ptr(arr_ptr)
+        && !keys.contains(&fk)
+        && cache.contains_key(&fk)
+    {
+        keys.push(fk);
+    }
+    for (k, (_, _, weak)) in cache.iter() {
+        if weak
+            .upgrade()
+            .is_some_and(|rc| rc.as_ptr() as usize == arr_ptr)
+            && !keys.contains(k)
+        {
+            keys.push(*k);
+        }
+    }
+    keys
+}
+
+#[cfg(feature = "std")]
+fn remove_stale_fallback_if_vm_active(arr_ptr: usize, removed_key: SpecializedCacheKey) {
+    if removed_key.0 == VmId(0) && crate::vm::current_vm_ptr().is_some() {
+        FALLBACK_ARRAY_MAP.with(|m| {
+            m.borrow_mut().remove(&arr_ptr);
+        });
+    }
+}
+
+pub trait ArrayCacheKey {
+    fn to_cache_key(&self) -> SpecializedCacheKey;
+    fn to_ptr_opt(&self) -> Option<usize> {
+        None
+    }
+}
+
+impl ArrayCacheKey for usize {
+    fn to_cache_key(&self) -> SpecializedCacheKey {
+        resolve_array_key_from_ptr(*self)
+    }
+    fn to_ptr_opt(&self) -> Option<usize> {
+        Some(*self)
+    }
+}
+
+impl ArrayCacheKey for SpecializedCacheKey {
+    fn to_cache_key(&self) -> SpecializedCacheKey {
+        *self
+    }
+}
+
+impl ArrayCacheKey for &Rc<LustArray> {
+    fn to_cache_key(&self) -> SpecializedCacheKey {
+        resolve_array_key_from_ptr(self.as_ptr() as usize)
+    }
+    fn to_ptr_opt(&self) -> Option<usize> {
+        Some(self.as_ptr() as usize)
+    }
+}
+
+#[cfg(feature = "std")]
+pub fn invalidate_specialized_array_cache<K: ArrayCacheKey>(key: K) {
+    if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+        return;
+    }
+    if let Some(arr_ptr) = key.to_ptr_opt() {
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &*vm_ptr };
+            if let Some(vm_key) = vm.unregister_array_id(arr_ptr) {
+                invalidate_specialized_array_cache_by_key(vm_key);
+            }
+        }
+        if let Some(seq0) = FALLBACK_ARRAY_MAP.with(|m| m.borrow_mut().remove(&arr_ptr)) {
+            invalidate_specialized_array_cache_by_key((VmId(0), seq0));
+        }
+        if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            return;
+        }
+        SPECIALIZED_BOOL_CACHE.with(|c| {
+            record_specialized_cache_probe();
+            let mut cache = c.borrow_mut();
+            let before = cache.len();
+            cache.retain(|_, (_, _, weak)| {
+                weak.upgrade()
+                    .is_some_and(|rc| rc.as_ptr() as usize != arr_ptr)
+            });
+            specialized_cache_sub(before - cache.len());
+        });
+        SPECIALIZED_INT_CACHE.with(|c| {
+            record_specialized_cache_probe();
+            let mut cache = c.borrow_mut();
+            let before = cache.len();
+            cache.retain(|_, (_, _, weak)| {
+                weak.upgrade()
+                    .is_some_and(|rc| rc.as_ptr() as usize != arr_ptr)
+            });
+            specialized_cache_sub(before - cache.len());
+        });
+        SPECIALIZED_FLOAT_CACHE.with(|c| {
+            record_specialized_cache_probe();
+            let mut cache = c.borrow_mut();
+            let before = cache.len();
+            cache.retain(|_, (_, _, weak)| {
+                weak.upgrade()
+                    .is_some_and(|rc| rc.as_ptr() as usize != arr_ptr)
+            });
+            specialized_cache_sub(before - cache.len());
+        });
+    } else {
+        let cache_key = key.to_cache_key();
+        invalidate_specialized_array_cache_by_key(cache_key);
+    }
+}
+
+#[cfg(feature = "std")]
+pub fn invalidate_specialized_array_cache_by_key(key: SpecializedCacheKey) {
+    if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+        return;
+    }
+    let mut removed = 0usize;
+    SPECIALIZED_BOOL_CACHE.with(|c| {
+        record_specialized_cache_probe();
+        if c.borrow_mut().remove(&key).is_some() {
+            removed += 1;
+        }
+    });
+    SPECIALIZED_INT_CACHE.with(|c| {
+        record_specialized_cache_probe();
+        if c.borrow_mut().remove(&key).is_some() {
+            removed += 1;
+        }
+    });
+    SPECIALIZED_FLOAT_CACHE.with(|c| {
+        record_specialized_cache_probe();
+        if c.borrow_mut().remove(&key).is_some() {
+            removed += 1;
+        }
+    });
+    specialized_cache_sub(removed);
+}
+
+pub fn get_specialized_cached_element(arr: &Rc<LustArray>, idx: i64) -> Option<Value> {
+    #[cfg(feature = "std")]
+    {
+        if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            return None;
+        }
+        let arr_ptr = arr.as_ptr() as usize;
+        let primary = primary_array_key_from_ptr_opt(arr_ptr);
+        SPECIALIZED_BOOL_CACHE.with(|c| {
+            record_specialized_cache_probe();
+            let cache = c.borrow();
+            let keys = matching_keys_in_cache(&cache, arr_ptr, primary);
+            for k in keys {
+                if let Some((vec, _, _)) = cache.get(&k) {
+                    if idx >= 0 && (idx as usize) < vec.len() {
+                        return Some(Value::Bool(vec[idx as usize] != 0));
+                    }
+                    return None;
+                }
+            }
+            None
         }).or_else(|| {
             SPECIALIZED_INT_CACHE.with(|c| {
-                c.borrow().get(&arr_key).and_then(|(vec, _, _)| {
-                    if idx >= 0 && (idx as usize) < vec.len() {
-                        Some(Value::Int(vec[idx as usize]))
-                    } else {
-                        None
+                record_specialized_cache_probe();
+                let cache = c.borrow();
+                let keys = matching_keys_in_cache(&cache, arr_ptr, primary);
+                for k in keys {
+                    if let Some((vec, _, _)) = cache.get(&k) {
+                        if idx >= 0 && (idx as usize) < vec.len() {
+                            return Some(Value::Int(vec[idx as usize]));
+                        }
+                        return None;
                     }
-                })
+                }
+                None
             })
         }).or_else(|| {
             SPECIALIZED_FLOAT_CACHE.with(|c| {
-                c.borrow().get(&arr_key).and_then(|(vec, _, _)| {
-                    if idx >= 0 && (idx as usize) < vec.len() {
-                        Some(Value::Float(vec[idx as usize]))
-                    } else {
-                        None
+                record_specialized_cache_probe();
+                let cache = c.borrow();
+                let keys = matching_keys_in_cache(&cache, arr_ptr, primary);
+                for k in keys {
+                    if let Some((vec, _, _)) = cache.get(&k) {
+                        if idx >= 0 && (idx as usize) < vec.len() {
+                            return Some(Value::Float(vec[idx as usize]));
+                        }
+                        return None;
                     }
-                })
+                }
+                None
             })
         })
     }
@@ -2217,19 +3630,35 @@ pub fn get_specialized_cached_element(arr: &Rc<RefCell<Vec<Value>>>, idx: i64) -
     None
 }
 
-pub fn get_specialized_cached_len(arr: &Rc<RefCell<Vec<Value>>>) -> Option<usize> {
+pub fn get_specialized_cached_len(arr: &Rc<LustArray>) -> Option<usize> {
     #[cfg(feature = "std")]
     {
-        let arr_key = arr.as_ptr() as usize;
+        if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            return None;
+        }
+        let arr_ptr = arr.as_ptr() as usize;
+        let primary = primary_array_key_from_ptr_opt(arr_ptr);
         SPECIALIZED_BOOL_CACHE.with(|c| {
-            c.borrow().get(&arr_key).map(|(vec, _, _)| vec.len())
+            record_specialized_cache_probe();
+            let cache = c.borrow();
+            matching_keys_in_cache(&cache, arr_ptr, primary)
+                .into_iter()
+                .find_map(|k| cache.get(&k).map(|(vec, _, _)| vec.len()))
         }).or_else(|| {
             SPECIALIZED_INT_CACHE.with(|c| {
-                c.borrow().get(&arr_key).map(|(vec, _, _)| vec.len())
+                record_specialized_cache_probe();
+                let cache = c.borrow();
+                matching_keys_in_cache(&cache, arr_ptr, primary)
+                    .into_iter()
+                    .find_map(|k| cache.get(&k).map(|(vec, _, _)| vec.len()))
             })
         }).or_else(|| {
             SPECIALIZED_FLOAT_CACHE.with(|c| {
-                c.borrow().get(&arr_key).map(|(vec, _, _)| vec.len())
+                record_specialized_cache_probe();
+                let cache = c.borrow();
+                matching_keys_in_cache(&cache, arr_ptr, primary)
+                    .into_iter()
+                    .find_map(|k| cache.get(&k).map(|(vec, _, _)| vec.len()))
             })
         })
     }
@@ -2238,15 +3667,24 @@ pub fn get_specialized_cached_len(arr: &Rc<RefCell<Vec<Value>>>) -> Option<usize
 }
 
 pub fn set_specialized_cached_element(
-    arr: &Rc<RefCell<Vec<Value>>>,
+    arr: &Rc<LustArray>,
     idx: i64,
     val: &Value,
 ) -> Option<Result<(), String>> {
     #[cfg(feature = "std")]
     {
-        let arr_key = arr.as_ptr() as usize;
-        let is_bool = SPECIALIZED_BOOL_CACHE.with(|c| c.borrow().contains_key(&arr_key));
-        if is_bool {
+        if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            return None;
+        }
+        let arr_ptr = arr.as_ptr() as usize;
+        let primary = primary_array_key_from_ptr_opt(arr_ptr);
+
+        let bool_key = SPECIALIZED_BOOL_CACHE.with(|c| {
+            record_specialized_cache_probe();
+            let cache = c.borrow();
+            matching_keys_in_cache(&cache, arr_ptr, primary).into_iter().next()
+        });
+        if let Some(arr_key) = bool_key {
             if let Value::Bool(b) = val {
                 return SPECIALIZED_BOOL_CACHE.with(|c| {
                     let mut cache = c.borrow_mut();
@@ -2260,6 +3698,7 @@ pub fn set_specialized_cached_element(
                         }
                         vec[idx as usize] = if *b { 1 } else { 0 };
                         *dirty = true;
+                        arr.invalidate_flat_cache();
                         Some(Ok(()))
                     } else {
                         None
@@ -2267,13 +3706,17 @@ pub fn set_specialized_cached_element(
                 });
             } else {
                 sync_specialized_array(arr);
-                invalidate_specialized_array_cache(arr_key);
+                invalidate_specialized_array_cache(arr);
                 return None;
             }
         }
 
-        let is_int = SPECIALIZED_INT_CACHE.with(|c| c.borrow().contains_key(&arr_key));
-        if is_int {
+        let int_key = SPECIALIZED_INT_CACHE.with(|c| {
+            record_specialized_cache_probe();
+            let cache = c.borrow();
+            matching_keys_in_cache(&cache, arr_ptr, primary).into_iter().next()
+        });
+        if let Some(arr_key) = int_key {
             if let Value::Int(i) = val {
                 return SPECIALIZED_INT_CACHE.with(|c| {
                     let mut cache = c.borrow_mut();
@@ -2287,6 +3730,7 @@ pub fn set_specialized_cached_element(
                         }
                         vec[idx as usize] = *i;
                         *dirty = true;
+                        arr.invalidate_flat_cache();
                         Some(Ok(()))
                     } else {
                         None
@@ -2294,13 +3738,17 @@ pub fn set_specialized_cached_element(
                 });
             } else {
                 sync_specialized_array(arr);
-                invalidate_specialized_array_cache(arr_key);
+                invalidate_specialized_array_cache(arr);
                 return None;
             }
         }
 
-        let is_float = SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow().contains_key(&arr_key));
-        if is_float {
+        let float_key = SPECIALIZED_FLOAT_CACHE.with(|c| {
+            record_specialized_cache_probe();
+            let cache = c.borrow();
+            matching_keys_in_cache(&cache, arr_ptr, primary).into_iter().next()
+        });
+        if let Some(arr_key) = float_key {
             if let Value::Float(f) = val {
                 return SPECIALIZED_FLOAT_CACHE.with(|c| {
                     let mut cache = c.borrow_mut();
@@ -2314,6 +3762,7 @@ pub fn set_specialized_cached_element(
                         }
                         vec[idx as usize] = *f;
                         *dirty = true;
+                        arr.invalidate_flat_cache();
                         Some(Ok(()))
                     } else {
                         None
@@ -2321,7 +3770,7 @@ pub fn set_specialized_cached_element(
                 });
             } else {
                 sync_specialized_array(arr);
-                invalidate_specialized_array_cache(arr_key);
+                invalidate_specialized_array_cache(arr);
                 return None;
             }
         }
@@ -2329,143 +3778,168 @@ pub fn set_specialized_cached_element(
     None
 }
 
-pub fn sync_specialized_array(arr: &Rc<RefCell<Vec<Value>>>) {
-    #[cfg(feature = "std")]
-    {
-        let arr_key = arr.as_ptr() as usize;
-        let remove_bool = SPECIALIZED_BOOL_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            if let Some((vec, dirty, _)) = cache.get_mut(&arr_key) {
-                if *dirty {
-                    let arr_mut = unsafe { &mut *arr.as_ptr() };
-                    if arr_mut.len() == vec.len() {
-                        for (val, &b) in arr_mut.iter_mut().zip(vec.iter()) {
-                            *val = Value::Bool(b != 0);
-                        }
-                    } else {
-                        *arr_mut = vec.iter().map(|&b| Value::Bool(b != 0)).collect();
+#[cfg(feature = "std")]
+fn sync_cache_for_array<T: Copy, F: Fn(T) -> Value>(
+    cache_cell: &RefCell<HashMap<SpecializedCacheKey, (Vec<T>, bool, Weak<LustArray>)>>,
+    arr: &Rc<LustArray>,
+    arr_ptr: usize,
+    primary: Option<SpecializedCacheKey>,
+    kind_label: &str,
+    to_value: F,
+) -> Result<(), String> {
+    record_specialized_cache_probe();
+    let mut cache = cache_cell.borrow_mut();
+    let keys = matching_keys_in_cache(&cache, arr_ptr, primary);
+    let mut to_remove = Vec::new();
+    for k in keys {
+        let is_non_primary = primary != Some(k);
+        let remove_entry = if let Some((vec, dirty, _)) = cache.get_mut(&k) {
+            if *dirty {
+                let mut arr_mut = arr.try_borrow_mut().map_err(|_| {
+                    format!(
+                        "Failed to acquire mutable borrow for specialized {kind_label} array sync: array is currently borrowed"
+                    )
+                })?;
+                if arr_mut.len() == vec.len() {
+                    for (val, &elem) in arr_mut.iter_mut().zip(vec.iter()) {
+                        *val = to_value(elem);
                     }
-                    *dirty = false;
-                    false
                 } else {
-                    unsafe { (*arr.as_ptr()).len() != vec.len() }
+                    *arr_mut = vec.iter().copied().map(&to_value).collect();
                 }
+                *dirty = false;
+                is_non_primary
             } else {
-                false
+                let arr_ref = arr.try_borrow().map_err(|_| {
+                    format!(
+                        "Failed to acquire borrow for specialized {kind_label} array sync: mutable borrow active"
+                    )
+                })?;
+                is_non_primary || arr_ref.len() != vec.len()
             }
-        });
-        if remove_bool {
-            SPECIALIZED_BOOL_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
-        }
-
-        let remove_int = SPECIALIZED_INT_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            if let Some((vec, dirty, _)) = cache.get_mut(&arr_key) {
-                if *dirty {
-                    let arr_mut = unsafe { &mut *arr.as_ptr() };
-                    if arr_mut.len() == vec.len() {
-                        for (val, &i) in arr_mut.iter_mut().zip(vec.iter()) {
-                            *val = Value::Int(i);
-                        }
-                    } else {
-                        *arr_mut = vec.iter().map(|&i| Value::Int(i)).collect();
-                    }
-                    *dirty = false;
-                    false
-                } else {
-                    unsafe { (*arr.as_ptr()).len() != vec.len() }
-                }
-            } else {
-                false
-            }
-        });
-        if remove_int {
-            SPECIALIZED_INT_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
-        }
-
-        let remove_float = SPECIALIZED_FLOAT_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            if let Some((vec, dirty, _)) = cache.get_mut(&arr_key) {
-                if *dirty {
-                    let arr_mut = unsafe { &mut *arr.as_ptr() };
-                    if arr_mut.len() == vec.len() {
-                        for (val, &f) in arr_mut.iter_mut().zip(vec.iter()) {
-                            *val = Value::Float(f);
-                        }
-                    } else {
-                        *arr_mut = vec.iter().map(|&f| Value::Float(f)).collect();
-                    }
-                    *dirty = false;
-                    false
-                } else {
-                    unsafe { (*arr.as_ptr()).len() != vec.len() }
-                }
-            } else {
-                false
-            }
-        });
-        if remove_float {
-            SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
+        } else {
+            false
+        };
+        if remove_entry {
+            to_remove.push(k);
         }
     }
+    let mut removed = 0usize;
+    for k in to_remove {
+        if cache.remove(&k).is_some() {
+            removed += 1;
+        }
+        remove_stale_fallback_if_vm_active(arr_ptr, k);
+    }
+    specialized_cache_sub(removed);
+    Ok(())
+}
+
+pub fn try_sync_specialized_array(arr: &Rc<LustArray>) -> Result<(), String> {
+    #[cfg(feature = "std")]
+    {
+        if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            return Ok(());
+        }
+        let arr_ptr = arr.as_ptr() as usize;
+        let primary = primary_array_key_from_ptr_opt(arr_ptr);
+
+        SPECIALIZED_BOOL_CACHE
+            .with(|c| sync_cache_for_array(c, arr, arr_ptr, primary, "bool", |b| Value::Bool(b != 0)))?;
+        SPECIALIZED_INT_CACHE
+            .with(|c| sync_cache_for_array(c, arr, arr_ptr, primary, "int", Value::Int))?;
+        SPECIALIZED_FLOAT_CACHE
+            .with(|c| sync_cache_for_array(c, arr, arr_ptr, primary, "float", Value::Float))?;
+    }
+    #[cfg(not(feature = "std"))]
+    let _ = arr;
+    Ok(())
+}
+
+pub fn sync_specialized_array(arr: &Rc<LustArray>) {
+    let _ = try_sync_specialized_array(arr);
 }
 
 pub fn sync_all_specialized_arrays() {
     #[cfg(feature = "std")]
     {
+        if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            return;
+        }
         SPECIALIZED_BOOL_CACHE.with(|c| {
+            record_specialized_cache_probe();
             let mut cache = c.borrow_mut();
-            for (&_arr_key, (vec, dirty, weak)) in cache.iter_mut() {
-                if *dirty {
-                    if let Some(rc) = weak.upgrade() {
-                        let arr_mut = unsafe { &mut *rc.as_ptr() };
-                        if arr_mut.len() == vec.len() {
-                            for (val, &b) in arr_mut.iter_mut().zip(vec.iter()) {
-                                *val = Value::Bool(b != 0);
+            let before = cache.len();
+            cache.retain(|&_arr_key, (vec, dirty, weak)| {
+                if let Some(rc) = weak.upgrade() {
+                    if *dirty {
+                        if let Ok(mut arr_mut) = rc.try_borrow_mut() {
+                            if arr_mut.len() == vec.len() {
+                                for (val, &b) in arr_mut.iter_mut().zip(vec.iter()) {
+                                    *val = Value::Bool(b != 0);
+                                }
+                            } else {
+                                *arr_mut = vec.iter().map(|&b| Value::Bool(b != 0)).collect();
                             }
-                        } else {
-                            *arr_mut = vec.iter().map(|&b| Value::Bool(b != 0)).collect();
+                            *dirty = false;
                         }
-                        *dirty = false;
                     }
+                    true
+                } else {
+                    false
                 }
-            }
+            });
+            specialized_cache_sub(before - cache.len());
         });
         SPECIALIZED_INT_CACHE.with(|c| {
+            record_specialized_cache_probe();
             let mut cache = c.borrow_mut();
-            for (&_arr_key, (vec, dirty, weak)) in cache.iter_mut() {
-                if *dirty {
-                    if let Some(rc) = weak.upgrade() {
-                        let arr_mut = unsafe { &mut *rc.as_ptr() };
-                        if arr_mut.len() == vec.len() {
-                            for (val, &i) in arr_mut.iter_mut().zip(vec.iter()) {
-                                *val = Value::Int(i);
+            let before = cache.len();
+            cache.retain(|&_arr_key, (vec, dirty, weak)| {
+                if let Some(rc) = weak.upgrade() {
+                    if *dirty {
+                        if let Ok(mut arr_mut) = rc.try_borrow_mut() {
+                            if arr_mut.len() == vec.len() {
+                                for (val, &i) in arr_mut.iter_mut().zip(vec.iter()) {
+                                    *val = Value::Int(i);
+                                }
+                            } else {
+                                *arr_mut = vec.iter().map(|&i| Value::Int(i)).collect();
                             }
-                        } else {
-                            *arr_mut = vec.iter().map(|&i| Value::Int(i)).collect();
+                            *dirty = false;
                         }
-                        *dirty = false;
                     }
+                    true
+                } else {
+                    false
                 }
-            }
+            });
+            specialized_cache_sub(before - cache.len());
         });
         SPECIALIZED_FLOAT_CACHE.with(|c| {
+            record_specialized_cache_probe();
             let mut cache = c.borrow_mut();
-            for (&_arr_key, (vec, dirty, weak)) in cache.iter_mut() {
-                if *dirty {
-                    if let Some(rc) = weak.upgrade() {
-                        let arr_mut = unsafe { &mut *rc.as_ptr() };
-                        if arr_mut.len() == vec.len() {
-                            for (val, &f) in arr_mut.iter_mut().zip(vec.iter()) {
-                                *val = Value::Float(f);
+            let before = cache.len();
+            cache.retain(|&_arr_key, (vec, dirty, weak)| {
+                if let Some(rc) = weak.upgrade() {
+                    if *dirty {
+                        if let Ok(mut arr_mut) = rc.try_borrow_mut() {
+                            if arr_mut.len() == vec.len() {
+                                for (val, &f) in arr_mut.iter_mut().zip(vec.iter()) {
+                                    *val = Value::Float(f);
+                                }
+                            } else {
+                                *arr_mut = vec.iter().map(|&f| Value::Float(f)).collect();
                             }
-                        } else {
-                            *arr_mut = vec.iter().map(|&f| Value::Float(f)).collect();
+                            *dirty = false;
                         }
-                        *dirty = false;
                     }
+                    true
+                } else {
+                    false
                 }
-            }
+            });
+            specialized_cache_sub(before - cache.len());
         });
     }
 }
@@ -2490,12 +3964,35 @@ pub unsafe extern "C" fn jit_unbox_array_int(
         let Value::Array(arr_rc) = &*array_value_ptr else {
             return 0;
         };
-        let arr_key = arr_rc.as_ptr() as usize;
-        let cached = SPECIALIZED_INT_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
+        let arr_ptr = arr_rc.as_ptr() as usize;
+        let arr_key = resolve_array_key_from_ptr(arr_ptr);
+        let cached = if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            None
+        } else {
+            SPECIALIZED_INT_CACHE.with(|c| {
+                let mut cache = c.borrow_mut();
+                let keys = matching_keys_in_cache(&cache, arr_ptr, Some(arr_key));
+                let mut found = None;
+                let mut removed = 0usize;
+                for k in keys {
+                    if let Some(entry) = cache.remove(&k) {
+                        removed += 1;
+                        remove_stale_fallback_if_vm_active(arr_ptr, k);
+                        if found.is_none() {
+                            found = Some(entry);
+                        }
+                    }
+                }
+                specialized_cache_sub(removed);
+                found
+            })
+        };
         let mut specialized_vec = if let Some((vec, _dirty, _weak)) = cached {
             vec
         } else {
-            let vec_ref = &*arr_rc.as_ptr();
+            let Ok(vec_ref) = arr_rc.try_borrow() else {
+                return 0;
+            };
             if vec_ref.iter().any(|value| !matches!(value, Value::Int(_))) {
                 return 0;
             }
@@ -2534,12 +4031,35 @@ pub unsafe extern "C" fn jit_unbox_array_bool(
         let Value::Array(arr_rc) = &*array_value_ptr else {
             return 0;
         };
-        let arr_key = arr_rc.as_ptr() as usize;
-        let cached = SPECIALIZED_BOOL_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
+        let arr_ptr = arr_rc.as_ptr() as usize;
+        let arr_key = resolve_array_key_from_ptr(arr_ptr);
+        let cached = if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            None
+        } else {
+            SPECIALIZED_BOOL_CACHE.with(|c| {
+                let mut cache = c.borrow_mut();
+                let keys = matching_keys_in_cache(&cache, arr_ptr, Some(arr_key));
+                let mut found = None;
+                let mut removed = 0usize;
+                for k in keys {
+                    if let Some(entry) = cache.remove(&k) {
+                        removed += 1;
+                        remove_stale_fallback_if_vm_active(arr_ptr, k);
+                        if found.is_none() {
+                            found = Some(entry);
+                        }
+                    }
+                }
+                specialized_cache_sub(removed);
+                found
+            })
+        };
         let mut specialized_vec = if let Some((vec, _dirty, _weak)) = cached {
             vec
         } else {
-            let vec_ref = &*arr_rc.as_ptr();
+            let Ok(vec_ref) = arr_rc.try_borrow() else {
+                return 0;
+            };
             if vec_ref.iter().any(|value| !matches!(value, Value::Bool(_))) {
                 return 0;
             }
@@ -2578,12 +4098,35 @@ pub unsafe extern "C" fn jit_unbox_array_float(
         let Value::Array(arr_rc) = &*array_value_ptr else {
             return 0;
         };
-        let arr_key = arr_rc.as_ptr() as usize;
-        let cached = SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
+        let arr_ptr = arr_rc.as_ptr() as usize;
+        let arr_key = resolve_array_key_from_ptr(arr_ptr);
+        let cached = if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            None
+        } else {
+            SPECIALIZED_FLOAT_CACHE.with(|c| {
+                let mut cache = c.borrow_mut();
+                let keys = matching_keys_in_cache(&cache, arr_ptr, Some(arr_key));
+                let mut found = None;
+                let mut removed = 0usize;
+                for k in keys {
+                    if let Some(entry) = cache.remove(&k) {
+                        removed += 1;
+                        remove_stale_fallback_if_vm_active(arr_ptr, k);
+                        if found.is_none() {
+                            found = Some(entry);
+                        }
+                    }
+                }
+                specialized_cache_sub(removed);
+                found
+            })
+        };
         let mut specialized_vec = if let Some((vec, _dirty, _weak)) = cached {
             vec
         } else {
-            let vec_ref = &*arr_rc.as_ptr();
+            let Ok(vec_ref) = arr_rc.try_borrow() else {
+                return 0;
+            };
             if vec_ref.iter().any(|value| !matches!(value, Value::Float(_))) {
                 return 0;
             }
@@ -2615,10 +4158,25 @@ pub unsafe extern "C" fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8 {
         let (vec, array) = (*slot).take_int();
         match (vec, array) {
             (Some(vec), Some(array)) => {
-                let arr_key = array.as_ptr() as usize;
+                array.invalidate_flat_cache();
+                let arr_ptr = array.as_ptr() as usize;
+                let arr_key = resolve_array_key_from_ptr(arr_ptr);
                 let weak = Rc::downgrade(&array);
                 SPECIALIZED_INT_CACHE.with(|c| {
-                    c.borrow_mut().insert(arr_key, (vec, true, weak));
+                    let mut cache = c.borrow_mut();
+                    let mut removed = 0usize;
+                    for k in matching_keys_in_cache(&cache, arr_ptr, Some(arr_key)) {
+                        if k != arr_key {
+                            if cache.remove(&k).is_some() {
+                                removed += 1;
+                            }
+                            remove_stale_fallback_if_vm_active(arr_ptr, k);
+                        }
+                    }
+                    specialized_cache_sub(removed);
+                    if cache.insert(arr_key, (vec, true, weak)).is_none() {
+                        specialized_cache_inc();
+                    }
                 });
                 1
             }
@@ -2639,10 +4197,25 @@ pub unsafe extern "C" fn jit_rebox_array_bool(slot: *mut JitVecSlot) -> u8 {
         let (vec, array) = (*slot).take_bool();
         match (vec, array) {
             (Some(vec), Some(array)) => {
-                let arr_key = array.as_ptr() as usize;
+                array.invalidate_flat_cache();
+                let arr_ptr = array.as_ptr() as usize;
+                let arr_key = resolve_array_key_from_ptr(arr_ptr);
                 let weak = Rc::downgrade(&array);
                 SPECIALIZED_BOOL_CACHE.with(|c| {
-                    c.borrow_mut().insert(arr_key, (vec, true, weak));
+                    let mut cache = c.borrow_mut();
+                    let mut removed = 0usize;
+                    for k in matching_keys_in_cache(&cache, arr_ptr, Some(arr_key)) {
+                        if k != arr_key {
+                            if cache.remove(&k).is_some() {
+                                removed += 1;
+                            }
+                            remove_stale_fallback_if_vm_active(arr_ptr, k);
+                        }
+                    }
+                    specialized_cache_sub(removed);
+                    if cache.insert(arr_key, (vec, true, weak)).is_none() {
+                        specialized_cache_inc();
+                    }
                 });
                 1
             }
@@ -2663,10 +4236,25 @@ pub unsafe extern "C" fn jit_rebox_array_float(slot: *mut JitVecSlot) -> u8 {
         let (vec, array) = (*slot).take_float();
         match (vec, array) {
             (Some(vec), Some(array)) => {
-                let arr_key = array.as_ptr() as usize;
+                array.invalidate_flat_cache();
+                let arr_ptr = array.as_ptr() as usize;
+                let arr_key = resolve_array_key_from_ptr(arr_ptr);
                 let weak = Rc::downgrade(&array);
                 SPECIALIZED_FLOAT_CACHE.with(|c| {
-                    c.borrow_mut().insert(arr_key, (vec, true, weak));
+                    let mut cache = c.borrow_mut();
+                    let mut removed = 0usize;
+                    for k in matching_keys_in_cache(&cache, arr_ptr, Some(arr_key)) {
+                        if k != arr_key {
+                            if cache.remove(&k).is_some() {
+                                removed += 1;
+                            }
+                            remove_stale_fallback_if_vm_active(arr_ptr, k);
+                        }
+                    }
+                    specialized_cache_sub(removed);
+                    if cache.insert(arr_key, (vec, true, weak)).is_none() {
+                        specialized_cache_inc();
+                    }
                 });
                 1
             }
@@ -2789,7 +4377,7 @@ pub unsafe extern "C" fn jit_drop_vec_int(slot: *mut JitVecSlot) {
         if !slot.is_null() {
             let (vec, array) = (*slot).take_int();
             if let Some(arr) = array {
-                SPECIALIZED_INT_CACHE.with(|c| c.borrow_mut().remove(&(arr.as_ptr() as usize)));
+                invalidate_specialized_array_cache(&arr);
             }
             drop(vec);
         }
@@ -2804,7 +4392,7 @@ pub unsafe extern "C" fn jit_drop_vec_bool(slot: *mut JitVecSlot) {
         if !slot.is_null() {
             let (vec, array) = (*slot).take_bool();
             if let Some(arr) = array {
-                SPECIALIZED_BOOL_CACHE.with(|c| c.borrow_mut().remove(&(arr.as_ptr() as usize)));
+                invalidate_specialized_array_cache(&arr);
             }
             drop(vec);
         }
@@ -2819,7 +4407,7 @@ pub unsafe extern "C" fn jit_drop_vec_float(slot: *mut JitVecSlot) {
         if !slot.is_null() {
             let (vec, array) = (*slot).take_float();
             if let Some(arr) = array {
-                SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow_mut().remove(&(arr.as_ptr() as usize)));
+                invalidate_specialized_array_cache(&arr);
             }
             drop(vec);
         }
@@ -3237,9 +4825,9 @@ pub unsafe extern "C" fn jit_call_native_safe(
             frame.ip = ip + 1;
         }
         let _native_guard = (&mut *vm_ptr).enter_native_scope();
-        push_vm_ptr(vm_ptr);
+        let _vm_guard = crate::vm::CurrentVmGuard::new(vm_ptr);
         let outcome = native_fn(&args);
-        pop_vm_ptr();
+        drop(_vm_guard);
         drop(_native_guard);
 
         let outcome = match outcome {
@@ -3267,10 +4855,11 @@ pub unsafe extern "C" fn jit_call_native_safe(
                 }
 
                 let dest_reg = vm.call_stack.last().and_then(|frame| {
-                    let base = frame.registers.as_ptr() as usize;
+                    let regs = &vm.vm_registers[frame.base_reg..frame.base_reg + frame.reg_count as usize];
+                    let base = regs.as_ptr() as usize;
                     let out_ptr = out as usize;
                     let value_size = core::mem::size_of::<Value>();
-                    let end = base + value_size * frame.registers.len();
+                    let end = base + value_size * regs.len();
                     if out_ptr < base || out_ptr >= end {
                         return None;
                     }
@@ -3299,6 +4888,58 @@ pub unsafe extern "C" fn jit_call_native_safe(
                     value,
                 });
                 2
+            }
+
+            NativeCallResult::YieldTimer(duration, value) => {
+                let vm = &mut *vm_ptr;
+                if vm.clock.is_simulated() && vm.current_task.is_some() {
+                    let dest_reg = vm.call_stack.last().and_then(|frame| {
+                        let regs = &vm.vm_registers[frame.base_reg..frame.base_reg + frame.reg_count as usize];
+                        let base = regs.as_ptr() as usize;
+                        let out_ptr = out as usize;
+                        let value_size = core::mem::size_of::<Value>();
+                        let end = base + value_size * regs.len();
+                        if out_ptr < base || out_ptr >= end {
+                            return None;
+                        }
+                        let offset = out_ptr - base;
+                        if !offset.is_multiple_of(value_size) {
+                            return None;
+                        }
+                        let reg = offset / value_size;
+                        if reg > u8::MAX as usize {
+                            return None;
+                        }
+                        Some(reg as u8)
+                    });
+                    let Some(dest_reg) = dest_reg else {
+                        jit::log(|| {
+                            "jit_call_native_safe: could not compute dest register for yield timer"
+                                .to_string()
+                        });
+                        return 0;
+                    };
+
+                    let duration_nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+                    let now = vm.clock.now_nanos();
+                    let deadline = now.saturating_add(duration_nanos);
+                    let timer_id = vm.clock.schedule_timer(deadline, 0, move || {});
+
+                    replace_value(out, Value::Nil);
+                    vm.observe_value_graph(&value);
+                    vm.pending_task_signal = Some(crate::vm::TaskSignal::YieldTimer {
+                        dest: dest_reg,
+                        value,
+                        timer_id,
+                    });
+                    2
+                } else {
+                    #[cfg(feature = "std")]
+                    std::thread::sleep(duration);
+                    vm.observe_value_graph(&value);
+                    replace_value(out, value);
+                    1
+                }
             }
 
             NativeCallResult::Stop(value) => {
@@ -3361,7 +5002,7 @@ pub unsafe extern "C" fn jit_call_function_safe(
         {
             frame.ip = ip + 1;
         }
-        push_vm_ptr(vm_ptr);
+        let _vm_guard = crate::vm::CurrentVmGuard::new(vm_ptr);
 
         // The callee runs with the JIT on: its loops get their own traces
         // and its body its own compiled code. Nothing in the trace that
@@ -3369,7 +5010,7 @@ pub unsafe extern "C" fn jit_call_function_safe(
         // its own code alive and has written every register back.
         let call_result = vm.call_value(&callee, args);
 
-        pop_vm_ptr();
+        drop(_vm_guard);
 
         match call_result {
             Ok(value) => {
@@ -3381,8 +5022,13 @@ pub unsafe extern "C" fn jit_call_function_safe(
                 // Get current registers pointer AFTER the call (it may have reallocated)
                 let vm = &mut *vm_ptr;
                 if let Some(frame) = vm.call_stack.last_mut() {
-                    if (dest_reg as usize) < frame.registers.len() {
-                        frame.registers[dest_reg as usize] = value;
+                    let reg = dest_reg as usize;
+                    if reg < frame.reg_count as usize {
+                        if !value.is_plain() {
+                            frame.mark_non_plain(reg);
+                        }
+                        let slot = frame.base_reg + reg;
+                        vm.vm_registers[slot] = value;
                         1
                     } else {
                         jit::log(|| {
@@ -3417,8 +5063,12 @@ pub unsafe extern "C" fn jit_current_registers(vm_ptr: *mut VM) -> *mut Value {
 
         let vm = &mut *vm_ptr;
         vm.call_stack
-            .last_mut()
-            .map(|frame| frame.registers.as_mut_ptr())
+            .last()
+            .map(|frame| {
+                let start = frame.base_reg;
+                let end = start + frame.reg_count as usize;
+                vm.vm_registers[start..end].as_mut_ptr()
+            })
             .unwrap_or(core::ptr::null_mut())
     }
 }
@@ -3729,9 +5379,9 @@ pub unsafe extern "C" fn jit_call_method_safe(
         }
 
         let _native_guard = (&mut *vm_ptr).enter_native_scope();
-        crate::vm::push_vm_ptr(vm_ptr);
+        let _vm_guard = crate::vm::CurrentVmGuard::new(vm_ptr);
         let outcome = call_builtin_method_simple(&object, method_name, args);
-        crate::vm::pop_vm_ptr();
+        drop(_vm_guard);
         drop(_native_guard);
         match outcome {
             Ok(val) => {
@@ -3741,8 +5391,13 @@ pub unsafe extern "C" fn jit_call_method_safe(
                 }
                 let vm = &mut *vm_ptr;
                 if let Some(frame) = vm.call_stack.last_mut() {
-                    if (dest_reg as usize) < frame.registers.len() {
-                        frame.registers[dest_reg as usize] = val;
+                    let reg = dest_reg as usize;
+                    if reg < frame.reg_count as usize {
+                        if !val.is_plain() {
+                            frame.mark_non_plain(reg);
+                        }
+                        let slot = frame.base_reg + reg;
+                        vm.vm_registers[slot] = val;
                         1
                     } else {
                         jit::log(|| {
@@ -4429,7 +6084,7 @@ mod jit_replacement_tests {
         assert_eq!(Rc::strong_count(&string), 1);
         assert!(matches!(value, Value::Int(42)));
 
-        let array = Rc::new(RefCell::new(vec![Value::Int(1)]));
+        let array = Rc::new(LustArray::new(vec![Value::Int(1)]));
         value = Value::Array(array.clone());
         assert_eq!(Rc::strong_count(&array), 2);
         unsafe {
@@ -4523,5 +6178,158 @@ mod jit_replacement_tests {
         assert_eq!(Rc::strong_count(rc), 2);
         unsafe { jit_drop_vec_int(&mut slot) };
         assert_eq!(Rc::strong_count(rc), 1);
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+
+    fn empty_slot() -> JitVecSlot {
+        JitVecSlot {
+            ptr: core::ptr::null_mut(),
+            len: 0,
+            cap: 0,
+            array: core::ptr::null(),
+        }
+    }
+
+    fn reset_probes() {
+        SPECIALIZED_CACHE_HASHMAP_PROBES.with(|c| c.set(0));
+    }
+
+    fn probe_count() -> usize {
+        SPECIALIZED_CACHE_HASHMAP_PROBES.with(|c| c.get())
+    }
+
+    fn actual_cache_len() -> usize {
+        SPECIALIZED_BOOL_CACHE.with(|c| c.borrow().len())
+            + SPECIALIZED_INT_CACHE.with(|c| c.borrow().len())
+            + SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow().len())
+    }
+
+    #[test]
+    fn test_perf_t1_6_specialized_cache_empty_fast_path() {
+        // Ensure clean starting state on this test thread.
+        sync_all_specialized_arrays();
+        assert_eq!(specialized_cache_active_entries(), 0);
+        assert_eq!(actual_cache_len(), 0);
+
+        let arr_int = Rc::new(LustArray::new(vec![Value::Int(10), Value::Int(20)]));
+        let arr_bool = Rc::new(LustArray::new(vec![Value::Bool(true), Value::Bool(false)]));
+        let arr_float = Rc::new(LustArray::new(vec![Value::Float(1.5), Value::Float(2.5)]));
+
+        // 1. Empty fast-path: all 6 functions (plus by_key) must trigger 0 HashMap probes.
+        reset_probes();
+        assert_eq!(get_specialized_cached_element(&arr_int, 0), None);
+        assert_eq!(get_specialized_cached_len(&arr_int), None);
+        assert!(set_specialized_cached_element(&arr_int, 0, &Value::Int(99)).is_none());
+        invalidate_specialized_array_cache(&arr_int);
+        invalidate_specialized_array_cache(arr_int.as_ptr() as usize);
+        invalidate_specialized_array_cache_by_key((VmId(0), ArraySequenceId(999)));
+        assert_eq!(try_sync_specialized_array(&arr_int), Ok(()));
+        sync_all_specialized_arrays();
+        assert_eq!(
+            probe_count(),
+            0,
+            "All 6 specialized cache entrypoints must skip HashMap probes when cache is empty"
+        );
+        assert_eq!(specialized_cache_active_entries(), 0);
+        assert_eq!(actual_cache_len(), 0);
+
+        // 2. Populate bool, int, and float caches via jit_unbox + jit_rebox.
+        let val_int = Value::Array(Rc::clone(&arr_int));
+        let val_bool = Value::Array(Rc::clone(&arr_bool));
+        let val_float = Value::Array(Rc::clone(&arr_float));
+
+        let mut slot = empty_slot();
+        unsafe {
+            assert_eq!(jit_unbox_array_int(&val_int, &mut slot), 1);
+            *slot.ptr = 111;
+            assert_eq!(jit_rebox_array_int(&mut slot), 1);
+        }
+        assert_eq!(specialized_cache_active_entries(), 1);
+        assert_eq!(actual_cache_len(), 1);
+
+        unsafe {
+            assert_eq!(jit_unbox_array_bool(&val_bool, &mut slot), 1);
+            *(slot.ptr as *mut u8) = 0;
+            assert_eq!(jit_rebox_array_bool(&mut slot), 1);
+        }
+        assert_eq!(specialized_cache_active_entries(), 2);
+        assert_eq!(actual_cache_len(), 2);
+
+        unsafe {
+            assert_eq!(jit_unbox_array_float(&val_float, &mut slot), 1);
+            *(slot.ptr as *mut LustFloat) = 9.25;
+            assert_eq!(jit_rebox_array_float(&mut slot), 1);
+        }
+        assert_eq!(specialized_cache_active_entries(), 3);
+        assert_eq!(actual_cache_len(), 3);
+
+        // 3. Reads, writes, and syncs work identically when active > 0.
+        assert_eq!(get_specialized_cached_len(&arr_int), Some(2));
+        assert_eq!(get_specialized_cached_element(&arr_int, 0), Some(Value::Int(111)));
+        assert_eq!(get_specialized_cached_len(&arr_bool), Some(2));
+        assert_eq!(get_specialized_cached_element(&arr_bool, 0), Some(Value::Bool(false)));
+        assert_eq!(get_specialized_cached_len(&arr_float), Some(2));
+        assert_eq!(get_specialized_cached_element(&arr_float, 0), Some(Value::Float(9.25)));
+
+        assert_eq!(
+            set_specialized_cached_element(&arr_int, 1, &Value::Int(222)),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            set_specialized_cached_element(&arr_bool, 1, &Value::Bool(true)),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            set_specialized_cached_element(&arr_float, 1, &Value::Float(4.5)),
+            Some(Ok(()))
+        );
+        assert_eq!(specialized_cache_active_entries(), 3);
+        assert_eq!(actual_cache_len(), 3);
+
+        // Sync writes dirty values back to underlying Vec<Value>.
+        assert_eq!(try_sync_specialized_array(&arr_int), Ok(()));
+        assert_eq!(arr_int.borrow()[0], Value::Int(111));
+        assert_eq!(arr_int.borrow()[1], Value::Int(222));
+
+        sync_all_specialized_arrays();
+        assert_eq!(arr_bool.borrow()[0], Value::Bool(false));
+        assert_eq!(arr_bool.borrow()[1], Value::Bool(true));
+        assert_eq!(arr_float.borrow()[0], Value::Float(9.25));
+        assert_eq!(arr_float.borrow()[1], Value::Float(4.5));
+        assert_eq!(specialized_cache_active_entries(), 3);
+        assert_eq!(actual_cache_len(), 3);
+
+        // 4. Invalidation decrements active count accurately back to 0.
+        invalidate_specialized_array_cache(&arr_int);
+        assert_eq!(specialized_cache_active_entries(), 2);
+        assert_eq!(actual_cache_len(), 2);
+
+        // Mismatched type write syncs & invalidates bool entry.
+        assert!(set_specialized_cached_element(&arr_bool, 0, &Value::Int(7)).is_none());
+        assert_eq!(specialized_cache_active_entries(), 1);
+        assert_eq!(actual_cache_len(), 1);
+
+        // Invalidate remaining float entry by raw pointer usize.
+        invalidate_specialized_array_cache(arr_float.as_ptr() as usize);
+        assert_eq!(specialized_cache_active_entries(), 0);
+        assert_eq!(actual_cache_len(), 0);
+
+        // 5. After returning to 0, all 6 functions again trigger 0 HashMap probes.
+        reset_probes();
+        assert_eq!(get_specialized_cached_element(&arr_int, 0), None);
+        assert_eq!(get_specialized_cached_len(&arr_bool), None);
+        assert!(set_specialized_cached_element(&arr_float, 0, &Value::Float(1.0)).is_none());
+        invalidate_specialized_array_cache(&arr_int);
+        assert_eq!(try_sync_specialized_array(&arr_bool), Ok(()));
+        sync_all_specialized_arrays();
+        assert_eq!(
+            probe_count(),
+            0,
+            "Fast path must re-engage with 0 HashMap probes after active count returns to 0"
+        );
     }
 }

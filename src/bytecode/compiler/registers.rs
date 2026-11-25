@@ -40,6 +40,9 @@ impl Compiler {
             }
             panic!("Register overflow (max 255 registers per function)");
         }
+        self.functions[self.current_function]
+            .register_types
+            .remove(&reg);
         reg
     }
 
@@ -57,6 +60,7 @@ impl Compiler {
         let depth = self.scopes.last().map(|s| s.depth + 1).unwrap_or(0);
         self.scopes.push(Scope {
             locals: HashMap::new(),
+            upvalues: HashMap::new(),
             effect_thunks: HashMap::new(),
             depth,
             cleanups: Vec::new(),
@@ -72,6 +76,7 @@ impl Compiler {
         }
         self.scopes.push(Scope {
             locals,
+            upvalues: HashMap::new(),
             effect_thunks: HashMap::new(),
             depth,
             cleanups: Vec::new(),
@@ -92,14 +97,23 @@ impl Compiler {
     }
 
     pub(super) fn end_scope(&mut self) -> Result<()> {
-        if let Some(scope) = self.scopes.pop() {
-            for cleanup in scope.cleanups.into_iter().rev() {
+        let cleanups_res = if let Some(scope) = self.scopes.last() {
+            let cleanups = scope.cleanups.clone();
+            let mut res = Ok(());
+            for cleanup in cleanups.into_iter().rev() {
                 if cleanup.kind == CleanupKind::Defer {
-                    self.compile_stmt(&cleanup.stmt)?;
+                    if let Err(e) = self.compile_stmt(&cleanup.stmt) {
+                        res = Err(e);
+                        break;
+                    }
                 }
             }
-        }
-        Ok(())
+            res
+        } else {
+            Ok(())
+        };
+        self.scopes.pop();
+        cleanups_res
     }
 
     pub(super) fn emit_all_defers(&mut self) -> Result<()> {
@@ -115,6 +129,70 @@ impl Compiler {
             self.compile_stmt(&stmt)?;
         }
         Ok(())
+    }
+
+    pub(super) fn emit_defers_for_return(&mut self, ret_reg: Register, is_static_err: bool) -> Result<()> {
+        let mut cleanups = Vec::new();
+        for scope in self.scopes.iter().rev() {
+            for cleanup in scope.cleanups.iter().rev() {
+                cleanups.push(cleanup.clone());
+            }
+        }
+
+        if is_static_err {
+            for cleanup in cleanups {
+                self.compile_stmt(&cleanup.stmt)?;
+            }
+            return Ok(());
+        }
+
+        let has_errdefer = cleanups.iter().any(|c| c.kind == CleanupKind::ErrDefer);
+        if !has_errdefer || ret_reg == 255 {
+            for cleanup in cleanups {
+                if cleanup.kind == CleanupKind::Defer {
+                    self.compile_stmt(&cleanup.stmt)?;
+                }
+            }
+            return Ok(());
+        }
+
+        let is_err_reg = self.next_local_slot();
+        if let Some(scope) = self.scopes.first_mut() {
+            scope.locals.insert(format!("(is_err_{})", is_err_reg), (is_err_reg, false));
+        }
+        let enum_name_idx = self.add_string_constant("Result");
+        let variant_idx = self.add_string_constant("Err");
+        self.emit(
+            Instruction::IsEnumVariant(is_err_reg, ret_reg, enum_name_idx, variant_idx),
+            0,
+        );
+
+        for cleanup in cleanups {
+            match cleanup.kind {
+                CleanupKind::Defer => {
+                    self.compile_stmt(&cleanup.stmt)?;
+                }
+                CleanupKind::ErrDefer => {
+                    let jump_skip = self.emit(Instruction::JumpIfNot(is_err_reg, 0), 0);
+                    self.compile_stmt(&cleanup.stmt)?;
+                    let end_pos = self.current_chunk().instructions.len();
+                    self.current_chunk_mut().patch_jump(jump_skip, end_pos);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn lookup_upvalue(&self, name: &str) -> Option<u8> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(&idx) = scope.upvalues.get(name) {
+                return Some(idx);
+            }
+            if scope.is_thunk_boundary {
+                break;
+            }
+        }
+        None
     }
 
     pub(super) fn resolve_local(&self, name: &str) -> Result<Register> {
@@ -214,6 +292,12 @@ impl Compiler {
             .insert(reg, type_kind);
     }
 
+    pub(super) fn get_register_type(&self, reg: Register) -> Option<&crate::ast::TypeKind> {
+        self.functions
+            .get(self.current_function)
+            .and_then(|f| f.register_types.get(&reg))
+    }
+
     pub(super) fn move_result(&mut self, dest: Register, src: Register, expression_start: usize) {
         if dest == src {
             return;
@@ -227,28 +311,68 @@ impl Compiler {
                 Instruction::Jump(_)
                     | Instruction::JumpIf(..)
                     | Instruction::JumpIfNot(..)
+                    | Instruction::BranchLtInt(..)
+                    | Instruction::BranchLeInt(..)
                     | Instruction::Return(_)
             )
         });
         if straight_line
             && i32::from(src) > self.max_local_register_index()
-            && let Some((instruction, ty, _, _)) = expression
-                .last()
-                .and_then(|instruction| instruction.numeric_specialization())
-            && instruction.defined_register() == Some(src)
+            && let Some(&last_instr) = expression.last()
+            && last_instr.defined_register() == Some(src)
         {
-            let replacement = match instruction {
-                Instruction::Add(_, l, r) => Some(Instruction::Add(dest, l, r)),
-                Instruction::Sub(_, l, r) => Some(Instruction::Sub(dest, l, r)),
-                Instruction::Mul(_, l, r) => Some(Instruction::Mul(dest, l, r)),
-                Instruction::Div(_, l, r) => Some(Instruction::Div(dest, l, r)),
-                Instruction::Mod(_, l, r) => Some(Instruction::Mod(dest, l, r)),
-                Instruction::Neg(_, s) => Some(Instruction::Neg(dest, s)),
-                _ => None,
+            let replacement = if let Some((instruction, ty, _, _)) = last_instr.numeric_specialization() {
+                match instruction {
+                    Instruction::Add(_, l, r) => Some(Instruction::Add(dest, l, r)),
+                    Instruction::Sub(_, l, r) => Some(Instruction::Sub(dest, l, r)),
+                    Instruction::Mul(_, l, r) => Some(Instruction::Mul(dest, l, r)),
+                    Instruction::Div(_, l, r) => Some(Instruction::Div(dest, l, r)),
+                    Instruction::Mod(_, l, r) => Some(Instruction::Mod(dest, l, r)),
+                    Instruction::Neg(_, s) => Some(Instruction::Neg(dest, s)),
+                    _ => None,
+                }
+                .map(|r| r.specialize_numeric(ty))
+            } else {
+                match last_instr {
+                    Instruction::LoadConst(_, c) => Some(Instruction::LoadConst(dest, c)),
+                    Instruction::LoadBool(_, b) => Some(Instruction::LoadBool(dest, b)),
+                    Instruction::LoadNil(_) => Some(Instruction::LoadNil(dest)),
+                    Instruction::GetField(_, obj, f) => Some(Instruction::GetField(dest, obj, f)),
+                    Instruction::GetFieldSlot(_, obj, slot) => {
+                        Some(Instruction::GetFieldSlot(dest, obj, slot))
+                    }
+                    Instruction::GetIndex(_, obj, idx) => Some(Instruction::GetIndex(dest, obj, idx)),
+                    Instruction::ArrayGetUnwrap(_, obj, idx) => {
+                        Some(Instruction::ArrayGetUnwrap(dest, obj, idx))
+                    }
+                    Instruction::MapGet(_, map, key) => Some(Instruction::MapGet(dest, map, key)),
+                    Instruction::MapGetUnwrap(_, map, key) => {
+                        Some(Instruction::MapGetUnwrap(dest, map, key))
+                    }
+                    Instruction::ArrayLen(_, obj) => Some(Instruction::ArrayLen(dest, obj)),
+                    Instruction::Call(f, args, argc, _) => Some(Instruction::Call(f, args, argc, dest)),
+                    Instruction::CallMethod(obj, m, args, argc, _) => {
+                        Some(Instruction::CallMethod(obj, m, args, argc, dest))
+                    }
+                    Instruction::FloorDiv(_, l, r) => Some(Instruction::FloorDiv(dest, l, r)),
+                    Instruction::FloorDivInt(_, l, r) => Some(Instruction::FloorDivInt(dest, l, r)),
+                    Instruction::FloorDivFloat(_, l, r) => {
+                        Some(Instruction::FloorDivFloat(dest, l, r))
+                    }
+                    Instruction::Pow(_, l, r) => Some(Instruction::Pow(dest, l, r)),
+                    Instruction::PowInt(_, l, r) => Some(Instruction::PowInt(dest, l, r)),
+                    Instruction::PowFloat(_, l, r) => Some(Instruction::PowFloat(dest, l, r)),
+                    Instruction::Concat(_, l, r) => Some(Instruction::Concat(dest, l, r)),
+                    Instruction::AddIntImm(_, src, imm) => {
+                        Some(Instruction::AddIntImm(dest, src, imm))
+                    }
+                    _ => None,
+                }
             };
             if let Some(replacement) = replacement {
-                *self.current_chunk_mut().instructions.last_mut().unwrap() =
-                    replacement.specialize_numeric(ty);
+                let chunk = self.current_chunk_mut();
+                let last_idx = chunk.instructions.len() - 1;
+                chunk.set_instruction(last_idx, replacement);
                 return;
             }
         }

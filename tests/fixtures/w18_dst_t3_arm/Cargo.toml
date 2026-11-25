@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "w18_dst_t3_arm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lust-aot-rt = { path = "../../../crates/lust-aot-rt", default-features = false }
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

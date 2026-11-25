@@ -911,6 +911,9 @@ pub mod c_engine {
                     MirBinaryOp::GtEq => format!("({l} >= {r})"),
                     MirBinaryOp::And => format!("({l} && {r})"),
                     MirBinaryOp::Or => format!("({l} || {r})"),
+                    MirBinaryOp::Concat => {
+                        return Err(MirCBackendError::UnsupportedBinaryOp(MirBinaryOp::Concat));
+                    }
                 };
                 Ok(s)
             }

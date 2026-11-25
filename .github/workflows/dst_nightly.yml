@@ -1,0 +1,67 @@
+name: DST Nightly Scaled Campaign (100k Seeds)
+
+on:
+  schedule:
+    # Run nightly at 02:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      seeds_per_shard:
+        description: 'Number of seeds per shard (default: 10000 for 100k total across 10 shards)'
+        required: false
+        default: '10000'
+
+jobs:
+  dst-campaign:
+    name: Shard ${{ matrix.shard }} (${{ matrix.seed_range }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: 1
+            seed_range: '1..10000'
+          - shard: 2
+            seed_range: '10001..20000'
+          - shard: 3
+            seed_range: '20001..30000'
+          - shard: 4
+            seed_range: '30001..40000'
+          - shard: 5
+            seed_range: '40001..50000'
+          - shard: 6
+            seed_range: '50001..60000'
+          - shard: 7
+            seed_range: '60001..70000'
+          - shard: 8
+            seed_range: '70001..80000'
+          - shard: 9
+            seed_range: '80001..90000'
+          - shard: 10
+            seed_range: '90001..100000'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run DST Campaign Shard
+        run: |
+          ./scripts/run_dst_campaign.sh \
+            --seeds "${{ matrix.seed_range }}" \
+            --workers 4 \
+            --artifact-dir "artifacts/replays"
+
+      - name: Upload Replay Bundle on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dst-replay-bundle-shard-${{ matrix.shard }}
+          path: artifacts/replays/*.tar
+          if-no-files-found: ignore
+          retention-days: 14

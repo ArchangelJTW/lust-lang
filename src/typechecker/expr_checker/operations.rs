@@ -459,6 +459,178 @@ impl TypeChecker {
         }
     }
 
+    fn check_lust_handle(
+        &mut self,
+        span: Span,
+        args: &[Expr],
+        expected_type: Option<&Type>,
+    ) -> Result<Type> {
+        if args.len() != 2 {
+            return Err(self.type_error_at(
+                "__lust_handle expects exactly 2 arguments (body, arms)".to_string(),
+                span,
+            ));
+        }
+
+        let body_thunk_type = self.check_expr(&args[0])?;
+        let body_ret_type = match &body_thunk_type.kind {
+            TypeKind::Function { return_type, .. } => (**return_type).clone(),
+            TypeKind::Effect { success, .. } => (**success).clone(),
+            _ => Type::new(TypeKind::Unknown, span),
+        };
+
+        let arms_expr = &args[1];
+        let mut arm_return_types = Vec::new();
+        if let ExprKind::Array(tuples) = &arms_expr.kind {
+            for tuple in tuples {
+                if let ExprKind::Tuple(items) = &tuple.kind && items.len() == 2 {
+                    let arm_fn = &items[1];
+                    self.handler_arm_depth += 1;
+                    let arm_fn_type = self.check_expr(arm_fn)?;
+                    self.handler_arm_depth -= 1;
+                    if let TypeKind::Function { return_type, .. } = &arm_fn_type.kind {
+                        if !matches!(return_type.kind, TypeKind::Unit | TypeKind::Never | TypeKind::Infer | TypeKind::Unknown) {
+                            arm_return_types.push((**return_type).clone());
+                        }
+                    }
+                } else {
+                    self.handler_arm_depth += 1;
+                    self.check_expr(tuple)?;
+                    self.handler_arm_depth -= 1;
+                }
+            }
+        } else {
+            self.check_expr(arms_expr)?;
+        }
+
+        if !matches!(body_ret_type.kind, TypeKind::Unit | TypeKind::Never | TypeKind::Unknown | TypeKind::Infer) {
+            for arm_ret in &arm_return_types {
+                if !self.types_compatible(&body_ret_type, arm_ret) {
+                    return Err(self.type_error_at(
+                        format!(
+                            "Effect handler arm return type '{}' is incompatible with handle body return type '{}'",
+                            arm_ret, body_ret_type
+                        ),
+                        span,
+                    ));
+                }
+            }
+        }
+
+        if let Some(exp) = expected_type {
+            if !matches!(body_ret_type.kind, TypeKind::Unknown | TypeKind::Infer) {
+                self.unify(exp, &body_ret_type)?;
+            }
+            Ok(exp.clone())
+        } else {
+            Ok(body_ret_type)
+        }
+    }
+
+    fn check_lust_perform(
+        &mut self,
+        span: Span,
+        args: &[Expr],
+        expected_type: Option<&Type>,
+    ) -> Result<Type> {
+        if args.is_empty() {
+            return Err(self.type_error_at(
+                "__lust_perform expects effect name and arguments".to_string(),
+                span,
+            ));
+        }
+        for arg in args {
+            self.check_expr(arg)?;
+        }
+        if let Some(exp) = expected_type {
+            Ok(exp.clone())
+        } else {
+            Ok(Type::new(TypeKind::Infer, span))
+        }
+    }
+
+    fn check_lust_resume(
+        &mut self,
+        span: Span,
+        args: &[Expr],
+        _expected_type: Option<&Type>,
+    ) -> Result<Type> {
+        if args.len() != 1 {
+            return Err(self.type_error_at(
+                "'resume' requires exactly 1 argument".to_string(),
+                span,
+            ));
+        }
+        if self.handler_arm_depth == 0 {
+            return Err(self.type_error_at(
+                "'resume' called outside of an active effect handler arm".to_string(),
+                span,
+            ));
+        }
+        self.check_expr(&args[0])?;
+        Ok(Type::new(TypeKind::Unit, span))
+    }
+
+    fn check_borrow_intrinsic(
+        &mut self,
+        span: Span,
+        args: &[Expr],
+        mutable: bool,
+    ) -> Result<Type> {
+        if args.len() != 1 {
+            return Err(self.type_error_at(
+                format!(
+                    "Borrow producer expects exactly 1 argument, got {}",
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        let arg_ty = self.check_expr(&args[0])?;
+        let canonical = self.canonicalize_type(&arg_ty);
+        let inner = match canonical.kind {
+            TypeKind::Ref(inner) => {
+                if mutable {
+                    return Err(self.type_error_at(
+                        "Cannot create mutable borrow '&mut' from an immutable reference '&'"
+                            .to_string(),
+                        span,
+                    ));
+                }
+                *inner
+            }
+            TypeKind::MutRef(inner) => *inner,
+            _ => canonical,
+        };
+        let kind = if mutable {
+            TypeKind::MutRef(Box::new(inner))
+        } else {
+            TypeKind::Ref(Box::new(inner))
+        };
+        Ok(Type::new(kind, span))
+    }
+
+    fn check_view_unwrap_intrinsic(
+        &mut self,
+        span: Span,
+        name: &str,
+        args: &[Expr],
+    ) -> Result<Type> {
+        if args.len() != 1 {
+            return Err(self.type_error_at(
+                format!("'{}' expects exactly 1 argument, got {}", name, args.len()),
+                span,
+            ));
+        }
+        let arg_ty = self.check_expr(&args[0])?;
+        let canonical = self.canonicalize_type(&arg_ty);
+        let unwrapped = match canonical.kind {
+            TypeKind::Ref(inner) | TypeKind::MutRef(inner) => *inner,
+            _ => canonical,
+        };
+        Ok(Type::new(unwrapped.kind, span))
+    }
+
     pub fn check_call_expr(
         &mut self,
         span: Span,
@@ -467,12 +639,130 @@ impl TypeChecker {
         args: &[Expr],
         expected_type: Option<&Type>,
     ) -> Result<Type> {
+        if let ExprKind::Identifier(fn_name) = &callee.kind {
+            if fn_name == "__lust_handle" {
+                return self.check_lust_handle(span, args, expected_type);
+            }
+            if fn_name == "__lust_perform" {
+                return self.check_lust_perform(span, args, expected_type);
+            }
+            if fn_name == "__lust_resume" {
+                return self.check_lust_resume(span, args, expected_type);
+            }
+            if fn_name == "__lust_borrow" {
+                return self.check_borrow_intrinsic(span, args, false);
+            }
+            if fn_name == "__lust_borrow_mut" {
+                return self.check_borrow_intrinsic(span, args, true);
+            }
+            if fn_name == "__lust_view_read" || fn_name == "__lust_materialize" {
+                return self.check_view_unwrap_intrinsic(span, fn_name, args);
+            }
+        }
+        if let ExprKind::FieldAccess { object, field } = &callee.kind
+            && let ExprKind::Identifier(obj_name) = &object.kind
+            && obj_name == "view"
+        {
+            match field.as_str() {
+                "borrow" => return self.check_borrow_intrinsic(span, args, false),
+                "borrow_mut" => return self.check_borrow_intrinsic(span, args, true),
+                "read" => return self.check_view_unwrap_intrinsic(span, "view.read", args),
+                "materialize" => {
+                    return self.check_view_unwrap_intrinsic(span, "view.materialize", args);
+                }
+                _ => {}
+            }
+        }
         if let ExprKind::FieldAccess { object, field } = &callee.kind {
-            if matches!(field.as_str(), "provide" | "run_sync") {
-                if let Ok(ty) = self.check_expr(object) {
-                    if matches!(ty.kind, TypeKind::Effect { .. }) {
-                        return self.check_method_call(object, field, explicit_type_args, args);
+            if let Ok(ty) = self.check_expr(object) {
+                if matches!(
+                    ty.kind,
+                    TypeKind::Option(_) | TypeKind::Result(_, _) | TypeKind::Effect { .. } | TypeKind::Schema { .. }
+                ) || matches!(&ty.kind, TypeKind::Named(name) if name == "Option" || name == "Result")
+                {
+                    return self.check_method_call(object, field, explicit_type_args, args);
+                }
+            }
+        }
+        if let ExprKind::FieldAccess { object, field } = &callee.kind
+            && let ExprKind::Identifier(obj_name) = &object.kind
+            && (obj_name == "s" || obj_name == "schema")
+        {
+            for arg in args {
+                self.check_expr(arg)?;
+            }
+            let span = Self::dummy_span();
+            let explicit_args = explicit_type_args.unwrap_or(&[]);
+            match field.as_str() {
+                "string" => {
+                    return Ok(Type::new(
+                        TypeKind::Schema {
+                            input: Box::new(Type::new(TypeKind::String, span)),
+                            output: Box::new(Type::new(TypeKind::String, span)),
+                            fields: None,
+                        },
+                        span,
+                    ));
+                }
+                "int" | "i64" | "i32" => {
+                    return Ok(Type::new(
+                        TypeKind::Schema {
+                            input: Box::new(Type::new(TypeKind::Int, span)),
+                            output: Box::new(Type::new(TypeKind::Int, span)),
+                            fields: None,
+                        },
+                        span,
+                    ));
+                }
+                "float" => {
+                    return Ok(Type::new(
+                        TypeKind::Schema {
+                            input: Box::new(Type::new(TypeKind::Float, span)),
+                            output: Box::new(Type::new(TypeKind::Float, span)),
+                            fields: None,
+                        },
+                        span,
+                    ));
+                }
+                "bool" => {
+                    return Ok(Type::new(
+                        TypeKind::Schema {
+                            input: Box::new(Type::new(TypeKind::Bool, span)),
+                            output: Box::new(Type::new(TypeKind::Bool, span)),
+                            fields: None,
+                        },
+                        span,
+                    ));
+                }
+                "struct" | "derive_schema" => {
+                    if let Some(first_type_arg) = explicit_args.first() {
+                        return Ok(Type::new(
+                            TypeKind::Schema {
+                                input: Box::new(first_type_arg.clone()),
+                                output: Box::new(first_type_arg.clone()),
+                                fields: None,
+                            },
+                            span,
+                        ));
                     }
+                    return Ok(Type::new(
+                        TypeKind::Schema {
+                            input: Box::new(Type::new(TypeKind::Unknown, span)),
+                            output: Box::new(Type::new(TypeKind::Unknown, span)),
+                            fields: None,
+                        },
+                        span,
+                    ));
+                }
+                _ => {
+                    return Ok(Type::new(
+                        TypeKind::Schema {
+                            input: Box::new(Type::new(TypeKind::Unknown, span)),
+                            output: Box::new(Type::new(TypeKind::Unknown, span)),
+                            fields: None,
+                        },
+                        span,
+                    ));
                 }
             }
         }
@@ -621,6 +911,9 @@ impl TypeChecker {
                         error.as_ref(),
                         callee.span,
                     )?;
+                    if self.is_in_main() {
+                        return Ok(success);
+                    }
                     return Ok(if let Some(err) = error {
                         Type::new(TypeKind::Result(Box::new(success), Box::new(err)), span)
                     } else {
@@ -1040,6 +1333,9 @@ impl TypeChecker {
                     error.as_ref(),
                     callee.span,
                 )?;
+                if self.is_in_main() {
+                    return Ok(success);
+                }
                 return Ok(if let Some(err) = error {
                     Type::new(TypeKind::Result(Box::new(success), Box::new(err)), span)
                 } else {
@@ -1348,6 +1644,36 @@ impl TypeChecker {
                     return Ok((**success).clone());
                 }
                 _ => {}
+            },
+            TypeKind::Schema { input, output, .. } => {
+                for arg in args {
+                    self.check_expr(arg)?;
+                }
+                match method {
+                    "validate" | "validate_json" | "validate_jsonc" | "validate_yaml"
+                    | "validate_bson" | "decode_json" => {
+                        return Ok((**output).clone());
+                    }
+                    "transform" => {
+                        if let Some(arg) = args.first() {
+                            let arg_ty = self.check_expr(arg)?;
+                            if let TypeKind::Function { return_type, .. } = arg_ty.kind {
+                                return Ok(Type::new(
+                                    TypeKind::Schema {
+                                        input: input.clone(),
+                                        output: return_type,
+                                        fields: None,
+                                    },
+                                    span,
+                                ));
+                            }
+                        }
+                        return Ok(receiver_type.clone());
+                    }
+                    _ => {
+                        return Ok(receiver_type.clone());
+                    }
+                }
             },
             TypeKind::Named(type_name) if type_name == "Option" || type_name == "Result" => {
                 match method {
@@ -1741,6 +2067,12 @@ impl TypeChecker {
             }
 
             if !enum_def.type_params.is_empty() {
+                if enum_def.name == "Option" {
+                    return Ok(Type::new(
+                        TypeKind::Option(Box::new(Type::new(TypeKind::Unknown, span))),
+                        span,
+                    ));
+                }
                 return Err(self.type_error_at(
                     format!(
                         "Cannot infer type parameters for unit variant '{}.{}'",
@@ -1753,7 +2085,12 @@ impl TypeChecker {
             return Ok(Type::new(TypeKind::Named(enum_def.name.clone()), span));
         }
 
-        let object_type = self.check_expr(object)?;
+        let raw_object_type = self.check_expr(object)?;
+        let (object_type, borrow_mode) = match &raw_object_type.kind {
+            TypeKind::Ref(inner) => ((**inner).clone(), Some(false)),
+            TypeKind::MutRef(inner) => ((**inner).clone(), Some(true)),
+            _ => (raw_object_type, None),
+        };
         if matches!(object_type.kind, TypeKind::Unknown)
             || matches!(&object_type.kind, TypeKind::Named(name) if name == "LuaValue" || name == "LuaTable")
         {
@@ -1817,7 +2154,22 @@ impl TypeChecker {
                 )
             })?;
         let field_type = self.substitute_type(&field_type, &type_bindings);
-        Ok(self.canonicalize_type(&field_type))
+        let canonical = self.canonicalize_type(&field_type);
+        Ok(match borrow_mode {
+            Some(is_mut)
+                if !matches!(
+                    canonical.kind,
+                    TypeKind::Int | TypeKind::Float | TypeKind::Bool | TypeKind::Unit
+                ) =>
+            {
+                if is_mut {
+                    Type::new(TypeKind::MutRef(Box::new(canonical)), span)
+                } else {
+                    Type::new(TypeKind::Ref(Box::new(canonical)), span)
+                }
+            }
+            _ => canonical,
+        })
     }
 
     pub fn check_index_expr(&mut self, span: Span, object: &Expr, index: &Expr) -> Result<Type> {
@@ -1835,7 +2187,11 @@ impl TypeChecker {
         index: &Expr,
         safe_array_read: bool,
     ) -> Result<Type> {
-        let object_type = self.check_expr(object)?;
+        let raw_object_type = self.check_expr(object)?;
+        let object_type = match &raw_object_type.kind {
+            TypeKind::Ref(inner) | TypeKind::MutRef(inner) => (**inner).clone(),
+            _ => raw_object_type,
+        };
         let index_type = self.check_expr(index)?;
         if matches!(object_type.kind, TypeKind::Unknown)
             || matches!(&object_type.kind, TypeKind::Named(name) if name == "LuaValue" || name == "LuaTable")

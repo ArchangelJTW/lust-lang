@@ -1,0 +1,14 @@
+[package]
+name = "lust-telemetry-otel"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Zero-dependency OpenTelemetry (OTLP) JSON and wire exporter for Lust Runtime"
+
+[features]
+default = []
+upstream = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
+
+[dependencies]
+opentelemetry = { version = "0.33.1", optional = true }
+opentelemetry_sdk = { version = "0.33.1", features = ["testing", "experimental_metrics_custom_reader"], optional = true }

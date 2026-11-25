@@ -1,0 +1,38 @@
+-- Example: Deterministic Fault Injection VFS in DST.
+-- Ported from `examples/simulation/02_fault_injection_vfs.rs`.
+
+use std.test
+
+function simulate_vfs_read(path: string): string
+    if path == "/data/secret.key" then
+        return "ERR:PermissionDenied"
+    elseif path == "/data/healthy.txt" then
+        return "OK:trusted content"
+    end
+    return "ERR:NotFound"
+end
+
+function simulate_vfs_write(path: string, payload: string): string
+    if path == "/data/readonly.log" then
+        return "ERR:ReadOnlyFilesystem"
+    end
+    return "OK:" .. path .. ":" .. payload
+end
+
+println("--- [Fault Injection VFS Example] ---")
+local r_ok = simulate_vfs_read("/data/healthy.txt")
+assert(r_ok == "OK:trusted content", "healthy read must succeed")
+println("READ_OK=" .. r_ok)
+
+local r_err = simulate_vfs_read("/data/secret.key")
+assert(r_err == "ERR:PermissionDenied", "secret read fault must trigger")
+println("READ_FAULT=" .. r_err)
+
+local w_err = simulate_vfs_write("/data/readonly.log", "audit event")
+assert(w_err == "ERR:ReadOnlyFilesystem", "readonly write fault must trigger")
+println("WRITE_FAULT=" .. w_err)
+
+local w_ok = simulate_vfs_write("/data/output.txt", "success")
+assert(w_ok == "OK:/data/output.txt:success", "normal write must succeed")
+println("WRITE_OK=" .. w_ok)
+println("All fault injection VFS assertions passed!")

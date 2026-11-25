@@ -1,3 +1,6 @@
+// Host CLI / packaging boundary: package manager operates on the host filesystem directly.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::{

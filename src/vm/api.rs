@@ -33,12 +33,69 @@ impl NativeExportParam {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativePurity {
+    Pure,
+    Effectful,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeEffectSpec {
+    pub purity: NativePurity,
+    pub error_type: Option<String>,
+    pub requirements: Vec<String>,
+    pub required_capability: Option<String>,
+    pub deterministic: bool,
+}
+
+impl NativeEffectSpec {
+    pub fn pure() -> Self {
+        Self {
+            purity: NativePurity::Pure,
+            error_type: None,
+            requirements: Vec::new(),
+            required_capability: None,
+            deterministic: true,
+        }
+    }
+
+    pub fn effectful(error_type: Option<impl Into<String>>, requirements: Vec<String>) -> Self {
+        Self {
+            purity: NativePurity::Effectful,
+            error_type: error_type.map(Into::into),
+            requirements,
+            required_capability: None,
+            deterministic: false,
+        }
+    }
+
+    pub fn with_capability(mut self, cap: impl Into<String>) -> Self {
+        self.required_capability = Some(cap.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeGasPolicy {
+    None,
+    Fixed(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeMemoryPolicy {
+    None,
+    MaxAllocBytes(usize),
+}
+
 #[derive(Debug, Clone)]
 pub struct NativeExport {
     name: String,
     params: Vec<NativeExportParam>,
     return_type: String,
     doc: Option<String>,
+    pub effects: Option<NativeEffectSpec>,
+    pub gas_policy: Option<NativeGasPolicy>,
+    pub memory_policy: Option<NativeMemoryPolicy>,
 }
 
 impl NativeExport {
@@ -52,11 +109,29 @@ impl NativeExport {
             params,
             return_type: return_type.into(),
             doc: None,
+            effects: None,
+            gas_policy: None,
+            memory_policy: None,
         }
     }
 
     pub fn with_doc(mut self, doc: impl Into<String>) -> Self {
         self.doc = Some(doc.into());
+        self
+    }
+
+    pub fn with_effects(mut self, effects: NativeEffectSpec) -> Self {
+        self.effects = Some(effects);
+        self
+    }
+
+    pub fn with_gas_policy(mut self, policy: NativeGasPolicy) -> Self {
+        self.gas_policy = Some(policy);
+        self
+    }
+
+    pub fn with_memory_policy(mut self, policy: NativeMemoryPolicy) -> Self {
+        self.memory_policy = Some(policy);
         self
     }
 
@@ -74,6 +149,18 @@ impl NativeExport {
 
     pub fn doc(&self) -> Option<&str> {
         self.doc.as_deref()
+    }
+
+    pub fn effects(&self) -> Option<&NativeEffectSpec> {
+        self.effects.as_ref()
+    }
+
+    pub fn gas_policy(&self) -> Option<&NativeGasPolicy> {
+        self.gas_policy.as_ref()
+    }
+
+    pub fn memory_policy(&self) -> Option<&NativeMemoryPolicy> {
+        self.memory_policy.as_ref()
     }
 }
 
@@ -101,6 +188,8 @@ struct VmBuiltinsCache {
     struct_metadata: HashMap<String, super::RuntimeStructInfo>,
     natives: HashMap<String, Value>,
     globals: HashMap<String, Value>,
+    globals_vec: Vec<Value>,
+    global_name_to_slot: HashMap<String, u32>,
     intrinsics: HashMap<usize, crate::jit::Intrinsic>,
 }
 
@@ -116,22 +205,78 @@ impl VM {
     }
 
     pub fn with_config(config: &LustConfig) -> Self {
+        let vm_alloc = crate::alloc_budget::VmAllocHandle::unbounded();
+        let vm_registers = Vec::with_capacity_in(4096, vm_alloc.clone());
         let mut vm = Self {
             current_vm_lookup: super::current_vm_ptr,
+            backend: {
+                #[cfg(feature = "std")]
+                {
+                    if std::env::var("LUST_JIT_BACKEND").as_deref() == Ok("cranelift")
+                        || std::env::var("LUST_BACKEND").as_deref() == Ok("cranelift")
+                        || config.cranelift_jit()
+                    {
+                        super::VmBackend::Cranelift
+                    } else {
+                        super::VmBackend::Bytecode
+                    }
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    super::VmBackend::Bytecode
+                }
+            },
+            cranelift_entry_count: 0,
+            #[cfg(feature = "test-deopt")]
+            test_deopt_spike_hook: None,
+            #[cfg(feature = "test-deopt")]
+            last_deopt_source: None,
+            cranelift_compilation_count: 0,
+            cranelift_array_cache_hits: 0,
+            cranelift_array_cache_builds: 0,
+            cranelift_dispatch_refine_count: 0,
+            cranelift_struct_sync_count: 0,
+            cranelift_generation: 0,
+            cranelift_compiled_generation: 0,
+            mir_context_struct_gen: 0,
+            cranelift_compiled_struct_gen: 0,
+            #[cfg(feature = "cranelift")]
+            cranelift_jit: None,
+            #[cfg(feature = "cranelift")]
+            cranelift_recipes: HashMap::new(),
+            #[cfg(feature = "cranelift")]
+            cranelift_fn_cache: Vec::new(),
+            #[cfg(feature = "cranelift")]
+            osr_engine: None,
+            #[cfg(feature = "cranelift")]
+            osr_backedge_counts: HashMap::new(),
+            #[cfg(feature = "cranelift")]
+            osr_cold_sites: hashbrown::HashSet::new(),
+            osr_compilation_count: 0,
+            osr_last_cranelift_gen: 0,
+            osr_last_struct_gen: 0,
+            mir_functions: HashMap::new(),
+            cranelift_compiled: HashMap::new(),
             jit: JitState::new(),
             budgets: BudgetState::default(),
             #[cfg(feature = "std")]
-            random_rng: None,
+            random_rng: core::cell::RefCell::new(None),
             functions: Vec::new(),
             call_meta: Vec::new(),
+            ast_bytecode_backup: HashMap::new(),
             natives: HashMap::new(),
             globals: HashMap::new(),
+            globals_vec: Vec::new(),
+            global_name_to_slot: HashMap::new(),
+            globals_generation: 1,
             globals_version: 0,
             jit_cells: crate::jit::JitCells::default(),
             unit_enums: HashMap::new(),
             map_hasher: DefaultHashBuilder::default(),
+            vm_alloc,
+            vm_registers,
             call_stack: Vec::new(),
-            frame_pool: Vec::new(),
+            last_frame_pop_cleanup_iters: 0,
             method_cache: hashbrown::HashMap::new(),
             arg_scratch: Vec::new(),
             max_stack_depth: 1000,
@@ -143,7 +288,7 @@ impl VM {
             skip_next_trace_record: false,
             trait_impls: HashMap::new(),
             struct_tostring_cache: HashMap::new(),
-            struct_metadata: HashMap::new(),
+            struct_metadata: super::StructMetadataRegistry::new(),
             call_until_depth: None,
             task_manager: TaskManager::new(),
             current_task: None,
@@ -156,17 +301,34 @@ impl VM {
             #[cfg(feature = "std")]
             exported_type_stubs: Vec::new(),
             last_dispatched_target: None,
-            root_frame: Some(CallFrame::new(0, None, 255)),
             active_native_depth: 0,
             active_jit_depth: 0,
             host_ledger: TrustedHostResourceLedger::new(),
+            #[cfg(feature = "std")]
+            rng: core::cell::RefCell::new(Box::new(rand::make_rng::<rand::rngs::StdRng>())),
+            id: Self::allocate_vm_id(),
+            next_array_sequence_id: core::sync::atomic::AtomicU64::new(0),
+            array_id_map: core::cell::RefCell::new(HashMap::new()),
+            lua_context: Rc::new(crate::lua_compat::LuaCompatContext::new()),
+            mir_context: Rc::new(crate::mir::runtime_helpers::MirContext::new()),
+            clock: alloc::sync::Arc::new(crate::sim::clock::LustClock::system()),
+            #[cfg(feature = "std")]
+            vfs: alloc::sync::Arc::new(crate::vfs::OsFs::new()),
+            #[cfg(feature = "std")]
+            env: crate::vfs::VirtualEnv::new(),
+            #[cfg(feature = "std")]
+            console: crate::vfs::VirtualConsole::new(),
+            quantum_fuel: None,
+            slow_path_flags: 0,
+            has_active_finalizers: false,
+            cycle_collections_count: 0,
+            config: config.clone(),
         };
         vm.cycle_collector.set_enabled(config.gc_enabled());
-        if config.use_mir() {
-            vm.jit.enabled = false;
-        } else {
-            vm.jit.enabled = vm.jit.enabled && config.jit_enabled();
-        }
+        vm.jit.enabled = vm.jit.enabled
+            && !crate::jit::is_dynasm_retired()
+            && !config.use_mir()
+            && config.jit_enabled();
 
         #[cfg(feature = "std")]
         let cache_key = {
@@ -188,9 +350,12 @@ impl VM {
         #[cfg(feature = "std")]
         if let Some(cached) = cached {
             vm.trait_impls = cached.trait_impls;
-            vm.struct_metadata = cached.struct_metadata;
+            vm.struct_metadata.replace_all(cached.struct_metadata);
             vm.natives = cached.natives;
             vm.globals = cached.globals;
+            vm.globals_vec = cached.globals_vec;
+            vm.global_name_to_slot = cached.global_name_to_slot;
+            vm.globals_generation = 1;
             vm.jit.intrinsics = cached.intrinsics;
             return vm;
         }
@@ -209,6 +374,11 @@ impl VM {
         for (name, func) in super::stdlib::create_stdlib(config, &vm) {
             vm.register_native(name, func);
         }
+        #[cfg(feature = "std")]
+        crate::stdlib::coord::register_builtins(&mut vm);
+        #[cfg(feature = "std")]
+        crate::stdlib::services::register_builtins(&mut vm);
+        super::channel::register_builtins(&mut vm);
         vm.register_jit_intrinsics();
 
         #[cfg(feature = "std")]
@@ -217,15 +387,100 @@ impl VM {
                 cache_key,
                 VmBuiltinsCache {
                     trait_impls: vm.trait_impls.clone(),
-                    struct_metadata: vm.struct_metadata.clone(),
+                    struct_metadata: vm.struct_metadata.clone_map(),
                     natives: vm.natives.clone(),
                     globals: vm.globals.clone(),
+                    globals_vec: vm.globals_vec.clone(),
+                    global_name_to_slot: vm.global_name_to_slot.clone(),
                     intrinsics: vm.jit.intrinsics.clone(),
                 },
             );
         });
 
         vm
+    }
+
+    pub fn with_seed(seed: u64) -> Self {
+        let vm = Self::new();
+        vm.set_seed(seed);
+        vm
+    }
+
+    pub fn with_sim_clock(seed: u64, epoch_nanos: u64, monotonic_nanos: u64) -> Self {
+        let mut vm = Self::with_seed(seed);
+        vm.clock = alloc::sync::Arc::new(crate::sim::clock::LustClock::simulated(
+            epoch_nanos,
+            monotonic_nanos,
+        ));
+        vm
+    }
+
+    #[cfg(feature = "std")]
+    pub fn with_mem_fs() -> Self {
+        let mut vm = Self::new();
+        vm.vfs = alloc::sync::Arc::new(crate::vfs::MemFs::new());
+        vm.env = crate::vfs::VirtualEnv::isolated();
+        vm.console = crate::vfs::VirtualConsole::captured();
+        vm
+    }
+
+    #[cfg(feature = "std")]
+    pub fn with_vfs(vfs: alloc::sync::Arc<dyn crate::vfs::VirtualFileSystem>) -> Self {
+        let mut vm = Self::new();
+        vm.vfs = vfs;
+        vm
+    }
+
+    pub fn set_clock(&mut self, clock: alloc::sync::Arc<crate::sim::clock::LustClock>) {
+        self.clock = clock;
+    }
+
+    pub fn with_config_and_seed(config: &LustConfig, seed: u64) -> Self {
+        let vm = Self::with_config(config);
+        vm.set_seed(seed);
+        vm
+    }
+
+    pub fn set_seed(&self, seed: u64) {
+        #[cfg(feature = "std")]
+        {
+            use rand::SeedableRng;
+            *self.rng.borrow_mut() = Box::new(rand::rngs::StdRng::seed_from_u64(seed));
+            *self.random_rng.borrow_mut() = Some(super::rng::PortableRng::from_seed(seed));
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = seed;
+        }
+    }
+
+    pub fn allocate_vm_id() -> crate::bytecode::value::VmId {
+        static NEXT_VM_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+        crate::bytecode::value::VmId(NEXT_VM_ID.fetch_add(1, core::sync::atomic::Ordering::SeqCst))
+    }
+
+    pub fn set_vm_id(&mut self, id: crate::bytecode::value::VmId) {
+        self.id = id;
+    }
+
+    pub fn get_or_register_array_id(
+        &self,
+        arr_ptr: usize,
+    ) -> (crate::bytecode::value::VmId, crate::bytecode::value::ArraySequenceId) {
+        let vm_id = self.id;
+        let mut map = self.array_id_map.borrow_mut();
+        let seq = *map.entry(arr_ptr).or_insert_with(|| {
+            let next = self.next_array_sequence_id.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            crate::bytecode::value::ArraySequenceId(next)
+        });
+        (vm_id, seq)
+    }
+
+    pub fn unregister_array_id(
+        &self,
+        arr_ptr: usize,
+    ) -> Option<(crate::bytecode::value::VmId, crate::bytecode::value::ArraySequenceId)> {
+        self.array_id_map.borrow_mut().remove(&arr_ptr).map(|seq| (self.id, seq))
     }
 
     pub fn acquire_host_resource(
@@ -321,6 +576,7 @@ impl VM {
         if !self.cycle_collector.is_enabled() {
             return;
         }
+        self.cycle_collections_count = self.cycle_collections_count.saturating_add(1);
         let enabled = self.cycle_collector.is_enabled();
         let mut collector = mem::take(&mut self.cycle_collector);
         collector.set_enabled(enabled);
@@ -363,8 +619,10 @@ impl VM {
         }
     }
 
-    pub fn load_functions(&mut self, functions: Vec<Function>) {
-        for function in &functions {
+    pub fn load_functions(&mut self, mut functions: Vec<Function>) {
+        for function in &mut functions {
+            function.chunk.compute_bb_gas_weights();
+            function.chunk.build_packed_code();
             for value in &function.chunk.constants {
                 self.observe_value_graph(value);
             }
@@ -374,6 +632,13 @@ impl VM {
         self.jit_cells.entry_table = self.jit.function_entry_table();
         self.call_meta = functions.iter().map(CallMeta::of).collect();
         self.functions = functions;
+        self.method_cache.clear();
+        self.ast_bytecode_backup.clear();
+        #[cfg(feature = "cranelift")]
+        {
+            self.cranelift_fn_cache.clear();
+        }
+        self.invalidate_osr_state();
     }
 
     pub fn jit_stats(&self) -> crate::jit::JitStats {
@@ -425,6 +690,15 @@ impl VM {
                 );
             }
         }
+        #[cfg(feature = "cranelift")]
+        if !defs.is_empty()
+            && self.cranelift_compiled_struct_gen != self.struct_metadata.generation()
+            && (!self.cranelift_compiled.is_empty()
+                || !self.cranelift_recipes.is_empty()
+                || !self.cranelift_fn_cache.is_empty())
+        {
+            self.invalidate_cranelift_for_struct_change();
+        }
     }
 
     pub fn instantiate_struct(
@@ -473,16 +747,26 @@ impl VM {
             self.budgets.charge_value_vec(1)?;
             return Ok(Value::ok(val));
         }
-        let values = values.try_borrow().map_err(|_| LustError::RuntimeError {
-            message: "Cannot read array while it is mutably borrowed".to_string(),
-        })?;
-        let length = values.len();
-        let value = if index >= 0 {
-            values.get(index as usize).cloned()
+        let (length, value) = if values.is_unboxed() {
+            let length = values.len_fast();
+            let value = if index >= 0 {
+                values.get_value_fast(index as usize)
+            } else {
+                None
+            };
+            (length, value)
         } else {
-            None
+            let values = values.try_borrow().map_err(|_| LustError::RuntimeError {
+                message: "Cannot read array while it is mutably borrowed".to_string(),
+            })?;
+            let length = values.len();
+            let value = if index >= 0 {
+                values.get(index as usize).cloned()
+            } else {
+                None
+            };
+            (length, value)
         };
-        drop(values);
 
         if let Some(value) = value {
             self.budgets.charge_value_vec(1)?;
@@ -573,20 +857,19 @@ impl VM {
                     // Resolve the calling VM at invocation time, then expose it to
                     // the extension's VM::with_current for the duration of the call.
                     Value::NativeFunction(native_fn(move |args| {
-                        let _context = host_lookup().map(super::CurrentVmGuard::new);
+                        let _context = host_lookup().map(|ptr| unsafe { super::CurrentVmGuard::new(ptr) });
                         func(args)
                     }))
                 };
                 let cloned = value.clone();
                 self.natives.insert(name.clone(), value);
-                self.globals.insert(name, cloned);
+                self.sync_global_insert(name, cloned);
             }
 
             other => {
-                self.globals.insert(name, other);
+                self.sync_global_insert(name, other);
             }
         }
-        self.globals_version = self.globals_version.wrapping_add(1);
     }
 
     #[allow(dead_code)]
@@ -656,6 +939,10 @@ impl VM {
         let params = export.params.clone();
         let return_type = export.return_type.clone();
         let type_module = self.export_prefix();
+        let effects = export.effects.clone();
+        let gas_policy = export.gas_policy.clone();
+        let memory_policy = export.memory_policy.clone();
+        let fn_name = name.clone();
         self.push_export_metadata(export);
         let native = Value::NativeFunction(native_fn(move |args| {
             if args.len() != params.len() {
@@ -666,6 +953,58 @@ impl VM {
                 ));
             }
             VM::with_current(|vm| {
+                if let Some(spec) = &effects {
+                    if vm.config().prelude_mode() == &crate::config::PreludeMode::Pure
+                        && spec.purity == NativePurity::Effectful
+                    {
+                        return Err(format!(
+                            "PurityViolation: effectful native function '{}' not allowed in PreludeMode::Pure",
+                            fn_name
+                        ));
+                    }
+                    if let Some(req_cap) = &spec.required_capability {
+                        let caps = vm.config().capability_mask();
+                        let allowed = match req_cap.as_str() {
+                            "net" => caps.allow_net,
+                            "fs" => caps.allow_fs,
+                            "io" => caps.allow_io || caps.allow_fs,
+                            "os" => caps.allow_os,
+                            "task" => caps.allow_task,
+                            "test" => caps.allow_test,
+                            "ffi" => caps.allow_ffi,
+                            other => caps.custom_capabilities.contains(other) || vm.config().is_std_module_allowed(other),
+                        };
+                        if !allowed {
+                            return Err(format!(
+                                "CapabilityDenied: native function '{}' requires capability '{}'",
+                                fn_name, req_cap
+                            ));
+                        }
+                    }
+                }
+
+                if let Some(policy) = &gas_policy {
+                    match policy {
+                        NativeGasPolicy::Fixed(gas) => {
+                            if vm.charge_gas(*gas).is_err() {
+                                return Err("Out of gas".to_string());
+                            }
+                        }
+                        NativeGasPolicy::None => {}
+                    }
+                }
+
+                if let Some(policy) = &memory_policy {
+                    match policy {
+                        NativeMemoryPolicy::MaxAllocBytes(max_bytes) => {
+                            if vm.memory_budget_bytes().is_some() && !vm.try_charge_memory_bytes(*max_bytes) {
+                                return Err("Out of memory budget".to_string());
+                            }
+                        }
+                        NativeMemoryPolicy::None => {}
+                    }
+                }
+
                 for (index, (value, param)) in args.iter().zip(&params).enumerate() {
                     if !vm.value_is_export_type(value, param.ty(), type_module.as_deref()) {
                         return Err(format!(
@@ -679,6 +1018,41 @@ impl VM {
 
                 let outcome = func(args)?;
                 if let NativeCallResult::Return(value) = &outcome {
+                    if let Value::Map(m) = value {
+                        let borrowed = m.borrow();
+                        let key_effect = ValueKey::from(String::from("__effect"));
+                        let key_kind = ValueKey::from(String::from("__kind"));
+                        let is_effect = matches!(borrowed.get(&key_effect), Some(Value::Bool(true)));
+                        if is_effect {
+                            let is_fail = match borrowed.get(&key_kind) {
+                                Some(Value::String(s)) => s.as_str() == "fail",
+                                _ => false,
+                            };
+                            match &effects {
+                                None => {
+                                    return Err(format!(
+                                        "UndeclaredEffect: native function '{}' produced an effect but has no declared effect signature",
+                                        fn_name
+                                    ));
+                                }
+                                Some(spec) => {
+                                    if spec.purity == NativePurity::Pure {
+                                        return Err(format!(
+                                            "UndeclaredEffect: native function '{}' produced an effect but was declared Pure",
+                                            fn_name
+                                        ));
+                                    }
+                                    if is_fail && spec.error_type.is_none() {
+                                        return Err(format!(
+                                            "UndeclaredEffectError: native function '{}' produced an effect error, but declared no error type",
+                                            fn_name
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let expected = if return_type.trim().is_empty() {
                         "()"
                     } else {
@@ -742,6 +1116,7 @@ impl VM {
     pub fn clear_native_functions(&mut self) {
         self.natives.clear();
         self.globals_version = self.globals_version.wrapping_add(1);
+        self.globals_generation = self.globals_generation.wrapping_add(1).max(1);
         #[cfg(feature = "std")]
         self.exported_type_stubs.clear();
     }
@@ -789,14 +1164,12 @@ impl VM {
     pub fn set_global(&mut self, name: impl Into<String>, value: Value) {
         let name = name.into();
         self.observe_value(&value);
-        self.globals.insert(name.clone(), value);
         self.natives.remove(&name);
-        self.globals_version = self.globals_version.wrapping_add(1);
+        self.sync_global_insert(name, value);
         self.maybe_collect_cycles();
     }
 
-    fn execute_call_frame(&mut self, frame: Box<CallFrame>) -> Result<Value> {
-        let stack_depth_before = self.call_stack.len();
+    fn execute_top_call_frame(&mut self, stack_depth_before: usize) -> Result<Value> {
         let saved_pending_return_value = self.pending_return_value.clone();
         let saved_pending_return_dest = self.pending_return_dest;
         let saved_pending_task_signal = self.pending_task_signal.clone();
@@ -806,8 +1179,7 @@ impl VM {
         let saved_call_until_depth = self.call_until_depth;
         self.skip_next_trace_record = false;
         self.call_until_depth = Some(stack_depth_before);
-        let func_idx = frame.function_idx;
-        self.call_stack.push(frame);
+        let func_idx = self.call_stack.last().expect("frame pushed before execute_top_call_frame").function_idx;
         #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
         let result = if self.jit.enabled && saved_trace_recorder.is_none() {
             match self.run_compiled_function(func_idx) {
@@ -818,6 +1190,7 @@ impl VM {
                         && let Some(return_value) = self.pending_return_value.take()
                     {
                         self.call_until_depth = None;
+                        self.sync_slow_path_flags();
                         Ok(return_value)
                     } else {
                         self.run()
@@ -840,30 +1213,53 @@ impl VM {
             Ok(v) => Ok(v),
             Err(e) => {
                 let annotated = self.annotate_runtime_error(e);
-                self.call_stack.truncate(stack_depth_before);
+                self.truncate_call_stack(stack_depth_before);
                 self.pending_return_value = saved_pending_return_value;
                 self.pending_return_dest = saved_pending_return_dest;
                 self.pending_task_signal = saved_pending_task_signal;
                 self.last_task_signal = saved_last_task_signal;
+                self.sync_slow_path_flags();
                 Err(annotated)
             }
         }
     }
 
     fn call_function_index(&mut self, func_idx: usize, args: Vec<Value>) -> Result<Value> {
-        let frame = self.make_call_frame(func_idx, None, args, Vec::new())?;
-        self.execute_call_frame(frame)
+        let stack_depth_before = self.call_stack.len();
+        self.push_deep_call_frame(func_idx, None, args, Vec::new(), Vec::new())?;
+        self.execute_top_call_frame(stack_depth_before)
     }
 
     pub fn call(&mut self, function_name: &str, args: Vec<Value>) -> Result<Value> {
-        let func_idx = self
-            .functions
-            .iter()
-            .position(|f| f.name == function_name)
-            .ok_or_else(|| LustError::RuntimeError {
+        let res = if let Some(func_idx) = self.functions.iter().position(|f| f.name == function_name) {
+            self.call_function_index(func_idx, args)
+        } else if let Some(val) = self.natives.get(function_name).cloned().or_else(|| self.globals.get(function_name).cloned()) {
+            self.call_value(&val, args)
+        } else {
+            Err(LustError::RuntimeError {
                 message: format!("Function not found: {}", function_name),
-            })?;
-        self.call_function_index(func_idx, args)
+            })
+        };
+        if self.has_active_finalizers || super::execution::get_effect_finalizer_count() > 0 {
+            let _ = self.run_finalizers_down_to(0);
+        }
+        res
+    }
+
+    pub fn call_slice(&mut self, function_name: &str, args: &[Value]) -> Result<Value> {
+        let res = if let Some(func_idx) = self.functions.iter().position(|f| f.name == function_name) {
+            self.call_function_index_slice(func_idx, args)
+        } else if let Some(val) = self.natives.get(function_name).cloned().or_else(|| self.globals.get(function_name).cloned()) {
+            self.call_value(&val, args.to_vec())
+        } else {
+            Err(LustError::RuntimeError {
+                message: format!("Function not found: {}", function_name),
+            })
+        };
+        if self.has_active_finalizers || super::execution::get_effect_finalizer_count() > 0 {
+            let _ = self.run_finalizers_down_to(0);
+        }
+        res
     }
 
     pub(crate) fn functions(&self) -> &[Function] {
@@ -882,7 +1278,7 @@ impl VM {
         })
     }
 
-    pub(crate) fn call_function_index_slice(
+    pub fn call_function_index_slice(
         &mut self,
         func_idx: usize,
         args: &[Value],
@@ -896,10 +1292,13 @@ impl VM {
                     self.functions[func_idx].register_count,
                 );
                 if args.len() == param_count {
-                    if let Some(mut root_frame) = self.root_frame.take() {
-                        root_frame.registers[..param_count].clone_from_slice(args);
-                        let registers_ptr = root_frame.registers.as_mut_ptr();
-                        let vm_ptr = self as *mut VM;
+                    let window_len = (register_count as usize).max(param_count).max(256);
+                    if self.vm_registers.len() < window_len {
+                        self.vm_registers.resize(window_len, Value::Nil);
+                    }
+                    self.vm_registers[..param_count].clone_from_slice(args);
+                    let registers_ptr = self.vm_registers.as_mut_ptr();
+                    let vm_ptr = self as *mut VM;
 
                         let marker = 0u8;
                         let sp = &marker as *const u8 as usize;
@@ -933,34 +1332,327 @@ impl VM {
                             .contains(&result)
                         {
                             let reg = (result - crate::jit::FUNCTION_RETURN_BASE) as usize;
-                            let return_value = root_frame.registers[reg].fast_clone();
-                            root_frame.reset(0, None, register_count);
-                            self.root_frame = Some(root_frame);
+                            let return_value = self.vm_registers[reg].fast_clone();
+                            let clear_len = (register_count as usize).max(param_count).min(self.vm_registers.len());
+                            for slot in &mut self.vm_registers[..clear_len] {
+                                *slot = Value::Nil;
+                            }
                             return Ok(return_value);
                         }
-                        root_frame.reset(0, None, register_count);
-                        self.root_frame = Some(root_frame);
-                    }
+                        let clear_len = (register_count as usize).max(param_count).min(self.vm_registers.len());
+                        for slot in &mut self.vm_registers[..clear_len] {
+                            *slot = Value::Nil;
+                        }
                 }
             }
         }
-        let frame = self.make_call_frame_slice(func_idx, None, args, ArgCheck::Shallow)?;
-        self.execute_call_frame(frame)
+        let stack_depth_before = self.call_stack.len();
+        self.push_call_frame_slice(func_idx, None, args, ArgCheck::Shallow)?;
+        self.execute_top_call_frame(stack_depth_before)
+    }
+
+    /// Read-only alias for `cranelift_entry_count` (`NG-W10-3`).
+    #[inline]
+    pub fn cranelift_native_entry_count(&self) -> u64 {
+        self.cranelift_entry_count
     }
 
     #[inline]
     pub(crate) fn has_native_entry(&self, func_idx: usize) -> bool {
+        #[cfg(feature = "cranelift")]
+        {
+            if self.backend == VmBackend::Cranelift
+                && (self.slow_path_flags & !crate::vm::SLOW_PATH_GAS_LIMIT) == 0
+                && !crate::vm::MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed)
+                && self.call_stack.is_empty()
+                && self.active_jit_depth == 0
+                && self.active_native_depth == 0
+                && self.budgets.memory.limit_bytes.is_none()
+                && !self.has_active_finalizers
+                && !crate::vm::tracing::has_trace_hook()
+            {
+                #[cfg(feature = "test-deopt")]
+                if self.test_deopt_spike_hook.is_some() {
+                    return false;
+                }
+                let current_struct_gen = self.struct_metadata.generation();
+                if self.cranelift_compiled_generation == self.cranelift_generation
+                    && self.cranelift_compiled_struct_gen == current_struct_gen
+                    && self.mir_context_struct_gen == current_struct_gen
+                {
+                    if let Some(Some(entry)) = self.cranelift_fn_cache.get(func_idx) {
+                        if entry.is_pure_scalar_abi
+                            && !entry.code_ptr.is_null()
+                            && entry.compiled_generation == self.cranelift_compiled_generation
+                            && entry.struct_metadata_generation == current_struct_gen
+                        {
+                            return true;
+                        }
+                    }
+                } else if !self.mir_functions.is_empty()
+                    && self
+                        .functions
+                        .get(func_idx)
+                        .is_some_and(|f| self.mir_functions.contains_key(&f.name))
+                {
+                    return true;
+                }
+            }
+        }
         #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             self.call_stack.is_empty()
                 && self.jit.enabled
                 && self.trace_recorder.is_none()
-                && self.root_frame.is_some()
                 && self.jit.function_entry(func_idx) != 0
         }
         #[cfg(not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))))]
         {
             false
+        }
+    }
+
+    /// Direct scalar C-ABI fast-path into Cranelift JIT without allocating a VM `CallFrame`
+    /// (`NG-W10-3`). Returns `None` whenever preconditions are not met so callers fall back
+    /// cleanly to the standard VM dispatch path.
+    #[inline]
+    pub(crate) fn try_call_cranelift_scalar_direct(
+        &mut self,
+        func_idx: usize,
+        args: &[Value],
+    ) -> Option<Result<Value>> {
+        #[cfg(not(feature = "cranelift"))]
+        {
+            let _ = (func_idx, args);
+            None
+        }
+        #[cfg(feature = "cranelift")]
+        {
+            use crate::mir::cranelift_backend::{
+                MIR_STATUS_ERR_DIV_BY_ZERO, MIR_STATUS_ERR_NEG_EXPONENT, MIR_STATUS_ERR_OOM,
+                MIR_STATUS_ERR_OUT_OF_BOUNDS, MIR_STATUS_ERR_OUT_OF_GAS, MIR_STATUS_OK,
+            };
+            use crate::mir::ir::MirType;
+
+            if self.backend != VmBackend::Cranelift
+                || (self.slow_path_flags & !crate::vm::SLOW_PATH_GAS_LIMIT) != 0
+                || crate::vm::MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed)
+                || !self.call_stack.is_empty()
+                || self.active_jit_depth != 0
+                || self.active_native_depth != 0
+                || self.budgets.memory.limit_bytes.is_some()
+                || self.has_active_finalizers
+                || super::execution::get_effect_finalizer_count() > 0
+                || crate::vm::tracing::has_trace_hook()
+                || args.len() > 4
+            {
+                return None;
+            }
+            #[cfg(feature = "test-deopt")]
+            if self.test_deopt_spike_hook.is_some() {
+                return None;
+            }
+            // If any safepoint slow flag (deopt request, pending interrupt, ordinal hook, mask)
+            // is active, fall back to the full frame path with `NativeInvocationGuard`.
+            if unsafe { (*crate::mir::cranelift_backend::lust_mir_safepoint_state_ptr()).slow_flags }
+                != 0
+            {
+                return None;
+            }
+
+            let current_struct_gen = self.struct_metadata.generation();
+            if self.cranelift_compiled_generation != self.cranelift_generation
+                || self.cranelift_compiled_struct_gen != current_struct_gen
+                || self.mir_context_struct_gen != current_struct_gen
+                || func_idx >= self.cranelift_fn_cache.len()
+            {
+                if self.mir_functions.is_empty() {
+                    return None;
+                }
+                self.compile_cranelift().ok()?;
+            }
+
+            let post_struct_gen = self.struct_metadata.generation();
+            let entry = self.cranelift_fn_cache.get(func_idx)?.as_ref()?;
+            if !entry.is_pure_scalar_abi
+                || entry.code_ptr.is_null()
+                || entry.compiled_generation != self.cranelift_compiled_generation
+                || entry.struct_metadata_generation != post_struct_gen
+                || args.len() != entry.param_types.len()
+            {
+                return None;
+            }
+
+            #[derive(Clone, Copy)]
+            enum ScalarArg {
+                Int(i64),
+                Float(f64),
+                Bool(u8),
+            }
+            #[derive(Clone, Copy)]
+            enum ScalarRet {
+                Int,
+                Float,
+                Bool,
+                Unit,
+            }
+
+            let ret_kind = match entry.ret_type {
+                MirType::Int => ScalarRet::Int,
+                MirType::Float => ScalarRet::Float,
+                MirType::Bool => ScalarRet::Bool,
+                MirType::Unit => ScalarRet::Unit,
+                _ => return None,
+            };
+
+            let arg_len = args.len();
+            let mut unpacked = [ScalarArg::Int(0); 4];
+            for (i, (val, expected_ty)) in args.iter().zip(entry.param_types.iter()).enumerate() {
+                unpacked[i] = match (val, expected_ty) {
+                    (Value::Int(n), MirType::Int) => ScalarArg::Int(*n),
+                    (Value::Float(f), MirType::Float) => ScalarArg::Float(*f),
+                    (Value::Bool(b), MirType::Bool) => ScalarArg::Bool(u8::from(*b)),
+                    _ => return None,
+                };
+            }
+            let code_ptr = entry.code_ptr;
+
+            macro_rules! invoke_scalar_ret {
+                ($ptr:expr, $rk:expr, ($($arg_ty:ty),*), ($($arg_val:expr),*)) => {{
+                    match $rk {
+                        ScalarRet::Int => {
+                            // SAFETY: `entry.is_pure_scalar_abi` verified exact Cranelift C-ABI
+                            // (`I64`/`F64`/`I8` params -> `I64` return) and `self.cranelift_jit`
+                            // keeps `code_ptr` alive for the full duration of `&mut self`.
+                            let func: extern "C" fn($($arg_ty),*) -> i64 =
+                                unsafe { core::mem::transmute($ptr) };
+                            Value::Int(func($($arg_val),*))
+                        }
+                        ScalarRet::Float => {
+                            // SAFETY: verified Cranelift C-ABI signature with `F64` return.
+                            let func: extern "C" fn($($arg_ty),*) -> f64 =
+                                unsafe { core::mem::transmute($ptr) };
+                            Value::Float(func($($arg_val),*))
+                        }
+                        ScalarRet::Bool => {
+                            // SAFETY: verified Cranelift C-ABI signature with `I8` return.
+                            let func: extern "C" fn($($arg_ty),*) -> u8 =
+                                unsafe { core::mem::transmute($ptr) };
+                            Value::Bool(func($($arg_val),*) != 0)
+                        }
+                        ScalarRet::Unit => {
+                            // SAFETY: verified Cranelift C-ABI signature with void (`Unit`) return.
+                            let func: extern "C" fn($($arg_ty),*) =
+                                unsafe { core::mem::transmute($ptr) };
+                            func($($arg_val),*);
+                            Value::Nil
+                        }
+                    }
+                }};
+            }
+
+            macro_rules! dispatch_scalar_args {
+                ($ptr:expr, $rk:expr, ($($acc_ty:ty),*), ($($acc_val:expr),*);) => {
+                    invoke_scalar_ret!($ptr, $rk, ($($acc_ty),*), ($($acc_val),*))
+                };
+                ($ptr:expr, $rk:expr, ($($acc_ty:ty),*), ($($acc_val:expr),*); $head:expr $(, $tail:expr)*) => {
+                    match $head {
+                        ScalarArg::Int(v) => dispatch_scalar_args!(
+                            $ptr, $rk, ($($acc_ty,)* i64), ($($acc_val,)* v); $($tail),*
+                        ),
+                        ScalarArg::Float(v) => dispatch_scalar_args!(
+                            $ptr, $rk, ($($acc_ty,)* f64), ($($acc_val,)* v); $($tail),*
+                        ),
+                        ScalarArg::Bool(v) => dispatch_scalar_args!(
+                            $ptr, $rk, ($($acc_ty,)* u8), ($($acc_val,)* v); $($tail),*
+                        ),
+                    }
+                };
+            }
+
+            let baseline = self.mir_context.capture_baseline();
+            let _mir_guard = self.mir_context.enter();
+
+            let vm_gas_budget = self.gas_remaining();
+            self.mir_context.set_status(MIR_STATUS_OK);
+            self.mir_context.set_memory_used(0);
+            self.mir_context.set_max_memory_limit(i64::MAX);
+            let mut gas_guard = crate::vm::GasScopeGuard::enter(
+                Rc::clone(&self.mir_context),
+                vm_gas_budget,
+                false,
+            );
+
+            self.cranelift_entry_count += 1;
+            let _jit_guard = self.enter_jit_scope();
+
+            // Charge base entry gas (matches `try_run_cranelift_top_frame_scoped`).
+            self.mir_context.charge_gas(1);
+
+            let result_val = if self.mir_context.last_status() == MIR_STATUS_OK {
+                match arg_len {
+                    0 => dispatch_scalar_args!(code_ptr, ret_kind, (), ();),
+                    1 => dispatch_scalar_args!(code_ptr, ret_kind, (), (); unpacked[0]),
+                    2 => dispatch_scalar_args!(code_ptr, ret_kind, (), (); unpacked[0], unpacked[1]),
+                    3 => dispatch_scalar_args!(code_ptr, ret_kind, (), (); unpacked[0], unpacked[1], unpacked[2]),
+                    4 => dispatch_scalar_args!(code_ptr, ret_kind, (), (); unpacked[0], unpacked[1], unpacked[2], unpacked[3]),
+                    _ => unreachable!("args.len() <= 4 already verified"),
+                }
+            } else {
+                Value::Nil
+            };
+
+            let status = self.mir_context.last_status();
+            drop(_jit_guard);
+
+            let gas_charge_res = gas_guard.finish_and_charge(&mut self.budgets);
+
+            if self.mir_context.dirty_allocations() {
+                self.mir_context
+                    .clear_to_baselines(baseline.handles, baseline.buffers);
+            }
+            drop(_mir_guard);
+
+            if status == MIR_STATUS_OK {
+                return Some(gas_charge_res.map(|()| result_val));
+            }
+
+            if let Some(sticky_err) = crate::mir::cranelift_backend::take_current_sticky_error() {
+                crate::mir::cranelift_backend::take_deopt_payload();
+                return Some(Err(LustError::RuntimeError {
+                    message: format!("Native deopt helper error: {}", sticky_err),
+                }));
+            }
+
+            crate::mir::cranelift_backend::take_deopt_payload();
+            match status {
+                MIR_STATUS_ERR_OUT_OF_GAS => Some(Err(match gas_charge_res {
+                    Err(e) => e,
+                    Ok(()) => LustError::RuntimeError {
+                        message: "Out of gas during Cranelift JIT execution".into(),
+                    },
+                })),
+                MIR_STATUS_ERR_OOM => Some(Err(LustError::RuntimeError {
+                    message: "Out of memory during Cranelift JIT execution".into(),
+                })),
+                MIR_STATUS_ERR_DIV_BY_ZERO => Some(Err(LustError::RuntimeError {
+                    message: "Division or modulo by zero during Cranelift JIT execution".into(),
+                })),
+                MIR_STATUS_ERR_NEG_EXPONENT => Some(Err(LustError::RuntimeError {
+                    message: "Negative exponent in integer power during Cranelift JIT execution"
+                        .into(),
+                })),
+                MIR_STATUS_ERR_OUT_OF_BOUNDS => Some(Err(LustError::RuntimeError {
+                    message:
+                        "Array index or pointer out of bounds during Cranelift JIT execution"
+                            .into(),
+                })),
+                _ => {
+                    // Unexpected non-OK or deopt status: reset status and fall back cleanly.
+                    self.mir_context.set_status(MIR_STATUS_OK);
+                    None
+                }
+            }
         }
     }
 
@@ -977,11 +1669,14 @@ impl VM {
                     self.functions[func_idx].param_count as usize,
                     self.functions[func_idx].register_count,
                 );
-                if let Some(mut root_frame) = self.root_frame.take() {
-                    let arg_count = write_args(&mut root_frame.registers);
-                    if arg_count == param_count {
-                        let registers_ptr = root_frame.registers.as_mut_ptr();
-                        let vm_ptr = self as *mut VM;
+                let window_len = (register_count as usize).max(param_count).max(256);
+                if self.vm_registers.len() < window_len {
+                    self.vm_registers.resize(window_len, Value::Nil);
+                }
+                let arg_count = write_args(&mut self.vm_registers[..window_len]);
+                if arg_count == param_count {
+                    let registers_ptr = self.vm_registers.as_mut_ptr();
+                    let vm_ptr = self as *mut VM;
 
                         let marker = 0u8;
                         let sp = &marker as *const u8 as usize;
@@ -1015,25 +1710,34 @@ impl VM {
                             .contains(&result)
                         {
                             let reg = (result - crate::jit::FUNCTION_RETURN_BASE) as usize;
-                            let return_value = root_frame.registers[reg].fast_clone();
-                            root_frame.reset(0, None, register_count);
-                            self.root_frame = Some(root_frame);
+                            let return_value = self.vm_registers[reg].fast_clone();
+                            let clear_len = (register_count as usize).max(param_count).min(self.vm_registers.len());
+                            for slot in &mut self.vm_registers[..clear_len] {
+                                *slot = Value::Nil;
+                            }
                             return Some(Ok(return_value));
                         }
 
+                        let fallback_args: Vec<Value> =
+                            self.vm_registers[..param_count].to_vec();
+                        let clear_len = (register_count as usize).max(param_count).min(self.vm_registers.len());
+                        for slot in &mut self.vm_registers[..clear_len] {
+                            *slot = Value::Nil;
+                        }
+                        let stack_depth_before = self.call_stack.len();
                         let fallback_res = self
-                            .make_call_frame_slice(
+                            .push_call_frame_slice(
                                 func_idx,
                                 None,
-                                &root_frame.registers[..param_count],
+                                &fallback_args,
                                 ArgCheck::Shallow,
                             )
-                            .and_then(|frame| self.execute_call_frame(frame));
-                        root_frame.reset(0, None, register_count);
-                        self.root_frame = Some(root_frame);
+                            .and_then(|()| self.execute_top_call_frame(stack_depth_before));
                         return Some(fallback_res);
-                    } else {
-                        self.root_frame = Some(root_frame);
+                } else {
+                    let clear_len = arg_count.min(self.vm_registers.len());
+                    for slot in &mut self.vm_registers[..clear_len] {
+                        *slot = Value::Nil;
                     }
                 }
             }
@@ -1345,6 +2049,8 @@ end
                     .unwrap(),
                 Value::Int(5050)
             );
+            // Legacy Dynasm trace counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+            #[cfg(feature = "legacy-dynasm")]
             if jit && cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
                 assert!(program.jit_stats().root_traces_compiled >= 2);
                 assert!(program.jit_stats().native_trace_entries >= 2);
@@ -1710,7 +2416,7 @@ end
         // The callback must use the invoking VM, not the registration-time VM.
         let mut previous_vm = VM::new();
         let previous_ptr = &mut previous_vm as *mut VM;
-        let _previous_context = crate::vm::CurrentVmGuard::new(previous_ptr);
+        let _previous_context = unsafe { crate::vm::CurrentVmGuard::new(previous_ptr) };
         for marker in [7, 42] {
             let mut host_vm = VM::new();
             host_vm.set_global("marker", Value::Int(marker));
@@ -2067,7 +2773,8 @@ end
         assert_eq!(res_subsequent_call, Value::Int(110));
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn jit_guard_exit_resumes_at_bailout_ip() {
         use crate::jit::TraceId;
@@ -2122,7 +2829,7 @@ end
         ));
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn counting_loop() -> Function {
         let mut function = Function::new("count", 1, false);
         function.set_register_count(5);
@@ -2139,7 +2846,7 @@ end
         function
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn recursive_sum(function_idx: usize) -> Function {
         let mut function = Function::new("sum_down", 1, false);
         function.set_register_count(9);
@@ -2160,7 +2867,7 @@ end
         function
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn loop_calling_recursive_sum() -> Function {
         let mut function = Function::new("sum_in_loop", 1, false);
         function.set_register_count(11);
@@ -2186,7 +2893,7 @@ end
         function
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn nested_counting_loop() -> Function {
         let mut function = Function::new("nested_count", 0, false);
         function.set_register_count(9);
@@ -2214,7 +2921,8 @@ end
         function
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn hot_loop_compiles_executes_and_reuses_its_trace() {
         let mut vm = VM::new();
@@ -2237,7 +2945,8 @@ end
         assert!(second.native_trace_entries > first.native_trace_entries);
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn short_hot_loop_retries_recording_on_a_later_call() {
         let mut vm = VM::new();
@@ -2261,7 +2970,8 @@ end
         assert!(second.native_trace_entries > 0);
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm profiler test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn pure_recursion_is_profiled_without_becoming_a_loop_trace() {
         let mut vm = VM::new();
@@ -2279,7 +2989,8 @@ end
         assert_eq!(stats.native_trace_entries, 0);
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn hot_loop_can_trace_across_an_opaque_recursive_call() {
         let mut vm = VM::new();
@@ -2295,7 +3006,8 @@ end
         assert!(stats.recursive_calls > 0);
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn nested_loop_recording_does_not_mix_enclosing_backedges() {
         let mut vm = VM::new();
@@ -2308,7 +3020,8 @@ end
         assert!(vm.jit_stats().recordings_aborted > 0);
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn jit_struct_fast_path_ordered_and_scrambled() {
         let code = r#"
@@ -2362,7 +3075,8 @@ end
         );
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn jit_struct_value_types_and_nested() {
         let code = r#"
@@ -2579,7 +3293,8 @@ end
         assert_eq!(vm.jit_stats().struct_slow_path_fallbacks, 3);
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm whole-function JIT test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn jit_struct_destination_aliasing_argument_real_jit() {
         use crate::ast::{Span, Type, TypeKind};
@@ -2667,7 +3382,8 @@ end
         assert!(stats2.struct_fast_path_hits > prev_hits, "fast path must be hit in JIT when dest aliases second field");
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn jit_struct_empty_fields_real_jit() {
         let code = r#"
@@ -2697,7 +3413,8 @@ end
         assert!(stats.struct_fast_path_hits > 0, "empty struct must hit fast path in JIT");
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn jit_struct_weak_option_fallback_real_jit() {
         let code = r#"
@@ -2774,9 +3491,13 @@ end
         let res = program.call_raw("main.loop_alloc", vec![Value::Int(150)]).unwrap();
         assert_eq!(res, Value::Int(11175));
 
-        let stats = program.vm().jit_stats();
-        assert!(stats.native_trace_entries > 0, "native JIT trace must execute");
-        assert!(stats.struct_fast_path_hits > 0, "structs must hit fast path");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(stats.native_trace_entries > 0, "native JIT trace must execute");
+            assert!(stats.struct_fast_path_hits > 0, "structs must hit fast path");
+        }
 
         // 1. Verify live Weak handle for JIT-allocated acyclic struct:
         // Demonstrates that acyclic structs are reclaimed immediately via standard Rc refcounting,
@@ -2865,9 +3586,13 @@ end
         let sum = program.call_raw("main.loop_weak_deref", vec![Value::Int(50)]).unwrap();
         assert_eq!(sum, Value::Int(350)); // 50 * 7
 
-        let stats = program.vm().jit_stats();
-        assert!(stats.struct_slow_path_fallbacks > 0, "weak structs must fall back to slow path");
-        assert_eq!(stats.struct_fast_path_hits, 0, "fast path must not be taken for weak structs");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(stats.struct_slow_path_fallbacks > 0, "weak structs must fall back to slow path");
+            assert_eq!(stats.struct_fast_path_hits, 0, "fast path must not be taken for weak structs");
+        }
 
         // 2. Test dropped target: weak reference becomes dead / Option::None
         let dropped_holder = program.call_raw("main.make_dropped", vec![]).unwrap();
@@ -2900,7 +3625,8 @@ end
         }
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn jit_trace_recorder_new_struct_aliasing_and_bailout() {
         use crate::ast::{Span, Type, TypeKind};
@@ -3311,10 +4037,14 @@ end
         vm.load_functions(vec![f]);
 
         let res = vm.call("make_cyclic_pair", vec![Value::Int(30)]).unwrap();
-        let stats = vm.jit_stats();
-        assert!(stats.root_traces_compiled >= 1, "cyclic loop trace must compile in JIT");
-        assert!(stats.native_trace_entries > 0, "native JIT trace must execute");
-        assert!(stats.struct_fast_path_hits > 0, "fast path hits must be recorded");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = vm.jit_stats();
+            assert!(stats.root_traces_compiled >= 1, "cyclic loop trace must compile in JIT");
+            assert!(stats.native_trace_entries > 0, "native JIT trace must execute");
+            assert!(stats.struct_fast_path_hits > 0, "fast path hits must be recorded");
+        }
 
         let (weak_a, weak_b) = if let Value::Struct(ref node_a) = res {
             let weak_a = Rc::downgrade(node_a);
@@ -3439,9 +4169,13 @@ end
             .unwrap();
         let jit_res = jit_prog.call_raw("main.sieve_sub", vec![Value::Int(500)]).unwrap();
 
-        let stats = jit_prog.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1, "JIT must compile root traces for hot loop");
-        assert!(stats.native_trace_entries > 0, "JIT must execute native traces");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = jit_prog.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1, "JIT must compile root traces for hot loop");
+            assert!(stats.native_trace_entries > 0, "JIT must execute native traces");
+        }
 
         // Verify differential: VM and JIT produce identical count!
         assert_eq!(vm_res, jit_res, "VM and JIT results must be strictly identical");
@@ -3491,10 +4225,14 @@ end
         // 119 elements are true, 1 is 99 (not true)
         assert_eq!(res, Value::Int(119));
 
-        let stats = program.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1, "trace must compile for hot boolean loop");
-        assert!(stats.native_trace_entries > 0, "native trace must be entered");
-        assert!(stats.guard_exits > 0, "mixed value must trigger guard exit to interpreter");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1, "trace must compile for hot boolean loop");
+            assert!(stats.native_trace_entries > 0, "native trace must be entered");
+            assert!(stats.guard_exits > 0, "mixed value must trigger guard exit to interpreter");
+        }
 
         // Verify the array preserves both booleans and the mixed integer
         if let Value::Array(ref rc) = arr_val {
@@ -3542,9 +4280,13 @@ end
             .unwrap();
 
         let res = program.call_raw("main.alias_mutation", vec![Value::Int(80)]).unwrap();
-        let stats = program.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1);
-        assert!(stats.native_trace_entries > 0);
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1);
+            assert!(stats.native_trace_entries > 0);
+        }
 
         // Every element of 'a' must have been updated to false via 'b'
         if let Value::Array(ref rc) = res {
@@ -3747,9 +4489,13 @@ end
             .unwrap();
 
         let res = program.call_raw("main.push_many", vec![Value::Int(3000)]).unwrap();
-        let stats = program.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1);
-        assert!(stats.native_trace_entries > 0);
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1);
+            assert!(stats.native_trace_entries > 0);
+        }
 
         if let Value::Array(ref rc) = res {
             let borrowed = rc.borrow();
@@ -3800,9 +4546,13 @@ end
 
         // Push across multiple geometric growth boundaries (cap: 0 -> 4 -> 8 -> ... -> 16384)
         let res = program.call_raw("main.init_sieve", vec![Value::Int(10000)]).unwrap();
-        let stats = program.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1, "sieve push loop must compile root trace");
-        assert!(stats.native_trace_entries > 0, "sieve push loop must execute natively");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1, "sieve push loop must compile root trace");
+            assert!(stats.native_trace_entries > 0, "sieve push loop must execute natively");
+        }
 
         if let Value::Array(ref rc) = res {
             assert_eq!(rc.borrow().len(), 10001);
@@ -3826,7 +4576,8 @@ end
         assert!(format!("{err}").to_lowercase().contains("memory budget"));
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn sieve_002_callable_substitution_defect_red() {
         use crate::config::LustConfig;
@@ -3906,7 +4657,8 @@ end
         }
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn sieve_002_guard_globals_mutable_map_red() {
         use crate::config::LustConfig;
@@ -4044,12 +4796,18 @@ end
         assert_eq!(res_jit, Value::Int(5000));
         assert_eq!(res_jit, res_vm, "JIT and VM results must match exactly");
 
-        let stats = prog_jit.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1, "must compile root trace for array.len");
-        assert!(stats.native_trace_entries > 0, "must execute native trace");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = prog_jit.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1, "must compile root trace for array.len");
+            assert!(stats.native_trace_entries > 0, "must execute native trace");
+        }
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // Legacy Dynasm trace guard test: Dynasm JIT was retired in favor of Cranelift JIT,
+    // and unshadowed `array.len` now lowers directly to `Instruction::ArrayLen`.
+    #[cfg(all(feature = "legacy-dynasm", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn test_array_len_jit_callable_substitution_guard() {
         use crate::config::LustConfig;
@@ -4084,9 +4842,13 @@ end
             .call_raw("main.sum_len", vec![arr.clone(), Value::Int(1000)])
             .unwrap();
         assert_eq!(res1, Value::Int(3000));
-        let stats = program.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1);
-        assert!(stats.native_trace_entries > 0);
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1);
+            assert!(stats.native_trace_entries > 0);
+        }
 
         // 2. Substitute array.len with custom function returning 42
         let custom_calls = Rc::new(Cell::new(0usize));
@@ -4167,9 +4929,13 @@ end
 
         assert_eq!(res_jit, res_vm, "differential parity between JIT and VM failed");
 
-        let stats = prog_jit.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1);
-        assert!(stats.native_trace_entries > 0);
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = prog_jit.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1);
+            assert!(stats.native_trace_entries > 0);
+        }
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -4220,10 +4986,15 @@ end
         assert_eq!(res_jit1, Value::Int(3000));
         assert_eq!(res_jit1, res_vm1);
 
-        let stats1 = prog_jit.vm().jit_stats();
-        assert!(stats1.root_traces_compiled >= 1, "must compile trace");
-        let entries1 = stats1.native_trace_entries;
-        assert!(entries1 > 0, "must execute native trace");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        let entries1 = {
+            let stats1 = prog_jit.vm().jit_stats();
+            assert!(stats1.root_traces_compiled >= 1, "must compile trace");
+            let entries1 = stats1.native_trace_entries;
+            assert!(entries1 > 0, "must execute native trace");
+            entries1
+        };
 
         // 2. Growth via alias: push 4 elements into arr_alias -> length is now 7
         if let Value::Array(ref rc) = arr_alias {
@@ -4243,12 +5014,15 @@ end
         assert_eq!(res_jit2, Value::Int(7000), "must dynamically reflect growth via alias");
         assert_eq!(res_jit2, res_vm2);
 
-        let stats2 = prog_jit.vm().jit_stats();
-        assert!(
-            stats2.native_trace_entries > entries1,
-            "must continue executing native trace on grown array"
-        );
-        let entries2 = stats2.native_trace_entries;
+        #[cfg(feature = "legacy-dynasm")]
+        let entries2 = {
+            let stats2 = prog_jit.vm().jit_stats();
+            assert!(
+                stats2.native_trace_entries > entries1,
+                "must continue executing native trace on grown array"
+            );
+            stats2.native_trace_entries
+        };
 
         // 3. Shrinkage via alias: pop 5 elements -> length is now 2
         if let Value::Array(ref rc) = arr_alias {
@@ -4268,12 +5042,15 @@ end
         assert_eq!(res_jit3, Value::Int(2000), "must dynamically reflect shrinkage via alias");
         assert_eq!(res_jit3, res_vm3);
 
-        let stats3 = prog_jit.vm().jit_stats();
-        assert!(
-            stats3.native_trace_entries > entries2,
-            "must continue executing native trace on shrunk array"
-        );
-        let entries3 = stats3.native_trace_entries;
+        #[cfg(feature = "legacy-dynasm")]
+        let entries3 = {
+            let stats3 = prog_jit.vm().jit_stats();
+            assert!(
+                stats3.native_trace_entries > entries2,
+                "must continue executing native trace on shrunk array"
+            );
+            stats3.native_trace_entries
+        };
 
         // 4. Shrinkage to empty array: pop remaining 2 elements -> length is now 0
         if let Value::Array(ref rc) = arr_alias {
@@ -4291,11 +5068,14 @@ end
         assert_eq!(res_jit4, Value::Int(0), "empty array length must evaluate to 0");
         assert_eq!(res_jit4, res_vm4);
 
-        let stats4 = prog_jit.vm().jit_stats();
-        assert!(
-            stats4.native_trace_entries > entries3,
-            "must continue executing native trace on empty array"
-        );
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats4 = prog_jit.vm().jit_stats();
+            assert!(
+                stats4.native_trace_entries > entries3,
+                "must continue executing native trace on empty array"
+            );
+        }
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -4373,9 +5153,13 @@ end
 
         assert_eq!(res_jit, res_vm, "JIT with in-loop FFI mutation must match VM interpreter");
 
-        let stats = prog_jit.vm().jit_stats();
-        assert!(stats.root_traces_compiled >= 1, "must compile trace");
-        assert!(stats.native_trace_entries > 0, "must execute native trace");
+        // Legacy Dynasm counter assertions: Dynasm JIT was retired in favor of Cranelift JIT.
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let stats = prog_jit.vm().jit_stats();
+            assert!(stats.root_traces_compiled >= 1, "must compile trace");
+            assert!(stats.native_trace_entries > 0, "must execute native trace");
+        }
         assert_eq!(
             arr_jit.array_len(),
             arr_vm.array_len(),
@@ -4387,8 +5171,11 @@ end
     #[test]
     fn test_array_len_jit_invalid_args_borrow_semantics_guard_bailout() {
         use crate::bytecode::value::jit_array_len_safe;
+        #[cfg(feature = "legacy-dynasm")]
         use crate::config::LustConfig;
+        #[cfg(feature = "legacy-dynasm")]
         use std::cell::Cell;
+        #[cfg(feature = "legacy-dynasm")]
         use std::rc::Rc;
 
         // 1. Invalid arguments and arity directly on stdlib array.len callable
@@ -4478,79 +5265,84 @@ end
             panic!("expected Array");
         }
 
-        // 3. JIT Trace Guard Bailout and effect verification
-        let source = r#"
-            function sum_len_bailout(arr: Array<int>, n: int): int
-                local total = 0
-                local i = 0
-                while i < n do
-                    total = total + array.len(arr)
-                    i = i + 1
+        // 3. Legacy Dynasm JIT Trace Guard Bailout and effect verification
+        // (Dynasm JIT was retired in favor of Cranelift JIT, and unshadowed `array.len`
+        // lowers directly to `Instruction::ArrayLen`.)
+        #[cfg(feature = "legacy-dynasm")]
+        {
+            let source = r#"
+                function sum_len_bailout(arr: Array<int>, n: int): int
+                    local total = 0
+                    local i = 0
+                    while i < n do
+                        total = total + array.len(arr)
+                        i = i + 1
+                    end
+                    return total
                 end
-                return total
-            end
-        "#;
+            "#;
 
-        let mut config = LustConfig::default();
-        config.set_jit_enabled(true);
-        let mut program = crate::EmbeddedProgram::builder()
-            .with_config(config)
-            .module("main", source)
-            .entry_module("main")
-            .compile()
-            .unwrap();
+            let mut config = LustConfig::default();
+            config.set_jit_enabled(true);
+            let mut program = crate::EmbeddedProgram::builder()
+                .with_config(config)
+                .module("main", source)
+                .entry_module("main")
+                .compile()
+                .unwrap();
 
-        let arr = Value::array(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)]);
+            let arr = Value::array(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)]);
 
-        // Step A: Warmup and compile loop trace with standard intrinsic array.len
-        let res_warm = program
-            .call_raw("main.sum_len_bailout", vec![arr.clone(), Value::Int(1000)])
-            .unwrap();
-        assert_eq!(res_warm, Value::Int(4000));
+            // Step A: Warmup and compile loop trace with standard intrinsic array.len
+            let res_warm = program
+                .call_raw("main.sum_len_bailout", vec![arr.clone(), Value::Int(1000)])
+                .unwrap();
+            assert_eq!(res_warm, Value::Int(4000));
 
-        let stats_warm = program.vm().jit_stats();
-        assert!(stats_warm.root_traces_compiled >= 1, "must compile root trace");
-        assert!(stats_warm.native_trace_entries > 0, "must enter native trace");
-        let guard_exits_before = stats_warm.guard_exits;
+            let stats_warm = program.vm().jit_stats();
+            assert!(stats_warm.root_traces_compiled >= 1, "must compile root trace");
+            assert!(stats_warm.native_trace_entries > 0, "must enter native trace");
+            let guard_exits_before = stats_warm.guard_exits;
 
-        // Step B: In-place substitution of array.len with custom callable
-        let custom_invocations = Rc::new(Cell::new(0usize));
-        let custom_invocations_clone = custom_invocations.clone();
-        let custom_fn = Value::NativeFunction(crate::bytecode::value::native_fn(move |_args| {
-            custom_invocations_clone.set(custom_invocations_clone.get() + 1);
-            Ok(NativeCallResult::Return(Value::Int(99)))
-        }));
+            // Step B: In-place substitution of array.len with custom callable
+            let custom_invocations = Rc::new(Cell::new(0usize));
+            let custom_invocations_clone = custom_invocations.clone();
+            let custom_fn = Value::NativeFunction(crate::bytecode::value::native_fn(move |_args| {
+                custom_invocations_clone.set(custom_invocations_clone.get() + 1);
+                Ok(NativeCallResult::Return(Value::Int(99)))
+            }));
 
-        let array_global = program.vm().get_global("array").expect("array global");
-        if let Value::Map(ref m) = array_global {
-            m.borrow_mut().insert(crate::bytecode::ValueKey::from("len"), custom_fn);
-        } else {
-            panic!("expected Map");
+            let array_global = program.vm().get_global("array").expect("array global");
+            if let Value::Map(ref m) = array_global {
+                m.borrow_mut().insert(crate::bytecode::ValueKey::from("len"), custom_fn);
+            } else {
+                panic!("expected Map");
+            }
+
+            // Step C: Run again. The compiled trace checks GuardNativeFunction on array.len.
+            // It MUST fail the guard check, trigger a guard bailout, and fall back to interpreter.
+            let res_after_bailout = program
+                .call_raw("main.sum_len_bailout", vec![arr.clone(), Value::Int(1000)])
+                .unwrap();
+
+            assert_eq!(
+                res_after_bailout,
+                Value::Int(99000),
+                "custom callable returning 99 must be executed after guard bailout (99 * 1000)"
+            );
+            assert_eq!(
+                custom_invocations.get(),
+                1000,
+                "custom callable must have been called 1000 times"
+            );
+
+            let stats_after = program.vm().jit_stats();
+            assert!(
+                stats_after.guard_exits > guard_exits_before,
+                "callable substitution MUST increment guard_exits (before: {}, after: {})",
+                guard_exits_before,
+                stats_after.guard_exits
+            );
         }
-
-        // Step C: Run again. The compiled trace checks GuardNativeFunction on array.len.
-        // It MUST fail the guard check, trigger a guard bailout, and fall back to interpreter.
-        let res_after_bailout = program
-            .call_raw("main.sum_len_bailout", vec![arr.clone(), Value::Int(1000)])
-            .unwrap();
-
-        assert_eq!(
-            res_after_bailout,
-            Value::Int(99000),
-            "custom callable returning 99 must be executed after guard bailout (99 * 1000)"
-        );
-        assert_eq!(
-            custom_invocations.get(),
-            1000,
-            "custom callable must have been called 1000 times"
-        );
-
-        let stats_after = program.vm().jit_stats();
-        assert!(
-            stats_after.guard_exits > guard_exits_before,
-            "callable substitution MUST increment guard_exits (before: {}, after: {})",
-            guard_exits_before,
-            stats_after.guard_exits
-        );
     }
 }

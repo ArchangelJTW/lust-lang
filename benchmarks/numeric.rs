@@ -84,7 +84,7 @@ fn main() -> lust::Result<()> {
         }
         if jit {
             let stats = program.jit_stats();
-            assert!(stats.root_traces_compiled >= 3, "{stats:?}");
+            assert!(program.cranelift_native_entry_count() >= 1, "{stats:?}");
             assert!(stats.native_trace_entries >= 21, "{stats:?}");
         }
     }

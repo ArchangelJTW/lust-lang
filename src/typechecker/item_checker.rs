@@ -69,6 +69,33 @@ impl TypeChecker {
                 }
                 Ok(())
             }
+            ItemKind::Schema(schema_def) => {
+                for field in &schema_def.fields {
+                    let canon_ty = self.canonicalize_type(&field.ty);
+                    self.validate_type(&canon_ty)?;
+                    for constraint in &field.constraints {
+                        if constraint.name == "regex" {
+                            if let Some(arg) = constraint.args.first() {
+                                if let ExprKind::Literal(Literal::String(pattern)) = &arg.kind {
+                                    #[cfg(feature = "std")]
+                                    if let Err(err) = crate::regex::compile_bounded(pattern) {
+                                        return Err(self.type_error_at(
+                                            format!("Invalid regex pattern '{}' in schema constraint: {}", pattern, err),
+                                            constraint.span,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ItemKind::TypeAlias { ty, .. } => {
+                let canon_ty = self.canonicalize_type(ty);
+                self.validate_type(&canon_ty)?;
+                Ok(())
+            }
         }
     }
 
@@ -145,6 +172,8 @@ impl TypeChecker {
 
         let prev_return_type = self.current_function_return_type.clone();
         let prev_return_spec = self.current_function_return_spec.clone();
+        let prev_function_name = self.current_function_name.clone();
+        self.current_function_name = Some(func.name.clone());
         let expected_body_return = if let Some(effects) = &func.effects {
             effects
                 .return_type
@@ -173,6 +202,7 @@ impl TypeChecker {
             }
         }
 
+        self.current_function_name = prev_function_name;
         self.current_function_return_type = prev_return_type;
         self.current_function_return_spec = prev_return_spec;
         self.current_trait_bounds = prev_trait_bounds;

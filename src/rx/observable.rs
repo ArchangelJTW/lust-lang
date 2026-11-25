@@ -265,6 +265,7 @@ pub fn interval<E: Clone + Send + 'static>(
             Ok(p) => p,
             Err(_) => return Err(RxError::Cancelled),
         };
+        control.attach_participant(participant_id);
 
         // Recursive tick scheduling closure
         struct TickScheduler<E: Clone + Send + 'static> {

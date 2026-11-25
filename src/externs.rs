@@ -1,4 +1,6 @@
 #![cfg(feature = "std")]
+// Host CLI / tooling boundary: extern file generator writes stub files to host filesystem.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use crate::embed::native_types::ModuleStub;
 use crate::{NativeExport, VM};

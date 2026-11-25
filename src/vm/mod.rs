@@ -1,15 +1,21 @@
-mod budget;
+pub mod budget;
+pub mod channel;
 mod corelib;
 pub(crate) mod cycle;
+#[cfg(feature = "cranelift")]
+pub mod osr;
 #[cfg(feature = "std")]
 pub mod stdlib;
 mod task;
-use self::budget::BudgetState;
-pub use self::task::{TaskId, TaskInstance, TaskManager, TaskState};
+pub mod cranelift_dispatch;
+#[path = "../telemetry/mod.rs"]
+pub mod telemetry;
+pub use self::budget::BudgetState;
+pub use self::task::{FiberContinuation, TaskId, TaskInstance, TaskManager, TaskState, WaitKey, YieldReason};
 pub(super) use crate::ast::{FieldOwnership, StructDef, Type, TypeKind};
 pub(super) use crate::bytecode::{
     FieldStorage, Function, Instruction, NativeCallResult, Register, StructLayout, TaskHandle,
-    Value,
+    Upvalue, Value,
 };
 #[cfg(feature = "std")]
 pub(super) use crate::embed::native_types::ModuleStub;
@@ -43,11 +49,37 @@ mod tracing;
 // Used by the std-only extern stub writers (`externs`, `packages`).
 #[cfg(feature = "std")]
 pub(crate) use self::api::format_doc_comment;
-pub use self::api::{NativeExport, NativeExportParam};
+pub use self::api::{
+    NativeEffectSpec, NativeExport, NativeExportParam, NativeGasPolicy, NativeMemoryPolicy,
+    NativePurity,
+};
+pub use self::execution::{
+    register_effect_finalizer, reset_effect_handler_state, MUTATION_M1_EXECUTION_COUNT,
+    MUTATION_M1_SKIP_GAS, MutationM1Guard,
+};
+pub use self::tasks::{
+    MUTATION_M2_EXECUTION_COUNT, MUTATION_M2_SKIP_PANIC_FINALIZER, MutationM2Guard,
+};
 pub(crate) use self::tracing::JitCallSite;
+#[cfg(feature = "std")]
+#[derive(Default)]
+pub(crate) struct CraneliftFallbackCache {
+    pub cranelift_gen: u64,
+    pub struct_gen: u64,
+    pub functions_len: usize,
+    /// `true` once every backward-jump target in `func_idx` is recorded in `osr_cold_sites`.
+    pub osr_exhausted_funcs: Vec<bool>,
+    /// Per-`func_idx` fast call state under `VmBackend::Cranelift`:
+    /// `0` = unprobed, `1` = known ineligible / trivial leaf subframe (stay in `'frame_fast`),
+    /// `2` = compiled Cranelift native entry (exit `'frame_fast` to run native code).
+    pub cranelift_call_state: Vec<u8>,
+}
+
 #[cfg(feature = "std")]
 thread_local! {
     static CURRENT_VM_STACK: RefCell<Vec<*mut VM>> = const { RefCell::new(Vec::new()) };
+    static CRANELIFT_FALLBACK_CACHES: RefCell<HashMap<crate::bytecode::value::VmId, Rc<RefCell<CraneliftFallbackCache>>>> =
+        RefCell::new(HashMap::default());
 }
 
 #[cfg(not(feature = "std"))]
@@ -134,32 +166,68 @@ where
     VM_STACK.with_mut(f)
 }
 
-pub(crate) fn push_vm_ptr(vm: *mut VM) {
+pub fn push_vm_ptr(vm: *mut VM) {
     with_vm_stack_mut(|stack| stack.push(vm));
 }
 
-pub(crate) fn pop_vm_ptr() {
+pub fn pop_vm_ptr() {
     with_vm_stack_mut(|stack| {
         stack.pop();
     });
 }
 
-fn current_vm_ptr() -> Option<*mut VM> {
-    with_vm_stack_ref(|stack| stack.last().copied())
+pub fn current_vm_ptr() -> Option<*mut VM> {
+    with_vm_stack_ref(|stack| stack.last().copied().filter(|p| !p.is_null()))
 }
 
-struct CurrentVmGuard;
+pub struct CurrentVmGuard {
+    vm: *mut VM,
+    _lua_guard: Option<crate::lua_compat::LuaCompatContextGuard>,
+    _mir_guard: Option<crate::mir::runtime_helpers::MirContextGuard>,
+}
 
 impl CurrentVmGuard {
-    fn new(vm: *mut VM) -> Self {
+    /// Creates a guard from a mutable reference to VM (safe).
+    pub fn from_vm(vm: &mut VM) -> Self {
+        unsafe { Self::new(vm as *mut VM) }
+    }
+
+    /// Creates a guard from a raw VM pointer.
+    ///
+    /// # Safety
+    /// Caller must ensure that `vm` is either null or points to a valid, live `VM` instance.
+    pub unsafe fn new(vm: *mut VM) -> Self {
         push_vm_ptr(vm);
-        Self
+        let (lua_guard, mir_guard) = if !vm.is_null() {
+            let vm_ref = unsafe { &*vm };
+            (
+                Some(vm_ref.lua_context.enter()),
+                Some(vm_ref.mir_context.enter()),
+            )
+        } else {
+            (None, None)
+        };
+        Self {
+            vm,
+            _lua_guard: lua_guard,
+            _mir_guard: mir_guard,
+        }
     }
 }
 
 impl Drop for CurrentVmGuard {
     fn drop(&mut self) {
-        pop_vm_ptr();
+        with_vm_stack_mut(|stack| {
+            if let Some(top) = stack.last() {
+                if *top == self.vm {
+                    stack.pop();
+                    return;
+                }
+            }
+            if let Some(pos) = stack.iter().rposition(|&p| p == self.vm) {
+                stack.remove(pos);
+            }
+        });
     }
 }
 
@@ -191,14 +259,256 @@ impl Drop for ActiveJitGuard {
     }
 }
 
+/// RAII gas scope guard for Cranelift top-frame dispatch and production OSR entry (`PERF-T4-1`).
+///
+/// - On **unbounded** VM entry (`vm_gas_budget.is_none()`): saves `gas_unbounded`, enables
+///   `gas_unbounded = true`, replenishes `gas_remaining` to `unbounded_gas_chunk()` if non-positive
+///   or above the active chunk override (preserving positive default balances so callers checking
+///   `gas_after < gas_before` observe real decrements while `lust_mir_gas_slow()` replenishes
+///   transparently on `< 0`), and restores `saved_unbounded` unconditionally on drop/exit.
+/// - On **finite** VM entry (`vm_gas_budget.is_some()`): disables `gas_unbounded`, initializes
+///   `gas_remaining` (never refunding outer spent gas on same-VM reentrancy), deducts exact
+///   net gas spent into `BudgetState` via `finish_and_charge()`, and synchronizes `gas_remaining`
+///   so reentrant callbacks never refund inner gas or double-charge outer frames.
+#[cfg(feature = "std")]
+pub(crate) struct GasScopeGuard {
+    mir_context: Rc<crate::mir::runtime_helpers::MirContext>,
+    vm_gas_budget: Option<u64>,
+    saved_unbounded: bool,
+    saved_gas: i64,
+    entry_snapshot: i64,
+    nested_charged_before: u64,
+    is_nested_same_vm: bool,
+    finalized: bool,
+}
+
+#[cfg(feature = "std")]
+impl GasScopeGuard {
+    pub(crate) fn enter(
+        mir_context: Rc<crate::mir::runtime_helpers::MirContext>,
+        vm_gas_budget: Option<u64>,
+        is_nested_same_vm: bool,
+    ) -> Self {
+        let saved_unbounded = mir_context.gas_unbounded();
+        let saved_gas = mir_context.gas_remaining();
+        let nested_charged_before = mir_context.nested_vm_gas_charged();
+
+        let entry_snapshot = match vm_gas_budget {
+            Some(rem_gas) => {
+                mir_context.set_gas_unbounded(false);
+                let vm_rem_i64 = i64::try_from(rem_gas).unwrap_or(i64::MAX);
+                let effective = if is_nested_same_vm {
+                    vm_rem_i64.min(saved_gas.max(0))
+                } else {
+                    vm_rem_i64
+                };
+                mir_context.set_gas(effective);
+                effective
+            }
+            None => {
+                mir_context.set_gas_unbounded(true);
+                let chunk = crate::mir::runtime_helpers::unbounded_gas_chunk();
+                if saved_gas <= 0 || saved_gas > chunk {
+                    mir_context.set_gas(chunk);
+                    chunk
+                } else {
+                    saved_gas
+                }
+            }
+        };
+
+        Self {
+            mir_context,
+            vm_gas_budget,
+            saved_unbounded,
+            saved_gas,
+            entry_snapshot,
+            nested_charged_before,
+            is_nested_same_vm,
+            finalized: false,
+        }
+    }
+
+    pub(crate) fn finish_and_charge(&mut self, budgets: &mut BudgetState) -> Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        self.finalized = true;
+        self.mir_context.set_gas_unbounded(self.saved_unbounded);
+
+        let gas_after = self.mir_context.gas_remaining();
+        let nested_delta = self
+            .mir_context
+            .nested_vm_gas_charged()
+            .saturating_sub(self.nested_charged_before);
+
+        match self.vm_gas_budget {
+            Some(_) => {
+                let total_drop = (self.entry_snapshot.saturating_sub(gas_after)).max(0) as u64;
+                let own_spent = total_drop.saturating_sub(nested_delta);
+                let charge_res = if own_spent > 0 {
+                    budgets.charge_gas(own_spent)
+                } else {
+                    Ok(())
+                };
+                if self.is_nested_same_vm && own_spent > 0 {
+                    self.mir_context.add_nested_vm_gas_charged(own_spent);
+                }
+                let updated_vm_rem = i64::try_from(
+                    budgets
+                        .gas
+                        .limit
+                        .map(|limit| limit.saturating_sub(budgets.gas.used))
+                        .unwrap_or(0),
+                )
+                .unwrap_or(i64::MAX);
+                if self.is_nested_same_vm {
+                    self.mir_context.set_gas(updated_vm_rem.min(gas_after));
+                } else {
+                    self.mir_context.set_gas(updated_vm_rem);
+                }
+                charge_res
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl Drop for GasScopeGuard {
+    fn drop(&mut self) {
+        if !self.finalized {
+            self.mir_context.set_gas_unbounded(self.saved_unbounded);
+            if self.vm_gas_budget.is_some() && !self.is_nested_same_vm {
+                self.mir_context.set_gas(self.saved_gas);
+            }
+        }
+    }
+}
+
 pub(super) const TO_STRING_TRAIT: &str = "ToString";
 pub(super) const TO_STRING_METHOD: &str = "to_string";
 pub(super) const HASH_KEY_TRAIT: &str = "HashKey";
 pub(super) const HASH_KEY_METHOD: &str = "to_hashkey";
+
+/// Bitmask constants for `VM::slow_path_flags`.
+///
+/// When `slow_path_flags == 0`, the interpreter dispatch loop skips all cold
+/// per-instruction preamble and gas-limit checks in a single branch.
+pub const SLOW_PATH_CURRENT_TASK: u8 = 1 << 0;
+pub const SLOW_PATH_PENDING_RETURN: u8 = 1 << 1;
+pub const SLOW_PATH_GAS_LIMIT: u8 = 1 << 2;
+pub const SLOW_PATH_QUANTUM_FUEL: u8 = 1 << 3;
+pub const SLOW_PATH_SKIP_GAS: u8 = 1 << 4;
+pub(crate) const SLOW_PATH_PREAMBLE_MASK: u8 =
+    SLOW_PATH_CURRENT_TASK | SLOW_PATH_PENDING_RETURN | SLOW_PATH_QUANTUM_FUEL;
+
+/// Execution backend selection for VM runtime dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VmBackend {
+    /// Baseline Bytecode VM interpreter (with Dynasm trace JIT where supported).
+    #[default]
+    Bytecode,
+    /// Native Cranelift JIT compilation backend via Lust MIR.
+    Cranelift,
+}
+
+/// Test-only bounded deopt spike configuration (default-off, per-VM, per-call, one-site).
+#[cfg(feature = "test-deopt")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeoptPayloadSource {
+    NativeExecution,
+    TestInjectedSeam,
+}
+
+#[cfg(feature = "test-deopt")]
+#[derive(Debug, Clone)]
+pub struct TestDeoptSpikeHook {
+    pub target_function: String,
+    pub deopt_block: usize,
+    pub triggered_count: usize,
+    pub max_triggers: usize,
+    pub expected_locals: Option<Vec<usize>>,
+    pub injected_payload: Option<crate::mir::cranelift_backend::DeoptPayload>,
+}
+
+#[cfg(feature = "test-deopt")]
+impl TestDeoptSpikeHook {
+    pub fn new(target_function: impl Into<String>, deopt_block: usize) -> Self {
+        Self {
+            target_function: target_function.into(),
+            deopt_block,
+            triggered_count: 0,
+            max_triggers: 1,
+            expected_locals: None,
+            injected_payload: None,
+        }
+    }
+
+    pub fn with_expected_locals(
+        target_function: impl Into<String>,
+        deopt_block: usize,
+        expected_locals: Vec<usize>,
+    ) -> Self {
+        Self {
+            target_function: target_function.into(),
+            deopt_block,
+            triggered_count: 0,
+            max_triggers: 1,
+            expected_locals: Some(expected_locals),
+            injected_payload: None,
+        }
+    }
+}
+
+#[cfg(feature = "cranelift")]
+#[derive(Debug, Clone)]
+pub struct CompiledDeoptRecipe {
+    pub func_name: String,
+    pub compilation_generation: u64,
+    pub block_id: usize,
+    pub site_kind: crate::mir::cranelift_backend::DeoptSiteKind,
+    pub precise_pc: usize,
+    pub proven_locals: Vec<(usize, crate::mir::ir::MirType)>,
+}
+
 pub struct VM {
     // Retain the host runtime's lookup function across dynamic-library boundaries.
     // Each extension can have its own copy of CURRENT_VM_STACK.
     current_vm_lookup: fn() -> Option<*mut VM>,
+    pub backend: VmBackend,
+    #[cfg(feature = "test-deopt")]
+    pub test_deopt_spike_hook: Option<TestDeoptSpikeHook>,
+    #[cfg(feature = "test-deopt")]
+    pub last_deopt_source: Option<DeoptPayloadSource>,
+    pub cranelift_entry_count: u64,
+    pub cranelift_compilation_count: u64,
+    pub cranelift_array_cache_hits: u64,
+    pub cranelift_array_cache_builds: u64,
+    pub(super) cranelift_dispatch_refine_count: u64,
+    pub(super) cranelift_struct_sync_count: u64,
+    pub(crate) cranelift_generation: u64,
+    pub(crate) cranelift_compiled_generation: u64,
+    pub(super) mir_context_struct_gen: u64,
+    pub(super) cranelift_compiled_struct_gen: u64,
+    #[cfg(feature = "cranelift")]
+    pub(crate) cranelift_jit: Option<crate::mir::cranelift_backend::jit_engine::CraneliftJitCompiler>,
+    #[cfg(feature = "cranelift")]
+    pub(crate) cranelift_recipes:
+        HashMap<(String, usize, crate::mir::cranelift_backend::DeoptSiteKind), CompiledDeoptRecipe>,
+    #[cfg(feature = "cranelift")]
+    pub(super) cranelift_fn_cache: Vec<Option<Rc<CompiledFnEntry>>>,
+    #[cfg(feature = "cranelift")]
+    pub(super) osr_engine: Option<crate::vm::osr::OsrEngine>,
+    #[cfg(feature = "cranelift")]
+    pub(super) osr_backedge_counts: HashMap<(usize, usize), u32>,
+    #[cfg(feature = "cranelift")]
+    pub(super) osr_cold_sites: hashbrown::HashSet<(usize, usize, u64, u64)>,
+    pub osr_compilation_count: u64,
+    pub(super) osr_last_cranelift_gen: u64,
+    pub(super) osr_last_struct_gen: u64,
+    pub mir_functions: HashMap<String, crate::mir::ir::MirFunction>,
+    pub cranelift_compiled: HashMap<String, *const u8>,
     pub(super) jit: JitState,
     /// Cells compiled code reads and writes through the VM pointer.
     pub(crate) jit_cells: crate::jit::JitCells,
@@ -207,26 +517,37 @@ pub struct VM {
     pub(crate) unit_enums: HashMap<(usize, usize), Rc<crate::bytecode::EnumObject>>,
     pub(super) budgets: BudgetState,
     /// Per-VM random stream. It is lazily initialized from the host entropy
-    /// source and can be made deterministic through `set_random_seed`.
+    /// source and can be made deterministic through `set_random_seed` / `set_seed`.
     #[cfg(feature = "std")]
-    random_rng: Option<rng::PortableRng>,
+    random_rng: core::cell::RefCell<Option<rng::PortableRng>>,
     pub(super) functions: Vec<Function>,
     /// Per-function facts the call path needs, indexed like `functions`
     /// (see `CallMeta`).
     pub(super) call_meta: Vec<CallMeta>,
+    /// Original pre-Cranelift bytecode (typically direct AST->Bytecode) backed up
+    /// transactionally whenever `compile_cranelift()` installs MIR continuation bytecode.
+    pub(super) ast_bytecode_backup: HashMap<usize, Function>,
     pub(super) natives: HashMap<String, Value>,
     pub(super) globals: HashMap<String, Value>,
+    /// Flat vector backing O(1) indexed `LoadGlobal` inside `'frame_fast: loop` (`NG-W11-3`).
+    pub(crate) globals_vec: Vec<Value>,
+    /// Maps global symbol name -> slot index in `globals_vec` (`NG-W11-3`).
+    pub(crate) global_name_to_slot: HashMap<String, u32>,
+    /// Generation counter for `LoadGlobal` IC invalidation (invariant: always >= 1).
+    pub(crate) globals_generation: u64,
     /// Bumped on every change to `globals` or `natives`. Traces snapshot
     /// the globals they read and guard on this counter (see
     /// `TraceOp::GuardGlobals`).
     pub(crate) globals_version: u64,
     pub(super) map_hasher: DefaultHashBuilder,
-    /// Frames are boxed: a `CallFrame` carries 12 KB of inline registers,
-    /// and moving that into and out of the stack on every call dominated
-    /// call cost. Returned frames go to `frame_pool` for reuse.
-    pub(super) call_stack: Vec<Box<CallFrame>>,
-    /// Recycled frames with their registers already reset to Nil.
-    pub(super) frame_pool: Vec<Box<CallFrame>>,
+    /// Budgeted allocator handle backing `vm_registers` (`NG-W9-2`, `NG-W11-4A`).
+    pub(crate) vm_alloc: crate::alloc_budget::VmAllocHandle,
+    /// Flat register stack backing all active `CallFrame` windows (`NG-W11-4A`).
+    pub(crate) vm_registers: Vec<Value, crate::alloc_budget::VmAllocHandle>,
+    /// Compact call-frame window descriptors stored by value (<= 96 bytes each, no `Box`).
+    pub(super) call_stack: Vec<CallFrame>,
+    /// Number of non-plain register slots cleared during the most recent frame pop (0 on pure-scalar frames).
+    pub(crate) last_frame_pop_cleanup_iters: usize,
     /// Resolved user-defined struct methods per call site:
     /// (struct layout, calling function, method-name constant) -> function.
     /// Resolution otherwise formats a mangled name and scans every function
@@ -246,7 +567,7 @@ pub struct VM {
     pub(super) skip_next_trace_record: bool,
     pub(super) trait_impls: HashMap<(String, String), bool>,
     pub(super) struct_tostring_cache: HashMap<usize, Rc<String>>,
-    pub(super) struct_metadata: HashMap<String, RuntimeStructInfo>,
+    pub(super) struct_metadata: StructMetadataRegistry,
     pub(super) call_until_depth: Option<usize>,
     pub(super) task_manager: TaskManager,
     pub(super) current_task: Option<TaskId>,
@@ -259,10 +580,28 @@ pub struct VM {
     #[cfg(feature = "std")]
     pub(super) exported_type_stubs: Vec<ModuleStub>,
     pub(super) last_dispatched_target: Option<(usize, String)>,
-    pub(super) root_frame: Option<Box<CallFrame>>,
     pub(super) active_native_depth: usize,
     pub(super) active_jit_depth: usize,
     pub host_ledger: TrustedHostResourceLedger,
+    #[cfg(feature = "std")]
+    pub rng: core::cell::RefCell<Box<dyn rand::Rng + Send>>,
+    pub id: crate::bytecode::value::VmId,
+    pub next_array_sequence_id: core::sync::atomic::AtomicU64,
+    pub array_id_map: core::cell::RefCell<HashMap<usize, crate::bytecode::value::ArraySequenceId>>,
+    pub lua_context: Rc<crate::lua_compat::LuaCompatContext>,
+    pub mir_context: Rc<crate::mir::runtime_helpers::MirContext>,
+    pub clock: alloc::sync::Arc<crate::sim::clock::LustClock>,
+    #[cfg(feature = "std")]
+    pub vfs: alloc::sync::Arc<dyn crate::vfs::VirtualFileSystem>,
+    #[cfg(feature = "std")]
+    pub env: crate::vfs::VirtualEnv,
+    #[cfg(feature = "std")]
+    pub console: crate::vfs::VirtualConsole,
+    pub quantum_fuel: Option<u64>,
+    pub(crate) slow_path_flags: u8,
+    pub(crate) has_active_finalizers: bool,
+    pub(crate) cycle_collections_count: u64,
+    pub config: crate::config::LustConfig,
 }
 
 pub type HostResourceCleanupFn = fn(usize);
@@ -271,12 +610,15 @@ pub type HostResourceCleanupFn = fn(usize);
 pub struct HostResourceSlot {
     pub handle: usize,
     pub cleanup: HostResourceCleanupFn,
+    pub generation: u32,
+    pub scope_id: u64,
     pub active: bool,
 }
 
 pub struct TrustedHostResourceLedger {
     pub slots: [HostResourceSlot; 256],
     pub count: usize,
+    pub next_generation: u32,
 }
 
 impl Default for TrustedHostResourceLedger {
@@ -291,9 +633,12 @@ impl TrustedHostResourceLedger {
             slots: [HostResourceSlot {
                 handle: 0,
                 cleanup: |_| {},
+                generation: 1,
+                scope_id: 0,
                 active: false,
             }; 256],
             count: 0,
+            next_generation: 1,
         }
     }
 
@@ -302,10 +647,25 @@ impl TrustedHostResourceLedger {
         handle: usize,
         cleanup: HostResourceCleanupFn,
     ) -> crate::error::Result<usize> {
+        self.acquire_scoped(handle, cleanup, 0)
+    }
+
+    pub fn acquire_scoped(
+        &mut self,
+        handle: usize,
+        cleanup: HostResourceCleanupFn,
+        scope_id: u64,
+    ) -> crate::error::Result<usize> {
         for (idx, slot) in self.slots.iter_mut().enumerate() {
             if !slot.active {
                 slot.handle = handle;
                 slot.cleanup = cleanup;
+                slot.generation = self.next_generation;
+                self.next_generation = self.next_generation.wrapping_add(1);
+                if self.next_generation == 0 {
+                    self.next_generation = 1;
+                }
+                slot.scope_id = scope_id;
                 slot.active = true;
                 self.count += 1;
                 return Ok(idx);
@@ -327,6 +687,18 @@ impl TrustedHostResourceLedger {
         }
     }
 
+    pub fn cleanup_scope(&mut self, scope_id: u64) {
+        for slot in self.slots.iter_mut().rev() {
+            if slot.active && slot.scope_id == scope_id {
+                slot.active = false;
+                (slot.cleanup)(slot.handle);
+                if self.count > 0 {
+                    self.count -= 1;
+                }
+            }
+        }
+    }
+
     pub fn cleanup_all(&mut self) {
         for slot in self.slots.iter_mut() {
             if slot.active {
@@ -339,6 +711,795 @@ impl TrustedHostResourceLedger {
 }
 
 impl VM {
+    #[inline(always)]
+    pub fn slow_path_flags(&self) -> u8 {
+        self.slow_path_flags
+    }
+
+    #[inline]
+    pub(crate) fn compute_slow_path_flags(&self) -> u8 {
+        let mut flags = 0u8;
+        if self.current_task.is_some() {
+            flags |= SLOW_PATH_CURRENT_TASK;
+        }
+        if self.pending_return_value.is_some() {
+            flags |= SLOW_PATH_PENDING_RETURN;
+        }
+        if self.budgets.gas.limit.is_some() {
+            flags |= SLOW_PATH_GAS_LIMIT;
+        }
+        if self.quantum_fuel.is_some() {
+            flags |= SLOW_PATH_QUANTUM_FUEL;
+        }
+        if MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed) {
+            flags |= SLOW_PATH_SKIP_GAS;
+        }
+        flags
+    }
+
+    #[inline]
+    pub(crate) fn sync_slow_path_flags(&mut self) {
+        self.slow_path_flags = self.compute_slow_path_flags();
+    }
+
+    #[inline]
+    pub fn cycle_collections_count(&self) -> u64 {
+        self.cycle_collections_count
+    }
+
+    #[inline]
+    pub fn globals_generation(&self) -> u64 {
+        self.globals_generation
+    }
+
+    #[inline]
+    pub(crate) fn sync_global_insert(&mut self, name: String, value: Value) {
+        if let Some(&slot) = self.global_name_to_slot.get(name.as_str()) {
+            self.globals_vec[slot as usize] = value.clone();
+        } else {
+            let slot = self.globals_vec.len() as u32;
+            self.globals_vec.push(value.clone());
+            self.global_name_to_slot.insert(name.clone(), slot);
+        }
+        self.globals.insert(name, value);
+        self.globals_version = self.globals_version.wrapping_add(1);
+        self.globals_generation = self.globals_generation.wrapping_add(1).max(1);
+    }
+
+    #[inline]
+    pub(crate) fn sync_globals_clear(&mut self) {
+        self.globals.clear();
+        self.globals_vec.clear();
+        self.global_name_to_slot.clear();
+        self.globals_version = self.globals_version.wrapping_add(1);
+        self.globals_generation = self.globals_generation.wrapping_add(1).max(1);
+    }
+
+    /// Returns the budgeted allocator handle backing `vm_registers`.
+    #[inline]
+    pub fn vm_alloc(&self) -> &crate::alloc_budget::VmAllocHandle {
+        &self.vm_alloc
+    }
+
+    /// Returns the current initialized length of the flat register stack `vm_registers`.
+    #[inline]
+    pub fn vm_registers_len(&self) -> usize {
+        self.vm_registers.len()
+    }
+
+    /// Returns the allocated capacity of the flat register stack `vm_registers`.
+    #[inline]
+    pub fn vm_registers_capacity(&self) -> usize {
+        self.vm_registers.capacity()
+    }
+
+    /// Returns the number of register cleanup iterations performed during the most recent frame pop.
+    /// Pure-scalar frames (`non_plain_mask == 0`) always report `0`.
+    #[inline]
+    pub fn last_frame_pop_cleanup_iters(&self) -> usize {
+        self.last_frame_pop_cleanup_iters
+    }
+
+    #[inline]
+    pub(crate) fn effective_reg_count(&self, func_idx: usize) -> u16 {
+        match self.functions.get(func_idx) {
+            Some(f) if f.register_count > 0 => (f.register_count as u16).max(f.param_count as u16),
+            _ => 256,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn next_frame_base_reg(&self) -> usize {
+        self.call_stack
+            .last()
+            .map(|f| f.base_reg + f.reg_count as usize)
+            .unwrap_or(0)
+    }
+
+    /// Returns an immutable slice over the register window of `call_stack[frame_idx]`.
+    #[inline]
+    pub fn frame_registers(&self, frame_idx: usize) -> &[Value] {
+        let frame = &self.call_stack[frame_idx];
+        let start = frame.base_reg;
+        let end = start + frame.reg_count as usize;
+        &self.vm_registers[start..end]
+    }
+
+    /// Returns a mutable slice over the register window of `call_stack[frame_idx]`.
+    #[inline]
+    pub fn frame_registers_mut(&mut self, frame_idx: usize) -> &mut [Value] {
+        let frame = &self.call_stack[frame_idx];
+        let start = frame.base_reg;
+        let end = start + frame.reg_count as usize;
+        &mut self.vm_registers[start..end]
+    }
+
+    /// Returns an immutable slice over the top call frame's register window.
+    #[inline]
+    pub fn top_frame_registers(&self) -> &[Value] {
+        let frame = self.call_stack.last().expect("top_frame_registers called on empty call stack");
+        let start = frame.base_reg;
+        let end = start + frame.reg_count as usize;
+        &self.vm_registers[start..end]
+    }
+
+    /// Returns a mutable slice over the top call frame's register window.
+    #[inline]
+    pub fn top_frame_registers_mut(&mut self) -> &mut [Value] {
+        let frame = self.call_stack.last().expect("top_frame_registers_mut called on empty call stack");
+        let start = frame.base_reg;
+        let end = start + frame.reg_count as usize;
+        &mut self.vm_registers[start..end]
+    }
+
+    /// Writes `value` into slot `reg` of `call_stack[frame_idx]`, maintaining `non_plain_mask`.
+    #[inline]
+    pub fn write_frame_register(&mut self, frame_idx: usize, reg: usize, value: Value) {
+        let frame = &mut self.call_stack[frame_idx];
+        debug_assert!(reg < frame.reg_count as usize);
+        if !value.is_plain() {
+            frame.mark_non_plain(reg);
+        }
+        let slot = frame.base_reg + reg;
+        self.vm_registers[slot] = value;
+    }
+
+    /// Ensures the top call frame has at least `required_regs` register slots in `vm_registers`
+    /// (Hazard 10: handles MIR inlining / SROA expanding locals beyond initial AST `register_count`).
+    pub(crate) fn ensure_top_frame_reg_capacity(&mut self, required_regs: usize) -> Result<usize> {
+        if required_regs > u16::MAX as usize {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Frame register capacity {} exceeds u16::MAX",
+                    required_regs
+                ),
+            });
+        }
+        let Some(top) = self.call_stack.last() else {
+            return Err(LustError::RuntimeError {
+                message: "Empty call stack".to_string(),
+            });
+        };
+        let base_reg = top.base_reg;
+        let cur_count = top.reg_count as usize;
+        if required_regs > cur_count {
+            let new_end = base_reg + required_regs;
+            if self.vm_registers.len() < new_end {
+                let extra = new_end - self.vm_registers.len();
+                self.vm_registers
+                    .try_reserve(extra)
+                    .map_err(|_| LustError::RuntimeError {
+                        message: "Out of memory expanding VM register window".to_string(),
+                    })?;
+                self.vm_registers.resize(new_end, Value::Nil);
+            } else {
+                for slot in &mut self.vm_registers[base_reg + cur_count..new_end] {
+                    *slot = Value::Nil;
+                }
+            }
+            if let Some(top_mut) = self.call_stack.last_mut() {
+                top_mut.reg_count = required_regs as u16;
+            }
+            return Ok(required_regs);
+        }
+        Ok(cur_count)
+    }
+
+    /// Allocates a new register window on `vm_registers`, pushes a `CallFrame`, and returns its frame index.
+    #[inline]
+    pub fn push_call_frame(
+        &mut self,
+        function_idx: usize,
+        reg_count: u16,
+        return_dest: Option<Register>,
+    ) -> usize {
+        let base_reg = self.next_frame_base_reg();
+        let needed = base_reg + reg_count as usize;
+        if self.vm_registers.len() < needed {
+            self.vm_registers.resize(needed, Value::Nil);
+        }
+        if let Some(meta) = self.call_meta.get_mut(function_idx) {
+            meta.active_depth = meta.active_depth.saturating_add(1);
+        }
+        let frame = CallFrame {
+            function_idx,
+            ip: 0,
+            base_reg,
+            reg_count,
+            return_dest,
+            non_plain_mask: 0,
+            upvalues: Vec::new(),
+            shared_upvalues: Vec::new(),
+            saved_registers: None,
+        };
+        self.call_stack.push(frame);
+        self.call_stack.len() - 1
+    }
+
+    /// Fallible frame window push enforcing `max_stack_depth` and `VmAllocHandle` OOM budgets.
+    #[inline]
+    pub(super) fn try_push_call_frame(
+        &mut self,
+        function_idx: usize,
+        reg_count: u16,
+        return_dest: Option<Register>,
+        upvalues: Vec<Value>,
+        shared_upvalues: Vec<Upvalue>,
+    ) -> Result<usize> {
+        if self.call_stack.len() >= self.max_stack_depth {
+            return Err(LustError::RuntimeError {
+                message: "Stack overflow".to_string(),
+            });
+        }
+        let base_reg = self.next_frame_base_reg();
+        let needed = base_reg + reg_count as usize;
+        if self.vm_registers.len() < needed {
+            let extra = needed - self.vm_registers.len();
+            self.vm_registers
+                .try_reserve(extra)
+                .map_err(|_| LustError::RuntimeError {
+                    message: "Out of memory allocating VM register window".to_string(),
+                })?;
+            self.vm_registers.resize(needed, Value::Nil);
+        }
+        if let Some(meta) = self.call_meta.get_mut(function_idx) {
+            meta.active_depth = meta.active_depth.saturating_add(1);
+        }
+        let frame = CallFrame {
+            function_idx,
+            ip: 0,
+            base_reg,
+            reg_count,
+            return_dest,
+            non_plain_mask: 0,
+            upvalues,
+            shared_upvalues,
+            saved_registers: None,
+        };
+        self.call_stack.push(frame);
+        Ok(self.call_stack.len() - 1)
+    }
+
+    #[inline]
+    pub(super) fn pop_call_frame(&mut self) -> Option<CallFrame> {
+        let frame = self.call_stack.pop()?;
+        if let Some(meta) = self.call_meta.get_mut(frame.function_idx) {
+            meta.active_depth = meta.active_depth.saturating_sub(1);
+        }
+        let start = frame.base_reg;
+        let end = (start + frame.reg_count as usize).min(self.vm_registers.len());
+        let cleared = if start < end {
+            CallFrame::clear_non_plain_slots(&mut self.vm_registers[start..end], frame.non_plain_mask)
+        } else {
+            0
+        };
+        self.last_frame_pop_cleanup_iters = cleared;
+        Some(frame)
+    }
+
+    #[inline]
+    pub(super) fn truncate_call_stack(&mut self, new_len: usize) {
+        while self.call_stack.len() > new_len {
+            let _ = self.pop_call_frame();
+        }
+    }
+
+    #[inline]
+    pub fn call_stack_depth(&self) -> usize {
+        self.call_stack.len()
+    }
+
+    /// Pops the top call frame and clears only its `non_plain_mask` register slots.
+    pub fn pop_call_frame_public(&mut self) -> Option<CallFrame> {
+        self.pop_call_frame()
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "test-deopt")]
+    pub fn push_call_frame_for_test(&mut self, mut frame: CallFrame) {
+        let saved = frame.saved_registers.take();
+        let saved_len = saved.as_ref().map_or(0, |v| v.len());
+        let reg_count = if frame.reg_count > 0 {
+            frame.reg_count.max(saved_len as u16)
+        } else if saved_len > 0 {
+            saved_len as u16
+        } else {
+            256
+        };
+        let base_reg = self.next_frame_base_reg();
+        let end = base_reg + reg_count as usize;
+        if self.vm_registers.len() < end {
+            self.vm_registers.resize(end, Value::Nil);
+        } else {
+            for slot in &mut self.vm_registers[base_reg..end] {
+                *slot = Value::Nil;
+            }
+        }
+        frame.non_plain_mask = 0;
+        if let Some(saved_vec) = saved {
+            for (i, val) in saved_vec.into_iter().enumerate().take(reg_count as usize) {
+                if !val.is_plain() {
+                    frame.mark_non_plain(i);
+                }
+                self.vm_registers[base_reg + i] = val;
+            }
+        }
+        frame.base_reg = base_reg;
+        frame.reg_count = reg_count;
+        if let Some(meta) = self.call_meta.get_mut(frame.function_idx) {
+            meta.active_depth = meta.active_depth.saturating_add(1);
+        }
+        self.call_stack.push(frame);
+    }
+
+    #[inline]
+    pub fn is_dynasm_retired() -> bool {
+        crate::jit::is_dynasm_retired()
+    }
+
+    #[inline]
+    pub fn set_dynasm_retired(retired: bool) {
+        crate::jit::set_dynasm_retired(retired);
+    }
+
+    #[inline]
+    pub fn dynasm_status() -> &'static str {
+        if crate::jit::is_dynasm_retired() {
+            "retired (safe fallback to Cranelift / interpreter)"
+        } else {
+            "legacy"
+        }
+    }
+
+    #[inline]
+    pub fn config(&self) -> &crate::config::LustConfig {
+        &self.config
+    }
+
+    #[inline]
+    pub fn charge_gas(&mut self, amount: u64) -> crate::error::Result<()> {
+        let res = self.budgets.charge_gas(amount);
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if res.is_ok() {
+                self.flush_gas_telemetry();
+            } else {
+                self.flush_gas_telemetry();
+                self.record_gas_exhausted("vm");
+            }
+        }
+        res
+    }
+
+    #[cfg(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    ))]
+    pub fn set_telemetry_sink(
+        &mut self,
+        sink: alloc::sync::Arc<dyn crate::vm::telemetry::TelemetrySink>,
+        mask: crate::vm::telemetry::TelemetrySignalMask,
+    ) {
+        self.budgets.telemetry_sink = Some(sink);
+        self.budgets.telemetry_mask = mask;
+    }
+
+    #[cfg(not(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    )))]
+    #[inline(always)]
+    pub fn set_telemetry_sink(
+        &mut self,
+        _sink: alloc::sync::Arc<dyn crate::vm::telemetry::TelemetrySink>,
+        _mask: crate::vm::telemetry::TelemetrySignalMask,
+    ) {
+    }
+
+    #[cfg(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    ))]
+    pub fn clear_telemetry_sink(&mut self) {
+        self.budgets.telemetry_sink = None;
+        self.budgets.telemetry_mask = crate::vm::telemetry::TelemetrySignalMask::NONE;
+    }
+
+    #[cfg(not(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    )))]
+    #[inline(always)]
+    pub fn clear_telemetry_sink(&mut self) {}
+
+    #[cfg(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    ))]
+    pub fn telemetry_sink(&self) -> Option<&alloc::sync::Arc<dyn crate::vm::telemetry::TelemetrySink>> {
+        self.budgets.telemetry_sink.as_ref()
+    }
+
+    #[cfg(not(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    )))]
+    #[inline(always)]
+    pub fn telemetry_sink(&self) -> Option<&alloc::sync::Arc<dyn crate::vm::telemetry::TelemetrySink>> {
+        None
+    }
+
+    #[cfg(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    ))]
+    pub fn telemetry_mask(&self) -> crate::vm::telemetry::TelemetrySignalMask {
+        self.budgets.telemetry_mask
+    }
+
+    #[cfg(not(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    )))]
+    #[inline(always)]
+    pub fn telemetry_mask(&self) -> crate::vm::telemetry::TelemetrySignalMask {
+        crate::vm::telemetry::TelemetrySignalMask::NONE
+    }
+
+    pub fn telemetry_snapshot(&self) -> crate::vm::telemetry::RuntimeTelemetrySnapshot {
+        let stats = self.jit_stats();
+        crate::vm::telemetry::RuntimeTelemetrySnapshot {
+            gas_used: self.gas_used(),
+            gas_remaining: self.gas_remaining(),
+            memory_used_bytes: self.memory_used(),
+            active_host_slots: self.host_ledger.count as u16,
+            jit_traces_compiled: stats.root_traces_compiled + stats.functions_compiled,
+            jit_guard_exits: stats.guard_exits,
+        }
+    }
+
+    #[inline]
+    pub fn flush_gas_telemetry(&mut self) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::GAS) {
+                    let current = self.budgets.gas.used;
+                    if current > self.budgets.last_gas_consumed_flushed {
+                        let delta = current - self.budgets.last_gas_consumed_flushed;
+                        self.budgets.last_gas_consumed_flushed = current;
+                        sink.counter_add("lust.vm.gas.consumed_total", delta, &[]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn record_gas_exhausted(&self, source: &str) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::GAS) {
+                    sink.counter_add("lust.vm.gas.exhausted_total", 1, &[("source", source)]);
+                }
+            }
+        }
+        let _ = source;
+    }
+
+    #[inline]
+    pub fn record_memory_used(&self, bytes: usize) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::MEMORY) {
+                    sink.gauge_set("lust.vm.memory.bytes_used", bytes as f64, &[]);
+                }
+            }
+        }
+        let _ = bytes;
+    }
+
+    #[inline]
+    pub fn record_memory_limit_rejection(&self) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::MEMORY) {
+                    sink.counter_add("lust.vm.memory.limit_rejections_total", 1, &[]);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn record_host_ledger_active(&self, count: u16) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::HOST_LEDGER) {
+                    sink.gauge_set("lust.vm.host_ledger.active_slots", count as f64, &[]);
+                }
+            }
+        }
+        let _ = count;
+    }
+
+    #[inline]
+    pub fn record_host_ledger_overflow(&self) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::HOST_LEDGER) {
+                    sink.counter_add("lust.vm.host_ledger.overflow_total", 1, &[]);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn notify_host_resource_acquired(&self) {
+        self.record_host_ledger_active(self.host_ledger.count as u16);
+    }
+
+    #[inline]
+    pub fn notify_host_resource_released(&self) {
+        self.record_host_ledger_active(self.host_ledger.count as u16);
+    }
+
+    #[inline]
+    pub fn record_jit_trace_compiled(&self, count: u64) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-jit"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::JIT) {
+                    sink.counter_add("lust.jit.traces_compiled_total", count, &[]);
+                }
+            }
+        }
+        let _ = count;
+    }
+
+    #[inline]
+    pub fn record_jit_bailout(&self, guard_kind: &str) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-jit"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::JIT) {
+                    sink.counter_add("lust.jit.bailouts_total", 1, &[("guard_kind", guard_kind)]);
+                }
+            }
+        }
+        let _ = guard_kind;
+    }
+
+    #[inline]
+    pub fn record_fiber_lifecycle(&self, event: &str) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-effects"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::EFFECTS) {
+                    sink.counter_add("lust.fiber.lifecycle_total", 1, &[("event", event)]);
+                }
+            }
+        }
+        let _ = event;
+    }
+
+    #[inline]
+    pub fn span_enter_effect(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-effects"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::EFFECTS) {
+                    return sink.span_enter(name, labels);
+                }
+            }
+        }
+        let _ = (name, labels);
+        0
+    }
+
+    #[inline]
+    pub fn span_exit_effect(&self, span_id: u64, status: crate::vm::telemetry::SpanStatus) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-effects"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::EFFECTS) {
+                    sink.span_exit(span_id, status);
+                }
+            }
+        }
+        let _ = (span_id, status);
+    }
+
+    #[inline]
+    pub fn record_telemetry_counter(&self, name: &str, delta: u64, labels: &[(&str, &str)]) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-user"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::USER) {
+                    sink.counter_add(name, delta, labels);
+                }
+            }
+        }
+        let _ = (name, delta, labels);
+    }
+
+    #[inline]
+    pub fn record_telemetry_gauge(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-user"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::USER) {
+                    sink.gauge_set(name, value, labels);
+                }
+            }
+        }
+        let _ = (name, value, labels);
+    }
+
+    #[inline]
+    pub fn record_telemetry_histogram(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-user"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::USER) {
+                    sink.histogram_record(name, value, labels);
+                }
+            }
+        }
+        let _ = (name, value, labels);
+    }
+
+    #[inline]
+    pub fn telemetry_span_enter(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-user"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::USER) {
+                    return sink.span_enter(name, labels);
+                }
+            }
+        }
+        let _ = (name, labels);
+        0
+    }
+
+    #[inline]
+    pub fn telemetry_span_exit(&self, span_id: u64, status: crate::vm::telemetry::SpanStatus) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-user"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::USER) {
+                    sink.span_exit(span_id, status);
+                }
+            }
+        }
+        let _ = (span_id, status);
+    }
+
     /// Whether the VM is currently idle (no executing call frame, native callback, or JIT code).
     #[inline]
     pub fn is_idle(&self) -> bool {
@@ -353,14 +1514,765 @@ impl VM {
 
     /// Whether JIT execution is effectively active.
     ///
-    /// When a memory budget is active, the effective execution policy switches to
-    /// the interpreter (Stage A) so existing logical array and growth checks apply.
-    /// This does not charge all allocations or guarantee RSS/physical memory containment;
-    /// other allocation classes and complete process containment are out of scope.
+    /// When a memory budget is active or Cranelift backend is selected, effective
+    /// Dynasm JIT execution is bypassed.
     #[inline]
     pub fn effective_jit_enabled(&self) -> bool {
-        self.jit.enabled && !self.budgets.mem_budget_enabled()
+        self.jit.enabled
+            && self.backend != VmBackend::Cranelift
+            && !self.budgets.mem_budget_enabled()
+            && self.quantum_fuel.is_none()
     }
+
+    /// Sets the execution backend for VM runtime dispatch.
+    #[inline]
+    pub fn set_backend(&mut self, backend: VmBackend) {
+        self.backend = backend;
+    }
+
+    /// Returns the current execution backend.
+    #[inline]
+    pub fn backend(&self) -> VmBackend {
+        self.backend
+    }
+
+    /// Sets JIT backend (alias for `set_backend`).
+    #[inline]
+    pub fn set_jit_backend(&mut self, backend: VmBackend) {
+        self.backend = backend;
+    }
+
+    /// Builder-style backend configuration.
+    #[inline]
+    pub fn with_backend(mut self, backend: VmBackend) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    pub(super) fn collect_direct_callees(&self) -> hashbrown::HashSet<String> {
+        let mut direct_callees: hashbrown::HashSet<String> =
+            self.functions.iter().map(|f| f.name.clone()).collect();
+        direct_callees.extend(self.mir_functions.keys().cloned());
+        direct_callees.extend(self.natives.keys().cloned());
+        direct_callees.extend(self.globals.keys().cloned());
+        direct_callees
+    }
+
+    pub fn function_by_name(&self, name: &str) -> Option<&Function> {
+        self.functions.iter().find(|f| f.name == name)
+    }
+
+    #[inline]
+    pub fn cranelift_dispatch_refine_count(&self) -> u64 {
+        self.cranelift_dispatch_refine_count
+    }
+
+    #[inline]
+    pub fn cranelift_struct_sync_count(&self) -> u64 {
+        self.cranelift_struct_sync_count
+    }
+
+    #[inline]
+    pub fn struct_metadata_generation(&self) -> u64 {
+        self.struct_metadata.generation()
+    }
+
+    #[inline]
+    pub fn mir_context_struct_gen(&self) -> u64 {
+        self.mir_context_struct_gen
+    }
+
+    pub(super) fn restore_all_ast_bytecode_backups(&mut self) {
+        for (func_idx, mut orig_fn) in self.ast_bytecode_backup.drain() {
+            if func_idx < self.functions.len() {
+                if orig_fn.signature.is_some() {
+                    orig_fn.trusted_signature = orig_fn.compute_trusted_signature();
+                }
+                let meta = CallMeta::of(&orig_fn);
+                self.functions[func_idx] = orig_fn;
+                if func_idx < self.call_meta.len() {
+                    self.call_meta[func_idx] = meta;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn osr_compilation_count(&self) -> u64 {
+        self.osr_compilation_count
+    }
+
+    #[cfg(feature = "cranelift")]
+    #[inline]
+    pub fn osr_cold_site_count(&self) -> usize {
+        self.osr_cold_sites.len()
+    }
+
+    pub(super) fn invalidate_osr_state(&mut self) {
+        #[cfg(feature = "cranelift")]
+        {
+            self.osr_engine = None;
+            self.osr_backedge_counts.clear();
+            self.osr_cold_sites.clear();
+        }
+        #[cfg(feature = "std")]
+        {
+            self.clear_cranelift_fallback_cache();
+        }
+    }
+
+    #[cfg(feature = "std")]
+    pub(super) fn clear_cranelift_fallback_cache(&self) {
+        CRANELIFT_FALLBACK_CACHES.with(|map| {
+            if let Some(entry) = map.borrow().get(&self.id)
+                && let Ok(mut cache) = entry.try_borrow_mut()
+            {
+                cache.osr_exhausted_funcs.clear();
+                cache.cranelift_call_state.clear();
+                cache.cranelift_gen = u64::MAX;
+                cache.struct_gen = u64::MAX;
+                cache.functions_len = 0;
+            }
+        });
+    }
+
+    #[cfg(feature = "std")]
+    pub(super) fn get_synced_cranelift_fallback_cache(
+        &self,
+    ) -> Rc<RefCell<CraneliftFallbackCache>> {
+        let cur_cl_gen = self.cranelift_generation;
+        let cur_struct_gen = self.struct_metadata.generation();
+        let cur_fn_len = self.functions.len();
+        let rc = CRANELIFT_FALLBACK_CACHES.with(|map| {
+            let mut map = map.borrow_mut();
+            Rc::clone(
+                map.entry(self.id)
+                    .or_insert_with(|| Rc::new(RefCell::new(CraneliftFallbackCache::default()))),
+            )
+        });
+        {
+            let mut cache = rc.borrow_mut();
+            if cache.cranelift_gen != cur_cl_gen
+                || cache.struct_gen != cur_struct_gen
+                || cache.functions_len != cur_fn_len
+            {
+                cache.cranelift_gen = cur_cl_gen;
+                cache.struct_gen = cur_struct_gen;
+                cache.functions_len = cur_fn_len;
+                cache.osr_exhausted_funcs.clear();
+                cache.osr_exhausted_funcs.resize(cur_fn_len, false);
+                cache.cranelift_call_state.clear();
+                cache.cranelift_call_state.resize(cur_fn_len, 0);
+            }
+        }
+        rc
+    }
+
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(super) fn is_trivial_leaf_method_fast(func: &Function) -> bool {
+        if !func.is_method || func.chunk.instructions.len() > 24 {
+            return false;
+        }
+        for insn in &func.chunk.instructions {
+            match insn {
+                Instruction::Jump(off)
+                | Instruction::JumpIf(_, off)
+                | Instruction::JumpIfNot(_, off)
+                | Instruction::BranchLtInt(_, _, off)
+                | Instruction::BranchLeInt(_, _, off) => {
+                    if *off < 0 {
+                        return false;
+                    }
+                }
+                Instruction::Call(..) | Instruction::CallMethod(..) | Instruction::Closure(..) => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    #[cfg(feature = "cranelift")]
+    pub(super) fn record_cranelift_call_probe(&mut self, func_idx: usize) {
+        #[cfg(feature = "test-deopt")]
+        if self.test_deopt_spike_hook.is_some() {
+            return;
+        }
+        let current_struct_gen = self.struct_metadata.generation();
+        if self.cranelift_compiled_generation == self.cranelift_generation
+            && self.cranelift_compiled_struct_gen == current_struct_gen
+            && self.cranelift_compiled.is_empty()
+            && self.mir_context_struct_gen != current_struct_gen
+        {
+            self.sync_mir_context_struct_metadata();
+        }
+        let Some(func) = self.functions.get(func_idx) else {
+            return;
+        };
+        let has_compiled = self.cranelift_compiled.contains_key(&func.name)
+            || self
+                .cranelift_fn_cache
+                .get(func_idx)
+                .and_then(|e| e.as_ref())
+                .is_some();
+        let is_deferred_dead = self
+            .cranelift_jit
+            .as_ref()
+            .is_some_and(|jit| jit.is_deferred_dead_helper(&func.name));
+        let stay_in_vm = if func.param_count > 6 || Self::is_trivial_leaf_method_fast(func) {
+            true
+        } else {
+            !has_compiled && !is_deferred_dead
+        };
+        let state = if stay_in_vm { 1u8 } else { 2u8 };
+        let rc = self.get_synced_cranelift_fallback_cache();
+        let mut cache = rc.borrow_mut();
+        if func_idx < cache.cranelift_call_state.len() {
+            cache.cranelift_call_state[func_idx] = state;
+        }
+    }
+
+    #[cfg(all(feature = "std", not(feature = "cranelift")))]
+    pub(super) fn record_cranelift_call_probe(&mut self, _func_idx: usize) {}
+
+    #[cfg(feature = "cranelift")]
+    fn mark_osr_site_cold_and_check_exhausted(
+        &mut self,
+        func_idx: usize,
+        cold_key: (usize, usize, u64, u64),
+    ) {
+        self.osr_cold_sites.insert(cold_key);
+        let all_cold = self.functions.get(func_idx).is_some_and(|func| {
+            if func.block_entry_pcs.is_empty() {
+                return true;
+            }
+            for (pc, inst) in func.chunk.instructions.iter().enumerate() {
+                let back_off = match *inst {
+                    Instruction::Jump(off)
+                    | Instruction::BranchLtInt(_, _, off)
+                    | Instruction::BranchLeInt(_, _, off)
+                        if off < 0 =>
+                    {
+                        Some(off)
+                    }
+                    _ => None,
+                };
+                if let Some(off) = back_off {
+                    let target = (pc as isize + 1 + off as isize) as usize;
+                    let key = (func_idx, target, cold_key.2, cold_key.3);
+                    if !self.osr_cold_sites.contains(&key) {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+        if all_cold {
+            let rc = self.get_synced_cranelift_fallback_cache();
+            let mut cache = rc.borrow_mut();
+            if func_idx < cache.osr_exhausted_funcs.len() {
+                cache.osr_exhausted_funcs[func_idx] = true;
+            }
+        }
+    }
+
+    /// Registers a MIR candidate for Cranelift JIT compilation without overwriting the
+    /// primary AST->Bytecode function in `self.functions`.
+    pub fn register_mir_candidate(&mut self, mir_fn: crate::mir::ir::MirFunction) {
+        let name = mir_fn.signature.name.clone();
+        self.mir_functions.insert(name, mir_fn);
+        self.cranelift_generation = self.cranelift_generation.wrapping_add(1).max(1);
+        self.cranelift_compiled_struct_gen = 0;
+        self.restore_all_ast_bytecode_backups();
+        #[cfg(feature = "cranelift")]
+        {
+            self.cranelift_jit = None;
+            self.cranelift_compiled.clear();
+            self.cranelift_recipes.clear();
+            self.cranelift_fn_cache.clear();
+        }
+        self.invalidate_osr_state();
+    }
+
+    /// Loads a MIR function into the VM, automatically generating its bytecode representation
+    /// for interpreter oracle parity while registering it for native Cranelift JIT compilation.
+    pub fn load_mir_function(&mut self, mir_fn: crate::mir::ir::MirFunction) -> Result<()> {
+        let mut direct_callees = self.collect_direct_callees();
+        direct_callees.insert(mir_fn.signature.name.clone());
+        self.load_mir_function_with_callees(mir_fn, &direct_callees)
+    }
+
+    fn load_mir_function_with_callees(
+        &mut self,
+        mir_fn: crate::mir::ir::MirFunction,
+        direct_callees: &hashbrown::HashSet<String>,
+    ) -> Result<()> {
+        let name = mir_fn.signature.name.clone();
+        let struct_layouts: hashbrown::HashMap<String, Rc<StructLayout>> = self
+            .struct_metadata
+            .iter()
+            .map(|(k, info)| (k.clone(), Rc::clone(&info.layout)))
+            .collect();
+        let mut bytecode_fn = if struct_layouts.is_empty() {
+            crate::mir::vm_backend::MirToBytecodeCompiler::compile_with_direct_callees(
+                &mir_fn,
+                direct_callees,
+            )
+        } else {
+            crate::mir::vm_backend::MirToBytecodeCompiler::compile_with_direct_callees_and_struct_layouts(
+                &mir_fn,
+                direct_callees,
+                &struct_layouts,
+            )
+        }
+        .map_err(|e| LustError::RuntimeError {
+            message: format!("Failed to lower MIR function '{}' to bytecode: {:?}", name, e),
+        })?;
+        if bytecode_fn.signature.is_some() {
+            bytecode_fn.trusted_signature = bytecode_fn.compute_trusted_signature();
+        }
+        let meta = CallMeta::of(&bytecode_fn);
+        let func_idx = if let Some(pos) = self.functions.iter().position(|f| f.name == name) {
+            bytecode_fn.is_method = self.functions[pos].is_method;
+            self.functions[pos] = bytecode_fn;
+            if pos < self.call_meta.len() {
+                self.call_meta[pos] = meta;
+            } else {
+                self.call_meta.push(meta);
+            }
+            pos
+        } else {
+            let idx = self.functions.len();
+            self.functions.push(bytecode_fn);
+            self.call_meta.push(meta);
+            idx
+        };
+        self.ast_bytecode_backup.remove(&func_idx);
+        self.sync_global_insert(name.clone(), Value::Function(func_idx));
+        self.jit.reset_function_tables(self.functions.len());
+        self.jit_cells.entry_table = self.jit.function_entry_table();
+        self.mir_functions.insert(name, mir_fn);
+        self.cranelift_generation = self.cranelift_generation.wrapping_add(1).max(1);
+        self.cranelift_compiled_struct_gen = 0;
+        #[cfg(feature = "cranelift")]
+        {
+            self.cranelift_jit = None;
+            self.cranelift_compiled.clear();
+            self.cranelift_recipes.clear();
+            self.cranelift_fn_cache.clear();
+        }
+        self.invalidate_osr_state();
+        Ok(())
+    }
+
+    /// Loads all functions from a MIR module into the VM.
+    pub fn load_mir_module(&mut self, module: &crate::mir::ir::MirModule) -> Result<()> {
+        let mut direct_callees = self.collect_direct_callees();
+        for mir_fn in &module.functions {
+            direct_callees.insert(mir_fn.signature.name.clone());
+        }
+        for mir_fn in &module.functions {
+            self.load_mir_function_with_callees(mir_fn.clone(), &direct_callees)?;
+        }
+        Ok(())
+    }
+
+    /// Attempts production On-Stack Replacement (OSR) at a hot loop backedge in Cranelift mode.
+    ///
+    /// Enforces all 5 Hazard 6 item 3 fail-closed preconditions, caches compiled OSR entries
+    /// keyed by `(func_idx, target_block, cranelift_generation, struct_metadata_generation)`,
+    /// reuses `self.mir_context` with synced gas/memory budgets, and deducts consumed budgets
+    /// on every exit path (`Completed`, `Deoptimized`, or `Error`).
+    #[cfg(all(feature = "std", not(feature = "cranelift")))]
+    pub(super) fn try_enter_osr_at_backedge(
+        &mut self,
+        _func_idx: usize,
+        _loop_start_ip: usize,
+    ) -> Result<Option<OsrBackedgeOutcome>> {
+        Ok(None)
+    }
+
+    #[cfg(feature = "cranelift")]
+    #[cold]
+    #[inline(never)]
+    pub(super) fn try_enter_osr_at_backedge(
+        &mut self,
+        func_idx: usize,
+        loop_start_ip: usize,
+    ) -> Result<Option<OsrBackedgeOutcome>> {
+        use core::sync::atomic::Ordering;
+
+        // Preconditions 1-3 (fail-closed)
+        if self.backend != VmBackend::Cranelift
+            || self.quantum_fuel.is_some()
+            || crate::vm::tracing::has_trace_hook()
+        {
+            return Ok(None);
+        }
+
+        // Precondition 4: active frame exists and has no upvalues
+        let has_upvalues = match self.call_stack.last() {
+            Some(frame) if frame.function_idx == func_idx => {
+                !frame.upvalues.is_empty() || !frame.shared_upvalues.is_empty()
+            }
+            _ => return Ok(None),
+        };
+        if has_upvalues {
+            return Ok(None);
+        }
+
+        // Invalidate OSR caches/cold markers automatically whenever generations advance
+        let cur_cl_gen = self.cranelift_generation;
+        let cur_struct_gen = self.struct_metadata.generation();
+        if self.osr_last_cranelift_gen != cur_cl_gen || self.osr_last_struct_gen != cur_struct_gen {
+            self.invalidate_osr_state();
+            self.osr_last_cranelift_gen = cur_cl_gen;
+            self.osr_last_struct_gen = cur_struct_gen;
+        }
+
+        let cold_key = (func_idx, loop_start_ip, cur_cl_gen, cur_struct_gen);
+        if self.osr_cold_sites.contains(&cold_key) {
+            self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
+            return Ok(None);
+        }
+
+        // Precondition 5 fast check: authoritative MIR continuation `block_entry_pcs` required
+        let has_block_pcs = self
+            .functions
+            .get(func_idx)
+            .is_some_and(|f| !f.block_entry_pcs.is_empty());
+        if !has_block_pcs {
+            self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
+            return Ok(None);
+        }
+
+        // Hot-backedge counter threshold
+        let count = self
+            .osr_backedge_counts
+            .entry((func_idx, loop_start_ip))
+            .or_insert(0);
+        *count = count.saturating_add(1);
+        if *count < crate::vm::osr::OSR_HOT_BACKEDGE_THRESHOLD {
+            return Ok(None);
+        }
+
+        // Precondition 5 authoritative lookup: map `loop_start_ip` to unique MIR loop header
+        let (func_name, mir_fn, target_block) = {
+            let Some(func) = self.functions.get(func_idx) else {
+                self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
+                return Ok(None);
+            };
+            let Some(mir_fn) = self.mir_functions.get(&func.name) else {
+                self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
+                return Ok(None);
+            };
+            let loop_headers = crate::mir::cranelift_backend::find_loop_headers(&mir_fn.blocks);
+            let mut matched_header: Option<usize> = None;
+            let mut ambiguous = false;
+            for (&block_id, &entry_pc) in &func.block_entry_pcs {
+                if entry_pc == loop_start_ip && loop_headers.contains(&block_id) {
+                    if matched_header.is_some() {
+                        ambiguous = true;
+                        break;
+                    }
+                    matched_header = Some(block_id);
+                }
+            }
+            let Some(target_block) = matched_header.filter(|_| !ambiguous) else {
+                self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
+                return Ok(None);
+            };
+            (func.name.clone(), mir_fn.clone(), target_block)
+        };
+
+        crate::vm::osr::GLOBAL_OSR_COUNTERS
+            .entry_attempts
+            .fetch_add(1, Ordering::SeqCst);
+
+        // Lazily initialize OSR engine on first eligible hot loop
+        if self.osr_engine.is_none() {
+            match crate::vm::osr::OsrEngine::new() {
+                Ok(engine) => self.osr_engine = Some(engine),
+                Err(_) => {
+                    crate::vm::osr::GLOBAL_OSR_COUNTERS
+                        .fallback_count
+                        .fetch_add(1, Ordering::SeqCst);
+                    self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
+                    return Ok(None);
+                }
+            }
+        }
+
+        let cache_key = crate::vm::osr::OsrCacheKey {
+            func_idx,
+            target_block,
+            cranelift_generation: cur_cl_gen,
+            struct_metadata_generation: cur_struct_gen,
+        };
+        let entry = {
+            let engine = self.osr_engine.as_mut().unwrap();
+            let prev_compilations = engine.compilation_count();
+            match engine.get_or_compile_osr_entry(
+                cache_key,
+                &mir_fn,
+                &self.functions[func_idx].block_entry_pcs,
+            ) {
+                Ok(entry) => {
+                    let after_compilations = engine.compilation_count();
+                    if after_compilations > prev_compilations {
+                        self.osr_compilation_count += after_compilations - prev_compilations;
+                    }
+                    entry
+                }
+                Err(_) => {
+                    crate::vm::osr::GLOBAL_OSR_COUNTERS
+                        .fallback_count
+                        .fetch_add(1, Ordering::SeqCst);
+                    self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
+                    return Ok(None);
+                }
+            }
+        };
+
+        let raw_args = {
+            let frame = self.call_stack.last().unwrap();
+            let regs = &self.vm_registers[frame.base_reg..frame.base_reg + frame.reg_count as usize];
+            match crate::vm::osr::OsrEngine::validate_and_pack_frame_args(&entry, frame, regs) {
+                Ok(args) => args,
+                Err(_) => {
+                    crate::vm::osr::GLOBAL_OSR_COUNTERS
+                        .fallback_count
+                        .fetch_add(1, Ordering::SeqCst);
+                    self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
+                    return Ok(None);
+                }
+            }
+        };
+
+        let baseline = self.mir_context.capture_baseline();
+        let mut native_entered = false;
+        let scoped_outcome = self.execute_osr_entry_scoped(
+            func_idx,
+            &func_name,
+            &entry,
+            &raw_args,
+            cold_key,
+            &mut native_entered,
+        );
+        self.mir_context
+            .clear_to_baselines(baseline.handles, baseline.buffers);
+
+        match scoped_outcome {
+            Ok(OsrScopedOutcome::Completed(val)) => {
+                crate::vm::osr::GLOBAL_OSR_COUNTERS
+                    .entry_successes
+                    .fetch_add(1, Ordering::SeqCst);
+                let finished = self.finish_return(val)?;
+                Ok(Some(OsrBackedgeOutcome::Return(finished)))
+            }
+            Ok(OsrScopedOutcome::DeoptimizedResume) => {
+                Ok(Some(OsrBackedgeOutcome::DeoptimizedResume))
+            }
+            Err(err) => {
+                crate::mir::cranelift_backend::take_current_sticky_error();
+                crate::mir::cranelift_backend::take_deopt_payload();
+                if native_entered {
+                    let _ = self.pop_call_frame();
+                }
+                Err(err)
+            }
+        }
+    }
+
+    #[cfg(feature = "cranelift")]
+    fn execute_osr_entry_scoped(
+        &mut self,
+        func_idx: usize,
+        func_name: &str,
+        entry: &crate::vm::osr::OsrCompiledEntry,
+        raw_args: &[i64],
+        cold_key: (usize, usize, u64, u64),
+        native_entered: &mut bool,
+    ) -> Result<OsrScopedOutcome> {
+        use crate::mir::cranelift_backend::{
+            MIR_STATUS_DEOPT, MIR_STATUS_ERR_DIV_BY_ZERO, MIR_STATUS_ERR_INTERRUPTED,
+            MIR_STATUS_ERR_NEG_EXPONENT, MIR_STATUS_ERR_OOM, MIR_STATUS_ERR_OUT_OF_BOUNDS,
+            MIR_STATUS_ERR_OUT_OF_GAS, MIR_STATUS_OK,
+        };
+        use core::sync::atomic::Ordering;
+
+        let _vm_guard = CurrentVmGuard::from_vm(self);
+
+        let vm_gas_budget = self.gas_remaining();
+        let vm_has_mem_budget = self.memory_budget_bytes().is_some();
+        let mem_limit = match self.memory_remaining_bytes() {
+            Some(rem_mem) => i64::try_from(rem_mem).unwrap_or(i64::MAX),
+            None => i64::MAX,
+        };
+
+        self.mir_context.set_status(MIR_STATUS_OK);
+        self.mir_context.set_memory_used(0);
+        self.mir_context.set_max_memory_limit(mem_limit);
+        let mut gas_guard = GasScopeGuard::enter(
+            Rc::clone(&self.mir_context),
+            vm_gas_budget,
+            self.active_jit_depth > 0,
+        );
+        self.sync_mir_context_struct_metadata();
+
+        self.cranelift_entry_count += 1;
+        *native_entered = true;
+        let invocation_id = self.cranelift_entry_count;
+        let frame_depth = self.call_stack.len();
+        let compiled_gen = self.cranelift_compiled_generation;
+        let _inv_guard = crate::mir::cranelift_backend::push_native_invocation_with_generation(
+            func_name.to_string(),
+            frame_depth,
+            invocation_id,
+            compiled_gen,
+        );
+        let _jit_guard = self.enter_jit_scope();
+
+        let execution_val = unsafe {
+            crate::vm::osr::invoke_osr_entry(entry.fn_ptr, raw_args, &entry.return_type)
+        };
+
+        let status = crate::mir::cranelift_backend::jit_engine::lust_mir_get_status();
+        let sticky_err = crate::mir::cranelift_backend::take_current_sticky_error();
+        let deopt_payload = crate::mir::cranelift_backend::take_deopt_payload();
+        drop(_jit_guard);
+        drop(_inv_guard);
+
+        // Deduct consumed gas and memory back into `self.budgets` on EVERY exit path.
+        let gas_charge_res = gas_guard.finish_and_charge(&mut self.budgets);
+
+        let mem_spent = usize::try_from(self.mir_context.memory_used().max(0)).unwrap_or(usize::MAX);
+        let mem_charge_res = if vm_has_mem_budget && mem_spent > 0 {
+            self.budgets.charge_mem_bytes(mem_spent)
+        } else {
+            Ok(())
+        };
+
+        if let Some(sticky) = sticky_err {
+            self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
+            return Err(LustError::RuntimeError {
+                message: format!("Native OSR deopt helper error: {}", sticky),
+            });
+        }
+
+        if status != MIR_STATUS_OK {
+            if status == MIR_STATUS_DEOPT {
+                // Mark site cold upfront so EVERY deopt path (both clean resume and
+                // fail-closed corrupted/unmapped deopt errors) suppresses future OSR thrashing.
+                self.mark_osr_site_cold_and_check_exhausted(func_idx, cold_key);
+                crate::vm::osr::GLOBAL_OSR_COUNTERS
+                    .deopt_count
+                    .fetch_add(1, Ordering::SeqCst);
+                gas_charge_res?;
+                mem_charge_res?;
+
+                let payload = deopt_payload.ok_or_else(|| LustError::RuntimeError {
+                    message: "OSR deopt status set but no deopt payload was captured".into(),
+                })?;
+
+                let p_ident = payload.frame_identity.as_ref().ok_or_else(|| {
+                    LustError::RuntimeError {
+                        message: "OSR deopt payload missing required strict frame identity".into(),
+                    }
+                })?;
+                if p_ident.func_name != func_name
+                    || p_ident.frame_depth != frame_depth
+                    || p_ident.invocation_id != invocation_id
+                    || p_ident.compilation_generation != compiled_gen
+                {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "OSR deopt payload frame identity mismatch: expected ({}, depth {}, inv {}, gen {}), got ({}, depth {}, inv {}, gen {})",
+                            func_name,
+                            frame_depth,
+                            invocation_id,
+                            compiled_gen,
+                            p_ident.func_name,
+                            p_ident.frame_depth,
+                            p_ident.invocation_id,
+                            p_ident.compilation_generation
+                        ),
+                    });
+                }
+
+                let deopt_exit = crate::vm::osr::DeoptExitState::from_payload_with_mapping(
+                    payload,
+                    crate::vm::osr::DeoptReason::Safepoint,
+                    &entry.live_local_types,
+                    Some(&self.functions[func_idx].block_entry_pcs),
+                )
+                .map_err(|e| LustError::RuntimeError {
+                    message: format!("OSR deopt payload conversion error: {e}"),
+                })?;
+
+                let (base_reg, reg_count) = self
+                    .call_stack
+                    .last()
+                    .map(|f| (f.base_reg, f.reg_count as usize))
+                    .ok_or_else(|| LustError::RuntimeError {
+                        message: "Call stack empty during OSR deopt reconstruction".into(),
+                    })?;
+                let top_frame = self.call_stack.last_mut().unwrap();
+                let regs = &mut self.vm_registers[base_reg..base_reg + reg_count];
+                deopt_exit
+                    .try_apply_authoritative_with_regs(top_frame, regs)
+                    .map_err(|e| LustError::RuntimeError {
+                        message: format!("OSR deopt authoritative frame application error: {e}"),
+                    })?;
+
+                return Ok(OsrScopedOutcome::DeoptimizedResume);
+            }
+
+            let primary_err = if status == MIR_STATUS_ERR_OUT_OF_GAS {
+                match gas_charge_res {
+                    Err(e) => e,
+                    Ok(()) => LustError::RuntimeError {
+                        message: "Out of gas during OSR execution".into(),
+                    },
+                }
+            } else if status == MIR_STATUS_ERR_OOM {
+                match mem_charge_res {
+                    Err(e) => e,
+                    Ok(()) => LustError::RuntimeError {
+                        message: "Out of memory during OSR execution".into(),
+                    },
+                }
+            } else if status == MIR_STATUS_ERR_INTERRUPTED {
+                LustError::RuntimeError {
+                    message: "Execution interrupted during OSR execution".into(),
+                }
+            } else {
+                let message = match status {
+                    MIR_STATUS_ERR_DIV_BY_ZERO => {
+                        "Division or modulo by zero during OSR execution".into()
+                    }
+                    MIR_STATUS_ERR_NEG_EXPONENT => {
+                        "Negative exponent in integer power during OSR execution".into()
+                    }
+                    MIR_STATUS_ERR_OUT_OF_BOUNDS => {
+                        "Array index or pointer out of bounds during OSR execution".into()
+                    }
+                    _ => format!("OSR native execution failed with status {}", status),
+                };
+                LustError::RuntimeError { message }
+            };
+            return Err(primary_err);
+        }
+
+        gas_charge_res?;
+        mem_charge_res?;
+
+        let val = execution_val.map_err(|msg| LustError::RuntimeError { message: msg })?;
+        Ok(OsrScopedOutcome::Completed(val))
+    }
+
 
     #[inline]
     pub(crate) fn enter_native_scope(&mut self) -> ActiveNativeGuard {
@@ -386,21 +2298,22 @@ impl VM {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct CallFrame {
-    pub(super) function_idx: usize,
-    pub(super) ip: usize,
-    /// In std mode this is a fixed [Value; 256] stored inline in the frame (no extra
-    /// indirection, JIT-compatible raw pointer layout). In no_std mode (no JIT) it is a
-    /// Vec sized to the function's actual register_count, saving the unused slots.
-    #[cfg(feature = "std")]
-    pub(super) registers: [Value; 256],
-    #[cfg(not(feature = "std"))]
-    pub(super) registers: Vec<Value>,
-    #[allow(dead_code)]
-    pub(super) base_register: usize,
-    pub(super) return_dest: Option<Register>,
-    pub(super) upvalues: Vec<Value>,
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallFrame {
+    pub function_idx: usize,
+    pub ip: usize,
+    /// Starting index of this frame's register window inside `VM::vm_registers`.
+    pub base_reg: usize,
+    /// Number of register slots allocated to this frame window (up to 256).
+    pub reg_count: u16,
+    pub return_dest: Option<Register>,
+    /// Bitmask of slots `0..63` (bit 63 = overflow for any slot `>= 63`) that hold non-plain (`!is_plain()`) values.
+    pub non_plain_mask: u64,
+    pub upvalues: Vec<Value>,
+    pub shared_upvalues: Vec<Upvalue>,
+    /// Detached register snapshot populated only for suspended fiber continuations and standalone OSR frames.
+    /// Active frames on `VM::call_stack` keep this as `None` (zero heap allocations).
+    pub saved_registers: Option<Box<Vec<Value>>>,
 }
 
 /// What a bytecode-to-bytecode call checks about its callee, computed
@@ -411,6 +2324,10 @@ pub(super) struct CallMeta {
     /// Lua-compat function (`LuaValue` params or multi-return): arguments
     /// are padded/truncated rather than counted. Takes the general path.
     pub(super) lua_function: bool,
+    /// True when the function signature is fully statically typed without dynamic
+    /// contracts (`Schema` / `LuaValue` / `Unknown` / `Infer` / generics / effects),
+    /// permitting internal bytecode calls to skip redundant shallow-type rechecks.
+    pub(super) trusted_signature: bool,
     /// Shallow kind check per parameter, when the signature is known and
     /// matches the parameter count.
     pub(super) params: Vec<ShallowKind>,
@@ -418,6 +2335,9 @@ pub(super) struct CallMeta {
     pub(super) return_kind: ShallowKind,
     /// A Lua multi-return function may return Nil for "nothing".
     pub(super) lua_multi_return: bool,
+    /// Number of currently active call frames for this function on `call_stack`,
+    /// enabling O(1) recursion detection without scanning `call_stack`.
+    pub(super) active_depth: u16,
 }
 
 /// The O(1) argument/return check for calls the typechecker validated:
@@ -492,6 +2412,7 @@ impl CallMeta {
         use crate::ast::TypeKind;
         let Some(signature) = &function.signature else {
             return Self {
+                trusted_signature: function.trusted_signature,
                 params: alloc::vec![ShallowKind::Any; function.param_count as usize],
                 ..Self::default()
             };
@@ -506,6 +2427,7 @@ impl CallMeta {
                 if matches!(&inner.kind, TypeKind::Named(name) if name == "LuaValue")
         );
         let lua_function = lua_params && (!signature.params.is_empty() || lua_multi_return);
+        let trusted_signature = !lua_function && function.compute_trusted_signature();
         let params = if signature.params.len() == function.param_count as usize {
             signature.params.iter().map(ShallowKind::of).collect()
         } else {
@@ -513,57 +2435,96 @@ impl CallMeta {
         };
         Self {
             lua_function,
+            trusted_signature,
             params,
             return_kind: ShallowKind::of(&signature.return_type),
             lua_multi_return,
+            active_depth: 0,
         }
     }
 }
 
-/// Upper bound on recycled frames kept around (each holds 12 KB).
-pub(super) const FRAME_POOL_LIMIT: usize = 64;
-
 impl CallFrame {
-    #[allow(unused_variables)]
-    pub(super) fn new(
+    /// Creates a compact window descriptor for a frame with `reg_count` slots.
+    #[inline]
+    pub fn new(
         function_idx: usize,
         return_dest: Option<Register>,
-        register_count: u8,
-    ) -> Box<Self> {
-        Box::new(Self {
+        reg_count: u16,
+    ) -> Self {
+        Self {
             function_idx,
             ip: 0,
-            #[cfg(feature = "std")]
-            registers: [const { Value::Nil }; 256],
-            #[cfg(not(feature = "std"))]
-            registers: alloc::vec![Value::Nil; register_count as usize],
-            base_register: 0,
+            base_reg: 0,
+            reg_count,
             return_dest,
+            non_plain_mask: 0,
             upvalues: Vec::new(),
-        })
+            shared_upvalues: Vec::new(),
+            saved_registers: None,
+        }
     }
 
-    /// Reset a frame that ran `function_idx` (which used the first
-    /// `register_count` registers) so it can be handed out again.
-    pub(super) fn reset(
-        &mut self,
-        function_idx: usize,
-        return_dest: Option<Register>,
-        register_count: u8,
-    ) {
-        for value in &mut self.registers[..register_count as usize] {
-            if value.is_plain() {
-                // SAFETY: nothing to drop.
-                unsafe { core::ptr::write(value, Value::Nil) };
-            } else {
-                *value = Value::Nil;
+    /// Creates a detached `CallFrame` with its own `saved_registers` buffer (used by standalone OSR/fiber tests).
+    #[inline]
+    pub fn new_detached(function_idx: usize, ip: usize, reg_count: u16) -> Self {
+        Self {
+            function_idx,
+            ip,
+            base_reg: 0,
+            reg_count,
+            return_dest: None,
+            non_plain_mask: 0,
+            upvalues: Vec::new(),
+            shared_upvalues: Vec::new(),
+            saved_registers: Some(Box::new(alloc::vec![Value::Nil; reg_count as usize])),
+        }
+    }
+
+    /// Marks slot `reg` as holding a non-plain (`!is_plain()`) value requiring cleanup on frame pop.
+    #[inline(always)]
+    pub fn mark_non_plain(&mut self, reg: usize) {
+        self.non_plain_mask |= 1u64 << reg.min(63);
+    }
+
+    /// Returns a slice of detached saved registers, if this frame holds a suspended/standalone snapshot.
+    #[inline]
+    pub fn saved_registers(&self) -> Option<&[Value]> {
+        self.saved_registers.as_deref().map(Vec::as_slice)
+    }
+
+    /// Returns a mutable slice of detached saved registers, if this frame holds a suspended/standalone snapshot.
+    #[inline]
+    pub fn saved_registers_mut(&mut self) -> Option<&mut [Value]> {
+        self.saved_registers.as_deref_mut().map(Vec::as_mut_slice)
+    }
+
+    /// Clears only register slots marked in `non_plain_mask` back to `Value::Nil`.
+    /// Returns the number of slots inspected/cleared (`0` on pure-scalar frames).
+    #[inline]
+    pub fn clear_non_plain_slots(regs: &mut [Value], non_plain_mask: u64) -> usize {
+        if non_plain_mask == 0 {
+            return 0;
+        }
+        let mut cleared = 0usize;
+        let mut low = non_plain_mask & !(1u64 << 63);
+        while low != 0 {
+            let bit = low.trailing_zeros() as usize;
+            low &= low - 1;
+            if bit < regs.len() {
+                regs[bit] = Value::Nil;
+                cleared += 1;
             }
         }
-        self.function_idx = function_idx;
-        self.ip = 0;
-        self.base_register = 0;
-        self.return_dest = return_dest;
-        self.upvalues.clear();
+        if (non_plain_mask & (1u64 << 63)) != 0 {
+            for slot in regs.iter_mut().skip(63) {
+                if !slot.is_plain() {
+                    *slot = Value::Nil;
+                }
+                cleared += 1;
+            }
+        }
+        cleared
     }
 }
 
@@ -572,9 +2533,121 @@ pub(super) struct RuntimeStructInfo {
     pub layout: Rc<StructLayout>,
 }
 
+/// Compiler-enforced encapsulating registry for VM struct layouts (Hazard 4 / PERF-T1-8).
+/// Every mutation bumps `generation` (invariant: always >= 1, never 0), making uncounted
+/// mutations impossible at compile time.
+#[derive(Clone)]
+pub(super) struct StructMetadataRegistry {
+    map: HashMap<String, RuntimeStructInfo>,
+    generation: u64,
+}
+
+impl StructMetadataRegistry {
+    pub(super) fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            generation: 1,
+        }
+    }
+
+    #[inline(always)]
+    fn bump(&mut self) {
+        self.generation = self.generation.wrapping_add(1).max(1);
+    }
+
+    #[inline(always)]
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(super) fn insert(
+        &mut self,
+        k: String,
+        v: RuntimeStructInfo,
+    ) -> Option<RuntimeStructInfo> {
+        self.bump();
+        self.map.insert(k, v)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn remove(&mut self, k: &str) -> Option<RuntimeStructInfo> {
+        self.bump();
+        self.map.remove(k)
+    }
+
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(super) fn replace_all(&mut self, map: HashMap<String, RuntimeStructInfo>) {
+        self.bump();
+        self.map = map;
+    }
+
+    #[inline]
+    pub(super) fn get(&self, k: &str) -> Option<&RuntimeStructInfo> {
+        self.map.get(k)
+    }
+
+    #[inline]
+    pub(super) fn contains_key(&self, k: &str) -> bool {
+        self.map.contains_key(k)
+    }
+
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&String, &RuntimeStructInfo)> {
+        self.map.iter()
+    }
+
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(super) fn as_map(&self) -> &HashMap<String, RuntimeStructInfo> {
+        &self.map
+    }
+
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(super) fn clone_map(&self) -> HashMap<String, RuntimeStructInfo> {
+        self.map.clone()
+    }
+}
+
+/// Outcome of a production VM OSR backedge attempt.
+#[cfg(feature = "std")]
+pub(super) enum OsrBackedgeOutcome {
+    /// OSR completed the function cleanly and delivered its return value via `finish_return`.
+    Return(Option<Value>),
+    /// OSR triggered safepoint deopt and authoritatively restored `frame.ip` + live locals.
+    DeoptimizedResume,
+}
+
+#[cfg(feature = "std")]
+enum OsrScopedOutcome {
+    Completed(Value),
+    DeoptimizedResume,
+}
+
+/// Direct `func_idx`-indexed compiled Cranelift metadata cache entry (Hazard 4 / PERF-T1-8).
+#[cfg(feature = "std")]
+#[derive(Clone)]
+pub(crate) struct CompiledFnEntry {
+    pub func_name: alloc::rc::Rc<str>,
+    pub code_ptr: *const u8,
+    pub param_types: Vec<crate::mir::ir::MirType>,
+    pub ret_type: crate::mir::ir::MirType,
+    pub local_types: Vec<crate::mir::ir::MirType>,
+    pub compiled_generation: u64,
+    pub struct_metadata_generation: u64,
+    pub readonly_params: Vec<bool>,
+    pub has_external_or_host_calls: bool,
+    pub is_pure_scalar_abi: bool,
+    pub sroa_recipes: Vec<crate::mir::ir::SroaStructRecipe>,
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum TaskSignal {
     Yield { dest: Register, value: Value },
+    YieldTimer {
+        dest: Register,
+        value: Value,
+        timer_id: crate::sim::clock::TimerId,
+    },
+    QuantumExhausted,
     Stop { value: Value },
 }
 
@@ -586,6 +2659,13 @@ impl Default for VM {
 
 impl Drop for VM {
     fn drop(&mut self) {
+        #[cfg(feature = "std")]
+        {
+            CRANELIFT_FALLBACK_CACHES.with(|map| {
+                map.borrow_mut().remove(&self.id);
+            });
+            execution::drop_pure_native_cache_for_vm(self.id);
+        }
         // Track A: Immediately release all native host resources with 0 gas and 0 alloc
         self.host_ledger.cleanup_all();
 
@@ -598,12 +2678,13 @@ impl Drop for VM {
         self.jit.traces.clear();
         self.functions.clear();
         self.natives.clear();
-        self.globals.clear();
-        self.globals_version = self.globals_version.wrapping_add(1);
+        self.sync_globals_clear();
         self.call_stack.clear();
+        self.vm_registers.clear();
         self.pending_return_value = None;
         self.pending_task_signal = None;
         self.last_task_signal = None;
+        self.sync_slow_path_flags();
         self.trace_recorder = None;
         self.nested_loop_exit_ip = None;
         self.task_manager = TaskManager::new();

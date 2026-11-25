@@ -45,9 +45,12 @@ pub struct Compiler {
     lambda_return_types: HashMap<String, HashMap<Span, Type>>,
     numeric_types: HashMap<String, HashMap<Span, NumericType>>,
     function_signatures: HashMap<String, FunctionSignature>,
+    pub(super) struct_defs: HashMap<String, crate::ast::StructDef>,
     minimal_runtime_types: bool,
     pub(super) use_mir: bool,
+    pub(super) collect_mir: bool,
     pub(super) strict_mir: bool,
+    pub(super) mir_functions: Vec<crate::mir::ir::MirFunction>,
     pub(super) thunk_return_target: Option<(Register, Vec<usize>)>,
 }
 
@@ -72,6 +75,7 @@ pub(super) struct BytecodeEffectThunk {
 #[derive(Debug, Clone)]
 pub(super) struct Scope {
     pub(super) locals: HashMap<String, (Register, bool)>,
+    pub(super) upvalues: HashMap<String, u8>,
     pub(super) effect_thunks: HashMap<String, BytecodeEffectThunk>,
     pub(super) depth: usize,
     pub(super) cleanups: Vec<ScopeCleanup>,
@@ -112,13 +116,20 @@ impl Compiler {
             lambda_return_types: HashMap::new(),
             numeric_types: HashMap::new(),
             function_signatures: HashMap::new(),
+            struct_defs: HashMap::new(),
             minimal_runtime_types: false,
             use_mir: false,
+            collect_mir: false,
             strict_mir: false,
+            mir_functions: Vec::new(),
             thunk_return_target: None,
         };
         compiler.configure_stdlib(&LustConfig::default());
         compiler
+    }
+
+    pub fn take_mir_functions(&mut self) -> Vec<crate::mir::ir::MirFunction> {
+        core::mem::take(&mut self.mir_functions)
     }
 
     pub fn set_minimal_runtime_types(&mut self, enabled: bool) {
@@ -127,12 +138,20 @@ impl Compiler {
 
     pub fn set_use_mir(&mut self, enabled: bool) {
         self.use_mir = enabled;
+        if enabled {
+            self.collect_mir = true;
+        }
+    }
+
+    pub fn set_collect_mir(&mut self, enabled: bool) {
+        self.collect_mir = enabled;
     }
 
     pub fn set_strict_mir(&mut self, enabled: bool) {
         self.strict_mir = enabled;
         if enabled {
             self.use_mir = true;
+            self.collect_mir = true;
         }
     }
 
@@ -140,6 +159,7 @@ impl Compiler {
     pub fn configure(&mut self, config: &LustConfig) {
         self.minimal_runtime_types = config.minimal_runtime_types();
         self.use_mir = config.use_mir();
+        self.collect_mir = config.use_mir() || config.cranelift_jit();
         self.strict_mir = config.strict_mir();
         self.configure_stdlib(config);
     }
@@ -256,8 +276,22 @@ impl Compiler {
         core::mem::take(&mut self.function_signatures)
     }
 
+    pub fn set_struct_defs(&mut self, defs: HashMap<String, crate::ast::StructDef>) {
+        self.struct_defs = defs;
+    }
+
+    pub(super) fn register_ast_struct_def(&mut self, def: &crate::ast::StructDef) {
+        let resolved = self.resolve_type_name(&def.name);
+        self.struct_defs
+            .entry(resolved)
+            .or_insert_with(|| def.clone());
+        self.struct_defs
+            .entry(def.name.clone())
+            .or_insert_with(|| def.clone());
+    }
+
     pub(super) fn is_stdlib_symbol(&self, name: &str) -> bool {
-        self.stdlib_symbols.contains(name)
+        self.stdlib_symbols.contains(name) || name.starts_with("__lust_")
     }
 
     pub(super) fn should_wrap_option(&self, span: Span) -> bool {
@@ -276,7 +310,9 @@ impl Compiler {
 
     fn assign_signature_by_name(&mut self, func_idx: usize, name: &str) {
         if let Some(signature) = self.function_signatures.get(name).cloned() {
-            self.functions[func_idx].set_signature(signature);
+            let func = &mut self.functions[func_idx];
+            func.set_signature(signature);
+            func.trusted_signature = func.compute_trusted_signature();
         }
     }
 
@@ -287,7 +323,9 @@ impl Compiler {
         return_type: &Option<Type>,
     ) {
         if let Some(signature) = Self::lambda_signature(params, return_type) {
-            self.functions[func_idx].set_signature(signature);
+            let func = &mut self.functions[func_idx];
+            func.set_signature(signature);
+            func.trusted_signature = func.compute_trusted_signature();
         }
     }
 
@@ -363,6 +401,7 @@ impl Compiler {
             ExprKind::Return(_) => "return expression",
             ExprKind::Range { .. } => "range expression",
             ExprKind::EffectBlock(_) => "effect expression",
+            ExprKind::RegexLiteral { .. } => "regex literal",
         }
     }
 
@@ -459,6 +498,19 @@ impl Compiler {
                     format!("Effect<{}, {}, {}>", s, e, req_strs.join(" + "))
                 }
             }
+            TypeKind::Typeof(name) => format!("typeof {name}"),
+            TypeKind::InferType(inner) => format!("Infer<{}>", Self::type_to_string(&inner.kind)),
+            TypeKind::InferInput(inner) => {
+                format!("InferInput<{}>", Self::type_to_string(&inner.kind))
+            }
+            TypeKind::InferOutput(inner) => {
+                format!("InferOutput<{}>", Self::type_to_string(&inner.kind))
+            }
+            TypeKind::Schema { input, output, .. } => format!(
+                "Schema<{}, {}>",
+                Self::type_to_string(&input.kind),
+                Self::type_to_string(&output.kind)
+            ),
         }
     }
 

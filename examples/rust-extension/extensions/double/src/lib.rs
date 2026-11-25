@@ -1,12 +1,13 @@
 use lust::{
     ast::{Span, Type, TypeKind},
-    bytecode::{NativeCallResult, Value},
+    bytecode::Value,
     embed::{
         function_param, self_param, struct_field_decl, ExternRegistry, FunctionBuilder,
         ImplBuilder, StructBuilder, StructInstance,
     },
-    type_named, FromLustValue, NativeExport, NativeExportParam, VM,
+    type_named, VM,
 };
+use lust_macros::{lust_fn, lust_module};
 use std::rc::Rc;
 
 fn ty_int() -> Type {
@@ -17,7 +18,7 @@ fn ty_factor() -> Type {
     type_named("Factor")
 }
 
-fn register_types(vm: &mut VM) {
+pub fn register_types(vm: &mut VM) {
     let mut registry = ExternRegistry::new();
 
     let factor_struct = StructBuilder::new("Factor")
@@ -46,54 +47,23 @@ fn register_types(vm: &mut VM) {
     registry.register_with_vm(vm);
 }
 
-fn register_functions(vm: &mut VM) -> Result<(), String> {
-    register_types(vm);
+#[lust_module(name = "lust_double", abi = "both")]
+pub mod lust_double {
+    use super::*;
 
-    let export = NativeExport::new(
-        "host_double",
-        vec![NativeExportParam::new("value", "int")],
-        "int",
-    );
-    vm.register_exported_native(export, |values: &[Value]| {
-        let number = values
-            .get(0)
-            .and_then(|value| value.as_int())
-            .ok_or_else(|| "expected int argument".to_string())?;
-        Ok(NativeCallResult::Return(Value::Int(number * 2)))
-    });
+    #[lust_fn(pure)]
+    pub fn host_double(value: i64) -> i64 {
+        value * 2
+    }
 
-    let export = NativeExport::new(
-        "nested.host_quadruple",
-        vec![NativeExportParam::new("value", "int")],
-        "int",
-    );
-    vm.register_exported_native(export, |values: &[Value]| {
-        let number = values
-            .get(0)
-            .and_then(|value| value.as_int())
-            .ok_or_else(|| "expected int argument".to_string())?;
-        Ok(NativeCallResult::Return(Value::Int(number * 4)))
-    });
+    #[lust_fn(name = "nested.host_quadruple", pure)]
+    pub fn host_quadruple(value: i64) -> i64 {
+        value * 4
+    }
 
-    let export = NativeExport::new(
-        "make_factor",
-        vec![
-            NativeExportParam::new("base", "int"),
-            NativeExportParam::new("multiplier", "int"),
-        ],
-        "Factor",
-    );
-    vm.register_exported_native(export, |values: &[Value]| {
-        let base = values
-            .get(0)
-            .and_then(|value| value.as_int())
-            .ok_or_else(|| "expected base: int".to_string())?;
-        let multiplier = values
-            .get(1)
-            .and_then(|value| value.as_int())
-            .ok_or_else(|| "expected multiplier: int".to_string())?;
-
-        let factor_value = VM::with_current(|vm| {
+    #[lust_fn]
+    pub fn make_factor(base: i64, multiplier: i64) -> Result<Value, String> {
+        VM::with_current(|vm| {
             vm.instantiate_struct(
                 "lust_double.Factor",
                 vec![
@@ -102,44 +72,15 @@ fn register_functions(vm: &mut VM) -> Result<(), String> {
                 ],
             )
             .map_err(|err| err.to_string())
-        })?;
-        Ok(NativeCallResult::Return(factor_value))
-    });
-
-    let export = NativeExport::new(
-        "Factor:apply",
-        vec![
-            NativeExportParam::new("self", "Factor"),
-            NativeExportParam::new("value", "int"),
-        ],
-        "int",
-    );
-    vm.register_exported_native(export, |values: &[Value]| {
-        let factor_value = values
-            .get(0)
-            .cloned()
-            .ok_or_else(|| "expected Factor as first argument".to_string())?;
-        let factor = StructInstance::from_value(factor_value).map_err(|err| err.to_string())?;
-        let base: i64 = factor.field("base").map_err(|err| err.to_string())?;
-        let multiplier: i64 = factor.field("multiplier").map_err(|err| err.to_string())?;
-        let input = values
-            .get(1)
-            .and_then(|value| value.as_int())
-            .ok_or_else(|| "expected int value".to_string())?;
-        Ok(NativeCallResult::Return(Value::Int(
-            base * input * multiplier,
-        )))
-    });
-
-    Ok(())
-}
-
-#[no_mangle]
-pub extern "C" fn lust_extension_register(vm_ptr: *mut VM) -> bool {
-    if vm_ptr.is_null() {
-        return false;
+        })
     }
 
-    let vm = unsafe { &mut *vm_ptr };
-    register_functions(vm).is_ok()
+    #[lust_fn(name = "Factor:apply")]
+    pub fn factor_apply(factor: StructInstance, value: i64) -> Result<i64, String> {
+        let base: i64 = factor.field("base").map_err(|err| err.to_string())?;
+        let multiplier: i64 = factor.field("multiplier").map_err(|err| err.to_string())?;
+        Ok(base * value * multiplier)
+    }
 }
+
+pub use lust_double::*;

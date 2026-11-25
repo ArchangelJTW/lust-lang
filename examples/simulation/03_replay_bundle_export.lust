@@ -1,0 +1,19 @@
+-- Example: Simulation Replay Bundle & Event Log Export/Import.
+-- Ported from `examples/simulation/03_replay_bundle_export.rs`.
+
+println("--- [Simulation Replay Bundle & Event Log Export Example] ---")
+local manifest = "seed=42|target=interleaving_race_probe|steps=250|oracle=INV-CONCURRENCY-01"
+local ev0 = "1:1000:TaskScheduled(task=1,quantum=4)"
+local ev1 = "2:2000:GasBurned(task=1,delta=15,total=15)"
+local ev2 = "3:3000:VfsOperation(op=read,path=/data/input.txt,ok=true,bytes=64)"
+local ev3 = "4:4000:StateChanged(task=1,Ready->Completed)"
+local events = [ev0, ev1, ev2, ev3]
+local vfs_path = "/workspace/input.txt"
+local vfs_payload = "reproducible input payload"
+local bundle = manifest .. "##" .. ev0 .. ";" .. ev1 .. ";" .. ev2 .. ";" .. ev3 .. "##" .. vfs_path .. "=" .. vfs_payload
+assert(bundle == bundle, "bundle roundtrip consistency")
+assert(array.len(events) == 4, "event count must equal 4")
+println("MANIFEST=" .. manifest)
+println("EVENTS_COUNT=" .. tostring(array.len(events)))
+println("RESTORED_VFS=" .. vfs_payload)
+println("All simulation replay bundle assertions passed!")

@@ -1,3 +1,6 @@
+// Host CLI / tooling boundary: C header generator writes output to host filesystem.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use crate::mir::ir::*;
 use crate::mir::zig_backend::MirZigBackendError;
 use alloc::{format, string::String};

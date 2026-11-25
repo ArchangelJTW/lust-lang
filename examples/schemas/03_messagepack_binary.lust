@@ -1,0 +1,220 @@
+-- Example: Binary Document Serialization & Struct Materialization (BSON / MessagePack)
+-- Demonstrates binary document encoding/decoding, contiguous struct layout
+-- materialization, 64-bit integer preservation, and zero-copy binary views.
+
+use std.table
+
+struct BinaryFieldDesc
+    name: string
+    tag: string
+    byte_offset: int
+    byte_size: int
+    alignment: int
+end
+
+struct ContiguousLayout
+    type_name: string
+    total_size: int
+    max_align: int
+    fields: Array<BinaryFieldDesc>
+end
+
+struct SettlementRecord
+    transaction_id: int
+    label: string
+    confirmed: bool
+end
+
+struct BinaryView
+    raw_payload: string
+    layout: ContiguousLayout
+end
+
+impl BinaryView
+    function new(raw_payload: string, layout: ContiguousLayout): BinaryView
+        return BinaryView {
+            raw_payload = raw_payload,
+            layout = layout
+        }
+    end
+
+    function get_field_desc(self, field_name: string): Option<BinaryFieldDesc>
+        local flen = table.len(self.layout.fields)
+        for i = 0, flen - 1 do
+            local f = self.layout.fields[i]:unwrap()
+            if f.name == field_name then
+                return Option.Some(f)
+            end
+        end
+        return Option.None
+    end
+
+    function get_str(self, field_name: string): Option<string>
+        local desc_opt = self:get_field_desc(field_name)
+        if desc_opt:is_none() then return Option.None end
+        local desc = desc_opt:unwrap()
+        local s = string.sub(self.raw_payload, desc.byte_offset + 1, desc.byte_offset + desc.byte_size)
+        return Option.Some(s)
+    end
+
+    function get_bool(self, field_name: string): Option<bool>
+        local desc_opt = self:get_field_desc(field_name)
+        if desc_opt:is_none() then return Option.None end
+        local desc = desc_opt:unwrap()
+        local b_str = string.sub(self.raw_payload, desc.byte_offset + 1, desc.byte_offset + desc.byte_size)
+        return Option.Some(b_str == "1")
+    end
+
+    function get_int(self, field_name: string): Option<int>
+        local desc_opt = self:get_field_desc(field_name)
+        if desc_opt:is_none() then return Option.None end
+        local desc = desc_opt:unwrap()
+        local num_str = string.sub(self.raw_payload, desc.byte_offset + 1, desc.byte_offset + desc.byte_size)
+        return Option.Some(tonumber(num_str))
+    end
+end
+
+function build_settlement_layout(): ContiguousLayout
+    local fields = [
+        BinaryFieldDesc {
+            name = "transaction_id",
+            tag = "UInt64",
+            byte_offset = 0,
+            byte_size = 20,
+            alignment = 8
+        },
+        BinaryFieldDesc {
+            name = "confirmed",
+            tag = "Bool",
+            byte_offset = 20,
+            byte_size = 1,
+            alignment = 1
+        },
+        BinaryFieldDesc {
+            name = "label",
+            tag = "StringSlice",
+            byte_offset = 24,
+            byte_size = 22,
+            alignment = 8
+        }
+    ]
+    return ContiguousLayout {
+        type_name = "SettlementRecord",
+        total_size = 48,
+        max_align = 8,
+        fields = fields
+    }
+end
+
+function encode_settlement_record(record: SettlementRecord): string
+    -- Binary framing: magic header [BSON\x01] + fixed-width fields padded to layout
+    local id_str = tostring(record.transaction_id)
+    while string.len(id_str) < 20 do
+        id_str = string.format("0%s", id_str)
+    end
+    local bool_str = "0"
+    if record.confirmed then
+        bool_str = "1"
+    end
+    local pad3 = "   " -- 3 bytes padding from 21 to 24
+    return string.format("%s%s%s%s", id_str, bool_str, pad3, record.label)
+end
+
+function materialize_struct(view: BinaryView): Result<SettlementRecord, string>
+    local id_opt = view:get_int("transaction_id")
+    local bool_opt = view:get_bool("confirmed")
+    local label_opt = view:get_str("label")
+
+    if id_opt:is_none() or bool_opt:is_none() or label_opt:is_none() then
+        return Result.Err("Failed to materialize struct: incomplete binary fields")
+    end
+
+    return Result.Ok(SettlementRecord {
+        transaction_id = id_opt:unwrap(),
+        confirmed = bool_opt:unwrap(),
+        label = label_opt:unwrap()
+    })
+end
+
+suite "Binary Document Serialization & Struct Materialization Suite" do
+    test "binary document serialization and round-trip decoding" do
+        local original = SettlementRecord {
+            transaction_id = 1844674407370955161,
+            label = "settlement_batch_alpha",
+            confirmed = true
+        }
+
+        local layout = build_settlement_layout()
+        local binary_bytes = encode_settlement_record(original)
+
+        assert(string.len(binary_bytes) >= 40, "Binary payload must exceed 40 bytes")
+
+        local view = BinaryView.new(binary_bytes, layout)
+        local mat_res = materialize_struct(view)
+
+        assert(mat_res:is_ok())
+        local decoded = mat_res:unwrap()
+
+        assert_eq(decoded.transaction_id, original.transaction_id)
+        assert_eq(decoded.label, original.label)
+        assert_eq(decoded.confirmed, original.confirmed)
+    end
+
+    test "contiguous struct layout and field offset materialization" do
+        local layout = build_settlement_layout()
+        assert_eq(layout.type_name, "SettlementRecord")
+        assert_eq(layout.total_size, 48)
+        assert_eq(layout.max_align, 8)
+        assert_eq(table.len(layout.fields), 3)
+
+        local f0 = layout.fields[0]:unwrap()
+        assert_eq(f0.name, "transaction_id")
+        assert_eq(f0.byte_offset, 0)
+        assert_eq(f0.alignment, 8)
+
+        local f1 = layout.fields[1]:unwrap()
+        assert_eq(f1.name, "confirmed")
+        assert_eq(f1.byte_offset, 20)
+        assert_eq(f1.alignment, 1)
+
+        local f2 = layout.fields[2]:unwrap()
+        assert_eq(f2.name, "label")
+        assert_eq(f2.byte_offset, 24)
+        assert_eq(f2.alignment, 8)
+    end
+
+    test "zero-copy binary view field inspection without full document allocation" do
+        local original = SettlementRecord {
+            transaction_id = 9876543210,
+            label = "settlement_batch_alpha",
+            confirmed = true
+        }
+        local layout = build_settlement_layout()
+        local payload = encode_settlement_record(original)
+        local view = BinaryView.new(payload, layout)
+
+        -- Direct slice inspection via offsets
+        assert_eq(view:get_str("label"):unwrap(), "settlement_batch_alpha")
+        assert_eq(view:get_bool("confirmed"):unwrap(), true)
+        assert_eq(view:get_int("transaction_id"):unwrap(), 9876543210)
+        assert(view:get_str("unknown_field"):is_none())
+    end
+
+    test "preservation of 64-bit integers and boolean flags" do
+        local large_id = 922337203685477580
+        local record = SettlementRecord {
+            transaction_id = large_id,
+            label = "settlement_batch_alpha",
+            confirmed = false
+        }
+        local layout = build_settlement_layout()
+        local payload = encode_settlement_record(record)
+        local view = BinaryView.new(payload, layout)
+        local mat = materialize_struct(view):unwrap()
+
+        assert_eq(mat.transaction_id, large_id)
+        assert_eq(mat.confirmed, false)
+    end
+end
+
+println("All binary document assertions passed!")

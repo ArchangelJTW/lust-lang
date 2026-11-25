@@ -1,6 +1,165 @@
 use super::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum HoistedScalarConst {
+    Int(LustInt),
+    FloatBits(crate::number::FloatBits),
+    Bool(bool),
+    Function(usize),
+}
+
+impl HoistedScalarConst {
+    fn scope_key(self) -> String {
+        match self {
+            Self::Int(v) => Compiler::hoisted_int_key(v),
+            Self::FloatBits(bits) => Compiler::hoisted_float_key(bits),
+            Self::Bool(b) => Compiler::hoisted_bool_key(b),
+            Self::Function(idx) => Compiler::hoisted_fn_key(idx),
+        }
+    }
+}
+
 impl Compiler {
-    pub(super) fn compile_stmt(&mut self, stmt: &Stmt) -> Result<()> {
+    fn compile_scoped_statements(&mut self, mut statements: &[Stmt]) -> Result<()> {
+        while let Some((first, tail)) = statements.split_first() {
+            if let Some((second, rest)) = tail.split_first()
+                && let Some(fused) = self.fuse_map_get_local(first, second, rest)
+            {
+                self.compile_stmt(&fused)?;
+                statements = rest;
+            } else {
+                self.compile_stmt(first)?;
+                statements = tail;
+            }
+        }
+        Ok(())
+    }
+
+    fn fuse_map_get_local(&self, first: &Stmt, second: &Stmt, rest: &[Stmt]) -> Option<Stmt> {
+        let StmtKind::Local {
+            bindings,
+            initializer: Some(values),
+        } = &first.kind
+        else {
+            return None;
+        };
+        let ([found], [get]) = (bindings.as_slice(), values.as_slice()) else {
+            return None;
+        };
+        self.builtin_map_args(get, "get")?;
+        let StmtKind::Local {
+            bindings,
+            initializer: Some(values),
+        } = &second.kind
+        else {
+            return None;
+        };
+        let ([_], [unwrap]) = (bindings.as_slice(), values.as_slice()) else {
+            return None;
+        };
+        let ExprKind::MethodCall {
+            receiver,
+            method,
+            type_args: None,
+            args,
+        } = &unwrap.kind
+        else {
+            return None;
+        };
+        if method != "unwrap"
+            || !args.is_empty()
+            || !matches!(&receiver.kind, ExprKind::Identifier(name) if name == &found.name)
+            || self.should_wrap_option(get.span)
+        {
+            return None;
+        }
+        // Refuse nested scopes and deferred statements in the tail unless
+        // their references can be checked without relying on shadowing.
+        if rest
+            .iter()
+            .any(|stmt| Self::may_reference_local(stmt, &found.name))
+        {
+            return None;
+        }
+        // Earlier cleanups are compiled at scope exit and can still read locals.
+        if self.scopes.iter().any(|scope| !scope.cleanups.is_empty()) {
+            return None;
+        }
+        Some(Stmt::new(
+            StmtKind::Local {
+                bindings: bindings.clone(),
+                initializer: Some(vec![Expr::new(
+                    ExprKind::MethodCall {
+                        receiver: Box::new(get.clone()),
+                        method: method.clone(),
+                        type_args: None,
+                        args: Vec::new(),
+                    },
+                    unwrap.span,
+                )]),
+            },
+            second.span,
+        ))
+    }
+
+    fn may_reference_local(stmt: &Stmt, name: &str) -> bool {
+        fn mentions(expr: &Expr, name: &str) -> bool {
+            let contains = |expr: &Expr| mentions(expr, name);
+            match &expr.kind {
+                ExprKind::Identifier(identifier) => identifier == name,
+                ExprKind::Literal(_) | ExprKind::RegexLiteral { .. } => false,
+                ExprKind::Binary { left, right, .. }
+                | ExprKind::Range {
+                    start: left,
+                    end: right,
+                    ..
+                }
+                | ExprKind::Index {
+                    object: left,
+                    index: right,
+                } => contains(left) || contains(right),
+                ExprKind::Unary { operand, .. }
+                | ExprKind::Paren(operand)
+                | ExprKind::FieldAccess {
+                    object: operand, ..
+                }
+                | ExprKind::Cast { expr: operand, .. }
+                | ExprKind::TypeCheck { expr: operand, .. }
+                | ExprKind::IsPattern { expr: operand, .. } => contains(operand),
+                ExprKind::Call { callee, args, .. }
+                | ExprKind::MethodCall {
+                    receiver: callee,
+                    args,
+                    ..
+                } => contains(callee) || args.iter().any(contains),
+                ExprKind::Array(args)
+                | ExprKind::Tuple(args)
+                | ExprKind::Return(args)
+                | ExprKind::EnumConstructor { args, .. } => args.iter().any(contains),
+                ExprKind::Map(entries) => entries
+                    .iter()
+                    .any(|(key, value)| contains(key) || contains(value)),
+                ExprKind::StructLiteral { fields, .. } => {
+                    fields.iter().any(|field| contains(&field.value))
+                }
+                _ => true,
+            }
+        }
+        let contains = |expr: &Expr| mentions(expr, name);
+        match &stmt.kind {
+            StmtKind::Local { initializer, .. } => initializer
+                .as_ref()
+                .is_some_and(|values| values.iter().any(contains)),
+            StmtKind::Assign { targets, values } => targets.iter().chain(values).any(contains),
+            StmtKind::CompoundAssign { target, value, .. } => contains(target) || contains(value),
+            StmtKind::Expr(expr) => contains(expr),
+            StmtKind::Return(values) => values.iter().any(contains),
+            StmtKind::Break | StmtKind::Continue => false,
+            _ => true,
+        }
+    }
+
+    pub fn compile_stmt(&mut self, stmt: &Stmt) -> Result<()> {
         self.current_line = stmt.span.start_line;
         match &stmt.kind {
             StmtKind::Local {
@@ -45,16 +204,22 @@ impl Compiler {
                                 }
                                 ExprKind::Identifier(src_name) => {
                                     if let Ok(src_reg) = self.resolve_local(src_name) {
-                                        if let Some(tk) = self.functions[self.current_function]
-                                            .register_types
-                                            .get(&src_reg)
-                                            .cloned()
+                                        if let Some(tk) = self
+                                            .functions
+                                            .get(self.current_function)
+                                            .and_then(|f| f.register_types.get(&src_reg).cloned())
                                         {
                                             self.register_type(reg, tk);
                                         }
                                     }
                                 }
-                                _ => {}
+                                _ => {
+                                    if let Some(struct_name) =
+                                        self.resolve_expr_struct_type(init_expr)
+                                    {
+                                        self.register_type(reg, TypeKind::Named(struct_name));
+                                    }
+                                }
                             }
                         }
                     }
@@ -147,11 +312,32 @@ impl Compiler {
                     {
                         let rhs_reg = self.compile_expr(right)?;
                         self.emit(Instruction::Concat(target_reg, target_reg, rhs_reg), 0);
+                        if let Some(upvalue_idx) = self.lookup_upvalue(target_name) {
+                            self.emit(Instruction::StoreUpvalue(upvalue_idx, target_reg), 0);
+                        }
                         if self.should_sync_module_local(target_name) {
                             self.emit_store_module_global(target_name, target_reg);
                         }
 
                         self.free_register(rhs_reg);
+                        return Ok(());
+                    }
+
+                    if let Some((tgt_obj, slot_idx, addend_expr)) =
+                        self.try_match_field_add_assign(&targets[0], &values[0])
+                    {
+                        let obj_reg = self.compile_expr(tgt_obj)?;
+                        let saved_freereg = self.next_register;
+                        let addend_reg = self.compile_expr(addend_expr)?;
+                        if self.next_register < saved_freereg {
+                            self.next_register = saved_freereg;
+                        }
+                        self.emit(
+                            Instruction::GetFieldAddSetInt(obj_reg, slot_idx, addend_reg),
+                            0,
+                        );
+                        self.free_register(addend_reg);
+                        self.free_register(obj_reg);
                         return Ok(());
                     }
 
@@ -195,54 +381,130 @@ impl Compiler {
                                     "Invalid compound assignment target".to_string(),
                                 ));
                             };
-                        let value_reg = self.compile_expr(value)?;
-                        let result_reg = self.allocate_register();
-                        let expression_start = self.current_chunk().instructions.len();
-                        self.compile_binary_op(
-                            *op,
-                            result_reg,
-                            target_reg,
-                            value_reg,
-                            (target.span, value.span),
-                        )?;
-                        if target_is_local {
-                            if result_reg != target_reg {
-                                self.move_result(target_reg, result_reg, expression_start);
-                                self.free_register(result_reg);
+                        let compound_imm = if !self.loop_contexts.is_empty()
+                            && self.numeric_type(target.span) == Some(NumericType::Int)
+                            && self.numeric_type(value.span) == Some(NumericType::Int)
+                        {
+                            match *op {
+                                BinaryOp::Add => Self::const_int_literal(value)
+                                    .and_then(|v| i8::try_from(v).ok()),
+                                BinaryOp::Sub => Self::const_int_literal(value)
+                                    .and_then(|v| v.checked_neg())
+                                    .and_then(|neg| i8::try_from(neg).ok()),
+                                _ => None,
                             }
-
-                            if self.should_sync_module_local(&target_name) {
-                                self.emit_store_module_global(&target_name, target_reg);
-                            }
-
-                            self.free_register(value_reg);
                         } else {
-                            self.emit_store_module_global(&target_name, result_reg);
-                            self.free_register(result_reg);
-                            self.free_register(value_reg);
-                            self.free_register(target_reg);
+                            None
+                        };
+                        if let Some(imm) = compound_imm {
+                            if target_is_local {
+                                self.emit(Instruction::AddIntImm(target_reg, target_reg, imm), 0);
+                                if let Some(upvalue_idx) = self.lookup_upvalue(&target_name) {
+                                    self.emit(Instruction::StoreUpvalue(upvalue_idx, target_reg), 0);
+                                }
+                                if self.should_sync_module_local(&target_name) {
+                                    self.emit_store_module_global(&target_name, target_reg);
+                                }
+                            } else {
+                                let result_reg = self.allocate_register();
+                                self.emit(Instruction::AddIntImm(result_reg, target_reg, imm), 0);
+                                self.emit_store_module_global(&target_name, result_reg);
+                                self.free_register(result_reg);
+                                self.free_register(target_reg);
+                            }
+                        } else {
+                            let value_reg = self.compile_expr(value)?;
+                            let result_reg = self.allocate_register();
+                            let expression_start = self.current_chunk().instructions.len();
+                            self.compile_binary_op(
+                                *op,
+                                result_reg,
+                                target_reg,
+                                value_reg,
+                                (target.span, value.span),
+                            )?;
+                            if target_is_local {
+                                if result_reg != target_reg {
+                                    self.move_result(target_reg, result_reg, expression_start);
+                                    self.free_register(result_reg);
+                                }
+
+                                if let Some(upvalue_idx) = self.lookup_upvalue(&target_name) {
+                                    self.emit(Instruction::StoreUpvalue(upvalue_idx, target_reg), 0);
+                                }
+
+                                if self.should_sync_module_local(&target_name) {
+                                    self.emit_store_module_global(&target_name, target_reg);
+                                }
+
+                                self.free_register(value_reg);
+                            } else {
+                                self.emit_store_module_global(&target_name, result_reg);
+                                self.free_register(result_reg);
+                                self.free_register(value_reg);
+                                self.free_register(target_reg);
+                            }
                         }
                     }
 
                     ExprKind::FieldAccess { object, field } => {
+                        let field_slot = self.resolve_struct_field_slot(object, field);
                         let obj_reg = self.compile_expr(object)?;
-                        let field_idx = self.add_string_constant(field);
-                        let cur_reg = self.allocate_register();
-                        self.emit(Instruction::GetField(cur_reg, obj_reg, field_idx), 0);
-                        let val_reg = self.compile_expr(value)?;
-                        let res_reg = self.allocate_register();
-                        self.compile_binary_op(
-                            *op,
-                            res_reg,
-                            cur_reg,
-                            val_reg,
-                            (target.span, value.span),
-                        )?;
-                        self.emit(Instruction::SetField(obj_reg, field_idx, res_reg), 0);
-                        self.free_register(res_reg);
-                        self.free_register(val_reg);
-                        self.free_register(cur_reg);
-                        self.free_register(obj_reg);
+                        if let Some((slot_idx, field_tk)) = field_slot {
+                            let is_int_add = *op == BinaryOp::Add
+                                && (matches!(field_tk, TypeKind::Int)
+                                    || self.numeric_type(target.span) == Some(NumericType::Int))
+                                && (self.numeric_type(value.span) == Some(NumericType::Int)
+                                    || matches!(value.kind, ExprKind::Literal(Literal::Integer(_))));
+                            if is_int_add {
+                                let saved_freereg = self.next_register;
+                                let val_reg = self.compile_expr(value)?;
+                                if self.next_register < saved_freereg {
+                                    self.next_register = saved_freereg;
+                                }
+                                self.emit(
+                                    Instruction::GetFieldAddSetInt(obj_reg, slot_idx, val_reg),
+                                    0,
+                                );
+                                self.free_register(val_reg);
+                                self.free_register(obj_reg);
+                            } else {
+                                let cur_reg = self.allocate_register();
+                                self.emit(Instruction::GetFieldSlot(cur_reg, obj_reg, slot_idx), 0);
+                                let val_reg = self.compile_expr(value)?;
+                                let res_reg = self.allocate_register();
+                                self.compile_binary_op(
+                                    *op,
+                                    res_reg,
+                                    cur_reg,
+                                    val_reg,
+                                    (target.span, value.span),
+                                )?;
+                                self.emit(Instruction::SetFieldSlot(obj_reg, slot_idx, res_reg), 0);
+                                self.free_register(res_reg);
+                                self.free_register(val_reg);
+                                self.free_register(cur_reg);
+                                self.free_register(obj_reg);
+                            }
+                        } else {
+                            let field_idx = self.add_string_constant(field);
+                            let cur_reg = self.allocate_register();
+                            self.emit(Instruction::GetField(cur_reg, obj_reg, field_idx), 0);
+                            let val_reg = self.compile_expr(value)?;
+                            let res_reg = self.allocate_register();
+                            self.compile_binary_op(
+                                *op,
+                                res_reg,
+                                cur_reg,
+                                val_reg,
+                                (target.span, value.span),
+                            )?;
+                            self.emit(Instruction::SetField(obj_reg, field_idx, res_reg), 0);
+                            self.free_register(res_reg);
+                            self.free_register(val_reg);
+                            self.free_register(cur_reg);
+                            self.free_register(obj_reg);
+                        }
                     }
 
                     ExprKind::Index { object, index } => {
@@ -276,8 +538,10 @@ impl Compiler {
             }
 
             StmtKind::Expr(expr) => {
-                let reg = self.compile_expr(expr)?;
-                self.free_register(reg);
+                if !self.try_compile_array_void_call(expr)? && !self.try_compile_map_set(expr)? {
+                    let reg = self.compile_expr(expr)?;
+                    self.free_register(reg);
+                }
             }
 
             StmtKind::If {
@@ -294,6 +558,12 @@ impl Compiler {
             }
 
             StmtKind::Return(values) => {
+                if self.functions.is_empty() {
+                    return Err(LustError::CompileError(
+                        "'return' outside of function".to_string(),
+                    ));
+                }
+
                 if self.thunk_return_target.is_some() {
                     if values.len() != 1 {
                         return Err(LustError::CompileError(
@@ -321,38 +591,68 @@ impl Compiler {
                     }
                 }
 
-                let ret_reg = if values.is_empty() {
-                    255
-                } else if values.len() == 1 {
-                    let expr_reg = self.compile_expr(&values[0])?;
-                    let dedicated_reg = self.next_local_slot();
-                    if let Some(scope) = self.scopes.first_mut() {
-                        scope.locals.insert(format!("(return_{})", dedicated_reg), (dedicated_reg, false));
+                let is_static_err = values.len() == 1 && match &values[0].kind {
+                    ExprKind::EnumConstructor { variant, .. } => variant == "Err",
+                    ExprKind::Call { callee, .. } => {
+                        if let ExprKind::FieldAccess { object, field } = &callee.kind {
+                            if let ExprKind::Identifier(type_name) = &object.kind {
+                                type_name == "Result" && field == "Err"
+                            } else {
+                                false
+                            }
+                        } else if let ExprKind::Identifier(fn_name) = &callee.kind {
+                            fn_name == "Err"
+                        } else {
+                            false
+                        }
                     }
-                    self.emit(Instruction::Move(dedicated_reg, expr_reg), 0);
-                    self.free_register(expr_reg);
-                    dedicated_reg
-                } else {
-                    let tuple_reg = self.compile_exprs_to_tuple(values)?;
-                    let dedicated_reg = self.next_local_slot();
-                    if let Some(scope) = self.scopes.first_mut() {
-                        scope.locals.insert(format!("(return_{})", dedicated_reg), (dedicated_reg, false));
-                    }
-                    self.emit(Instruction::Move(dedicated_reg, tuple_reg), 0);
-                    self.free_register(tuple_reg);
-                    dedicated_reg
+                    _ => false,
                 };
 
-                self.emit_all_defers()?;
+                let has_cleanups = self.scopes.iter().any(|s| !s.cleanups.is_empty());
+
+                let (ret_reg, should_free_ret) = if values.is_empty() {
+                    (255, false)
+                } else if values.len() == 1 {
+                    let expr_reg = self.compile_expr(&values[0])?;
+                    if !has_cleanups {
+                        (expr_reg, true)
+                    } else {
+                        let dedicated_reg = self.next_local_slot();
+                        if let Some(scope) = self.scopes.first_mut() {
+                            scope.locals.insert(format!("(return_{})", dedicated_reg), (dedicated_reg, false));
+                        }
+                        self.emit(Instruction::Move(dedicated_reg, expr_reg), 0);
+                        self.free_register(expr_reg);
+                        (dedicated_reg, false)
+                    }
+                } else {
+                    let tuple_reg = self.compile_exprs_to_tuple(values)?;
+                    if !has_cleanups {
+                        (tuple_reg, true)
+                    } else {
+                        let dedicated_reg = self.next_local_slot();
+                        if let Some(scope) = self.scopes.first_mut() {
+                            scope.locals.insert(format!("(return_{})", dedicated_reg), (dedicated_reg, false));
+                        }
+                        self.emit(Instruction::Move(dedicated_reg, tuple_reg), 0);
+                        self.free_register(tuple_reg);
+                        (dedicated_reg, false)
+                    }
+                };
+
+                if has_cleanups {
+                    self.emit_defers_for_return(ret_reg, is_static_err)?;
+                }
                 self.emit(Instruction::Return(ret_reg), 0);
+                if should_free_ret {
+                    self.free_register(ret_reg);
+                }
             }
 
             StmtKind::Block(stmts) => {
                 self.begin_scope();
-                for stmt in stmts {
-                    self.compile_stmt(stmt)?;
-                    self.reset_temp_registers();
-                }
+                self.compile_scoped_statements(stmts)?;
 
                 self.end_scope()?;
             }
@@ -427,9 +727,7 @@ impl Compiler {
 
             StmtKind::Scoped(stmts) => {
                 self.begin_scope();
-                for s in stmts {
-                    self.compile_stmt(s)?;
-                }
+                self.compile_scoped_statements(stmts)?;
                 self.end_scope()?;
             }
         }
@@ -490,16 +788,17 @@ impl Compiler {
         }
         self.reset_temp_registers();
 
-        for stmt in then_block {
-            self.compile_stmt(stmt)?;
-        }
+        self.compile_scoped_statements(then_block)?;
 
         self.end_scope()?;
-        let mut jumps_to_end = vec![self.emit(Instruction::Jump(0), 0)];
+        let mut jumps_to_end = Vec::new();
+        if !elseif_branches.is_empty() || else_block.is_some() {
+            jumps_to_end.push(self.emit(Instruction::Jump(0), 0));
+        }
         let next_branch_start = self.current_chunk().instructions.len();
         self.current_chunk_mut()
             .patch_jump(jump_to_else, next_branch_start);
-        for (elseif_cond, elseif_body) in elseif_branches {
+        for (idx, (elseif_cond, elseif_body)) in elseif_branches.iter().enumerate() {
             self.begin_scope();
             let mut tested_scrutinee = None;
             let elseif_cond_reg = if let Some((obj_expr, idx_expr, binding_name)) =
@@ -543,12 +842,13 @@ impl Compiler {
             }
             self.reset_temp_registers();
 
-            for stmt in elseif_body {
-                self.compile_stmt(stmt)?;
-            }
+            self.compile_scoped_statements(elseif_body)?;
 
             self.end_scope()?;
-            jumps_to_end.push(self.emit(Instruction::Jump(0), 0));
+            let is_last_elseif = idx + 1 == elseif_branches.len();
+            if !is_last_elseif || else_block.is_some() {
+                jumps_to_end.push(self.emit(Instruction::Jump(0), 0));
+            }
             let next_start = self.current_chunk().instructions.len();
             self.current_chunk_mut()
                 .patch_jump(jump_to_next, next_start);
@@ -557,9 +857,7 @@ impl Compiler {
         if let Some(else_stmts) = else_block {
             self.begin_scope();
             self.reset_temp_registers();
-            for stmt in else_stmts {
-                self.compile_stmt(stmt)?;
-            }
+            self.compile_scoped_statements(else_stmts)?;
 
             self.end_scope()?;
         }
@@ -572,20 +870,554 @@ impl Compiler {
         Ok(())
     }
 
-    pub(super) fn compile_while_loop(&mut self, condition: &Expr, body: &[Stmt]) -> Result<()> {
-        let loop_start = self.current_chunk().instructions.len();
+    fn is_simple_expr_for_const_hoisting(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Literal(_)
+            | ExprKind::RegexLiteral { .. }
+            | ExprKind::Identifier(_) => true,
+            ExprKind::Lambda { .. } | ExprKind::EffectBlock(_) => false,
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+                ..
+            } => {
+                if method == "reduce" {
+                    return false;
+                }
+                Self::is_simple_expr_for_const_hoisting(receiver)
+                    && args.iter().all(Self::is_simple_expr_for_const_hoisting)
+            }
+            ExprKind::Call { callee, args, .. } => {
+                if let ExprKind::FieldAccess { field, .. } = &callee.kind
+                    && field == "reduce"
+                {
+                    return false;
+                }
+                Self::is_simple_expr_for_const_hoisting(callee)
+                    && args.iter().all(Self::is_simple_expr_for_const_hoisting)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::is_simple_expr_for_const_hoisting(left)
+                    && Self::is_simple_expr_for_const_hoisting(right)
+            }
+            ExprKind::Unary { operand, .. }
+            | ExprKind::FieldAccess {
+                object: operand, ..
+            }
+            | ExprKind::Paren(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::TypeCheck { expr: operand, .. }
+            | ExprKind::IsPattern { expr: operand, .. } => {
+                Self::is_simple_expr_for_const_hoisting(operand)
+            }
+            ExprKind::Index { object, index } => {
+                Self::is_simple_expr_for_const_hoisting(object)
+                    && Self::is_simple_expr_for_const_hoisting(index)
+            }
+            ExprKind::Range { start, end, .. } => {
+                Self::is_simple_expr_for_const_hoisting(start)
+                    && Self::is_simple_expr_for_const_hoisting(end)
+            }
+            ExprKind::Array(elems)
+            | ExprKind::Tuple(elems)
+            | ExprKind::EnumConstructor { args: elems, .. }
+            | ExprKind::Return(elems) => elems.iter().all(Self::is_simple_expr_for_const_hoisting),
+            ExprKind::Map(entries) => entries.iter().all(|(k, v)| {
+                Self::is_simple_expr_for_const_hoisting(k)
+                    && Self::is_simple_expr_for_const_hoisting(v)
+            }),
+            ExprKind::StructLiteral { fields, .. } => fields
+                .iter()
+                .all(|f| Self::is_simple_expr_for_const_hoisting(&f.value)),
+            ExprKind::Block(stmts) => stmts.iter().all(Self::is_simple_stmt_for_const_hoisting),
+            ExprKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                Self::is_simple_expr_for_const_hoisting(condition)
+                    && Self::is_simple_expr_for_const_hoisting(then_branch)
+                    && else_branch
+                        .as_deref()
+                        .is_none_or(Self::is_simple_expr_for_const_hoisting)
+            }
+        }
+    }
+
+    fn is_simple_stmt_for_const_hoisting(stmt: &Stmt) -> bool {
+        match &stmt.kind {
+            StmtKind::Defer(_) | StmtKind::ErrDefer(_) => false,
+            StmtKind::Break | StmtKind::Continue => true,
+            StmtKind::Local { initializer, .. } => initializer
+                .as_ref()
+                .is_none_or(|vals| vals.iter().all(Self::is_simple_expr_for_const_hoisting)),
+            StmtKind::Assign { targets, values } => {
+                targets.iter().all(Self::is_simple_expr_for_const_hoisting)
+                    && values.iter().all(Self::is_simple_expr_for_const_hoisting)
+            }
+            StmtKind::CompoundAssign { target, value, .. } => {
+                Self::is_simple_expr_for_const_hoisting(target)
+                    && Self::is_simple_expr_for_const_hoisting(value)
+            }
+            StmtKind::Expr(expr) => Self::is_simple_expr_for_const_hoisting(expr),
+            StmtKind::Return(values) => values.iter().all(Self::is_simple_expr_for_const_hoisting),
+            StmtKind::Block(stmts) | StmtKind::Scoped(stmts) => {
+                stmts.iter().all(Self::is_simple_stmt_for_const_hoisting)
+            }
+            StmtKind::If {
+                condition,
+                then_block,
+                elseif_branches,
+                else_block,
+            } => {
+                Self::is_simple_expr_for_const_hoisting(condition)
+                    && then_block.iter().all(Self::is_simple_stmt_for_const_hoisting)
+                    && elseif_branches.iter().all(|(cond, blk)| {
+                        Self::is_simple_expr_for_const_hoisting(cond)
+                            && blk.iter().all(Self::is_simple_stmt_for_const_hoisting)
+                    })
+                    && else_block
+                        .as_ref()
+                        .is_none_or(|blk| blk.iter().all(Self::is_simple_stmt_for_const_hoisting))
+            }
+            StmtKind::While { condition, body } => {
+                Self::is_simple_expr_for_const_hoisting(condition)
+                    && body.iter().all(Self::is_simple_stmt_for_const_hoisting)
+            }
+            StmtKind::ForNumeric {
+                start,
+                end,
+                step,
+                body,
+                ..
+            } => {
+                Self::is_simple_expr_for_const_hoisting(start)
+                    && Self::is_simple_expr_for_const_hoisting(end)
+                    && step
+                        .as_ref()
+                        .is_none_or(Self::is_simple_expr_for_const_hoisting)
+                    && body.iter().all(Self::is_simple_stmt_for_const_hoisting)
+            }
+            StmtKind::ForIn { iterator, body, .. } => {
+                Self::is_simple_expr_for_const_hoisting(iterator)
+                    && body.iter().all(Self::is_simple_stmt_for_const_hoisting)
+            }
+        }
+    }
+
+    fn try_match_field_add_assign<'a>(
+        &self,
+        target: &'a Expr,
+        value: &'a Expr,
+    ) -> Option<(&'a Expr, u8, &'a Expr)> {
+        let ExprKind::FieldAccess {
+            object: tgt_obj,
+            field: tgt_field,
+        } = &target.kind
+        else {
+            return None;
+        };
+        let ExprKind::Identifier(tgt_var) = &tgt_obj.kind else {
+            return None;
+        };
+        let (slot_idx, field_tk) = self.resolve_struct_field_slot(tgt_obj, tgt_field)?;
+        let ExprKind::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } = &value.kind
+        else {
+            return None;
+        };
+        let is_same_field = |expr: &Expr| -> bool {
+            let mut cur = expr;
+            while let ExprKind::Paren(inner) = &cur.kind {
+                cur = inner;
+            }
+            matches!(
+                &cur.kind,
+                ExprKind::FieldAccess { object, field }
+                    if field == tgt_field
+                        && matches!(&object.kind, ExprKind::Identifier(name) if name == tgt_var)
+            )
+        };
+        let addend = if is_same_field(left) && Self::is_side_effect_free_expr(right) {
+            right.as_ref()
+        } else if is_same_field(right) && Self::is_side_effect_free_expr(left) {
+            left.as_ref()
+        } else {
+            return None;
+        };
+        let field_is_int = matches!(field_tk, TypeKind::Int)
+            || self.numeric_type(left.span) == Some(NumericType::Int);
+        let addend_is_int = self.numeric_type(addend.span) == Some(NumericType::Int)
+            || matches!(addend.kind, ExprKind::Literal(Literal::Integer(_)));
+        if field_is_int && addend_is_int {
+            Some((tgt_obj.as_ref(), slot_idx, addend))
+        } else {
+            None
+        }
+    }
+
+    fn collect_hoistable_consts_in_expr(
+        &self,
+        expr: &Expr,
+        seen: &mut HashSet<HoistedScalarConst>,
+        out: &mut Vec<HoistedScalarConst>,
+    ) {
+        const MAX_HOISTED_WHILE_CONSTS: usize = 16;
+        if out.len() >= MAX_HOISTED_WHILE_CONSTS {
+            return;
+        }
+        match &expr.kind {
+            ExprKind::Literal(Literal::Integer(v)) => {
+                let key = HoistedScalarConst::Int(*v);
+                if seen.insert(key) {
+                    out.push(key);
+                }
+            }
+            ExprKind::Literal(Literal::Float(f)) => {
+                let key = HoistedScalarConst::FloatBits(f.to_bits());
+                if seen.insert(key) {
+                    out.push(key);
+                }
+            }
+            ExprKind::Literal(Literal::Bool(b)) => {
+                let key = HoistedScalarConst::Bool(*b);
+                if seen.insert(key) {
+                    out.push(key);
+                }
+            }
+            ExprKind::Identifier(name) => {
+                if let Some(func_idx) = self.resolve_direct_fn_ident(name) {
+                    let key = HoistedScalarConst::Function(func_idx);
+                    if seen.insert(key) {
+                        out.push(key);
+                    }
+                }
+            }
+            ExprKind::Binary { left, op, right } => {
+                if self.numeric_type(left.span) == Some(NumericType::Int)
+                    && self.numeric_type(right.span) == Some(NumericType::Int)
+                    && let Some((operand_expr, _)) = Self::try_int_add_imm(*op, left, right)
+                {
+                    self.collect_hoistable_consts_in_expr(operand_expr, seen, out);
+                    return;
+                }
+                self.collect_hoistable_consts_in_expr(left, seen, out);
+                self.collect_hoistable_consts_in_expr(right, seen, out);
+            }
+            ExprKind::Unary { operand, .. }
+            | ExprKind::FieldAccess {
+                object: operand, ..
+            }
+            | ExprKind::Paren(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::TypeCheck { expr: operand, .. }
+            | ExprKind::IsPattern { expr: operand, .. } => {
+                self.collect_hoistable_consts_in_expr(operand, seen, out);
+            }
+            ExprKind::Index { object, index } => {
+                self.collect_hoistable_consts_in_expr(object, seen, out);
+                self.collect_hoistable_consts_in_expr(index, seen, out);
+            }
+            ExprKind::Call { callee, args, .. } => {
+                if let Some(func_idx) = self.resolve_static_dispatch_fn(callee) {
+                    let key = HoistedScalarConst::Function(func_idx);
+                    if seen.insert(key) {
+                        out.push(key);
+                    }
+                } else {
+                    self.collect_hoistable_consts_in_expr(callee, seen, out);
+                }
+                for arg in args {
+                    self.collect_hoistable_consts_in_expr(arg, seen, out);
+                }
+            }
+            ExprKind::MethodCall { receiver, args, .. } => {
+                self.collect_hoistable_consts_in_expr(receiver, seen, out);
+                for arg in args {
+                    self.collect_hoistable_consts_in_expr(arg, seen, out);
+                }
+            }
+            ExprKind::Array(elems)
+            | ExprKind::Tuple(elems)
+            | ExprKind::EnumConstructor { args: elems, .. }
+            | ExprKind::Return(elems) => {
+                for elem in elems {
+                    self.collect_hoistable_consts_in_expr(elem, seen, out);
+                }
+            }
+            ExprKind::Map(entries) => {
+                for (k, v) in entries {
+                    self.collect_hoistable_consts_in_expr(k, seen, out);
+                    self.collect_hoistable_consts_in_expr(v, seen, out);
+                }
+            }
+            ExprKind::StructLiteral { fields, .. } => {
+                for f in fields {
+                    self.collect_hoistable_consts_in_expr(&f.value, seen, out);
+                }
+            }
+            ExprKind::Range { start, end, .. } => {
+                self.collect_hoistable_consts_in_expr(start, seen, out);
+                self.collect_hoistable_consts_in_expr(end, seen, out);
+            }
+            ExprKind::Block(stmts) => {
+                for stmt in stmts {
+                    self.collect_hoistable_consts_in_stmt(stmt, seen, out);
+                }
+            }
+            ExprKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.collect_hoistable_consts_in_expr(condition, seen, out);
+                self.collect_hoistable_consts_in_expr(then_branch, seen, out);
+                if let Some(else_expr) = else_branch {
+                    self.collect_hoistable_consts_in_expr(else_expr, seen, out);
+                }
+            }
+            ExprKind::Literal(_)
+            | ExprKind::RegexLiteral { .. }
+            | ExprKind::Lambda { .. }
+            | ExprKind::EffectBlock(_) => {}
+        }
+    }
+
+    fn collect_hoistable_consts_in_stmt(
+        &self,
+        stmt: &Stmt,
+        seen: &mut HashSet<HoistedScalarConst>,
+        out: &mut Vec<HoistedScalarConst>,
+    ) {
+        const MAX_HOISTED_WHILE_CONSTS: usize = 16;
+        if out.len() >= MAX_HOISTED_WHILE_CONSTS {
+            return;
+        }
+        match &stmt.kind {
+            StmtKind::Local { initializer, .. } => {
+                if let Some(vals) = initializer {
+                    for val in vals {
+                        self.collect_hoistable_consts_in_expr(val, seen, out);
+                    }
+                }
+            }
+            StmtKind::Assign { targets, values } => {
+                if targets.len() == 1
+                    && values.len() == 1
+                    && let Some((_, _, addend_expr)) =
+                        self.try_match_field_add_assign(&targets[0], &values[0])
+                {
+                    self.collect_hoistable_consts_in_expr(addend_expr, seen, out);
+                    return;
+                }
+                for target in targets {
+                    self.collect_hoistable_consts_in_expr(target, seen, out);
+                }
+                for val in values {
+                    self.collect_hoistable_consts_in_expr(val, seen, out);
+                }
+            }
+            StmtKind::CompoundAssign { target, op, value } => {
+                let folded_imm = matches!(target.kind, ExprKind::Identifier(_))
+                    && self.numeric_type(target.span) == Some(NumericType::Int)
+                    && self.numeric_type(value.span) == Some(NumericType::Int)
+                    && match *op {
+                        BinaryOp::Add => Self::const_int_literal(value)
+                            .and_then(|v| i8::try_from(v).ok())
+                            .is_some(),
+                        BinaryOp::Sub => Self::const_int_literal(value)
+                            .and_then(|v| v.checked_neg())
+                            .and_then(|neg| i8::try_from(neg).ok())
+                            .is_some(),
+                        _ => false,
+                    };
+                self.collect_hoistable_consts_in_expr(target, seen, out);
+                if !folded_imm {
+                    self.collect_hoistable_consts_in_expr(value, seen, out);
+                }
+            }
+            StmtKind::Expr(expr) => self.collect_hoistable_consts_in_expr(expr, seen, out),
+            StmtKind::Return(values) => {
+                for val in values {
+                    self.collect_hoistable_consts_in_expr(val, seen, out);
+                }
+            }
+            StmtKind::Block(stmts) | StmtKind::Scoped(stmts) => {
+                for s in stmts {
+                    self.collect_hoistable_consts_in_stmt(s, seen, out);
+                }
+            }
+            StmtKind::If {
+                condition,
+                then_block,
+                elseif_branches,
+                else_block,
+            } => {
+                self.collect_hoistable_consts_in_expr(condition, seen, out);
+                for s in then_block {
+                    self.collect_hoistable_consts_in_stmt(s, seen, out);
+                }
+                for (cond, blk) in elseif_branches {
+                    self.collect_hoistable_consts_in_expr(cond, seen, out);
+                    for s in blk {
+                        self.collect_hoistable_consts_in_stmt(s, seen, out);
+                    }
+                }
+                if let Some(blk) = else_block {
+                    for s in blk {
+                        self.collect_hoistable_consts_in_stmt(s, seen, out);
+                    }
+                }
+            }
+            StmtKind::While { condition, body } => {
+                self.collect_hoistable_consts_in_expr(condition, seen, out);
+                for s in body {
+                    self.collect_hoistable_consts_in_stmt(s, seen, out);
+                }
+            }
+            StmtKind::ForNumeric {
+                start,
+                end,
+                step,
+                body,
+                ..
+            } => {
+                self.collect_hoistable_consts_in_expr(start, seen, out);
+                self.collect_hoistable_consts_in_expr(end, seen, out);
+                if let Some(step_expr) = step {
+                    self.collect_hoistable_consts_in_expr(step_expr, seen, out);
+                }
+                for s in body {
+                    self.collect_hoistable_consts_in_stmt(s, seen, out);
+                }
+            }
+            StmtKind::ForIn { iterator, body, .. } => {
+                self.collect_hoistable_consts_in_expr(iterator, seen, out);
+                for s in body {
+                    self.collect_hoistable_consts_in_stmt(s, seen, out);
+                }
+            }
+            StmtKind::Break | StmtKind::Continue | StmtKind::Defer(_) | StmtKind::ErrDefer(_) => {}
+        }
+    }
+
+    fn compile_while_condition_branch(&mut self, condition: &Expr) -> Result<usize> {
+        let mut cond_expr = condition;
+        while let ExprKind::Paren(inner) = &cond_expr.kind {
+            cond_expr = inner;
+        }
+        if let ExprKind::Binary { left, op, right } = &cond_expr.kind
+            && matches!(op, BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge)
+            && self.numeric_type(left.span) == Some(NumericType::Int)
+            && self.numeric_type(right.span) == Some(NumericType::Int)
+        {
+            self.current_line = cond_expr.span.start_line;
+            let left_reg = self.compile_expr(left)?;
+            let saved_freereg = self.next_register;
+            let right_reg = self.compile_expr(right)?;
+            if self.next_register < saved_freereg {
+                self.next_register = saved_freereg;
+            }
+            let branch_instr = match op {
+                BinaryOp::Lt => Instruction::BranchLtInt(left_reg, right_reg, 0),
+                BinaryOp::Le => Instruction::BranchLeInt(left_reg, right_reg, 0),
+                BinaryOp::Gt => Instruction::BranchLtInt(right_reg, left_reg, 0),
+                BinaryOp::Ge => Instruction::BranchLeInt(right_reg, left_reg, 0),
+                _ => unreachable!(),
+            };
+            let jump_to_end = self.emit(branch_instr, 0);
+            self.free_register(right_reg);
+            self.free_register(left_reg);
+            return Ok(jump_to_end);
+        }
+
         let cond_reg = self.compile_expr(condition)?;
         let jump_to_end = self.emit(Instruction::JumpIfNot(cond_reg, 0), 0);
         self.free_register(cond_reg);
+        Ok(jump_to_end)
+    }
+
+    pub(super) fn compile_while_loop(&mut self, condition: &Expr, body: &[Stmt]) -> Result<()> {
+        let mut hoisted_scope_active = false;
+        let base_before = (self.max_local_register_index() + 1).max(0) as usize;
+        if base_before < 192
+            && Self::is_simple_expr_for_const_hoisting(condition)
+            && body.iter().all(Self::is_simple_stmt_for_const_hoisting)
+        {
+            let mut seen = HashSet::new();
+            let mut candidates = Vec::new();
+            self.collect_hoistable_consts_in_expr(condition, &mut seen, &mut candidates);
+            for stmt in body {
+                self.collect_hoistable_consts_in_stmt(stmt, &mut seen, &mut candidates);
+            }
+            if !candidates.is_empty() {
+                self.begin_scope();
+                hoisted_scope_active = true;
+                let mut first_reg: Option<Register> = None;
+                for candidate in candidates {
+                    let cur_base = (self.max_local_register_index() + 1).max(0) as usize;
+                    if cur_base >= 200 {
+                        break;
+                    }
+                    let key = candidate.scope_key();
+                    if self.resolve_local(&key).is_ok() {
+                        continue;
+                    }
+                    let reg = self.next_local_slot();
+                    match candidate {
+                        HoistedScalarConst::Int(v) => {
+                            let const_idx = self.add_int_const(v);
+                            self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                        }
+                        HoistedScalarConst::FloatBits(bits) => {
+                            let const_idx = self.add_constant(Value::Float(
+                                crate::number::LustFloat::from_bits(bits),
+                            ));
+                            self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                        }
+                        HoistedScalarConst::Bool(b) => {
+                            self.emit(Instruction::LoadBool(reg, b), 0);
+                        }
+                        HoistedScalarConst::Function(func_idx) => {
+                            let const_idx = self.add_constant(Value::Function(func_idx));
+                            self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                        }
+                    }
+                    if first_reg.is_none() {
+                        first_reg = Some(reg);
+                    }
+                    if let Some(scope) = self.scopes.last_mut() {
+                        scope.locals.insert(key, (reg, false));
+                    }
+                }
+                if let Some(reg) = first_reg {
+                    if let Some(scope) = self.scopes.last_mut() {
+                        scope
+                            .locals
+                            .insert("(hoist_active)".to_string(), (reg, false));
+                    }
+                } else {
+                    self.end_scope()?;
+                    hoisted_scope_active = false;
+                }
+                self.reset_temp_registers();
+            }
+        }
+
+        let loop_start = self.current_chunk().instructions.len();
+        let jump_to_end = self.compile_while_condition_branch(condition)?;
+        self.reset_temp_registers();
         self.loop_contexts.push(LoopContext {
             continue_target: Some(loop_start),
             continue_jumps: Vec::new(),
             break_jumps: Vec::new(),
         });
         self.begin_scope();
-        for stmt in body {
-            self.compile_stmt(stmt)?;
-        }
+        self.compile_scoped_statements(body)?;
 
         self.end_scope()?;
         let loop_ctx = self.loop_contexts.pop().unwrap();
@@ -594,6 +1426,11 @@ impl Compiler {
         self.current_chunk_mut().patch_jump(jump_to_end, end_pos);
         for break_jump in loop_ctx.break_jumps {
             self.current_chunk_mut().patch_jump(break_jump, end_pos);
+        }
+
+        if hoisted_scope_active {
+            self.end_scope()?;
+            self.reset_temp_registers();
         }
 
         Ok(())
@@ -605,15 +1442,7 @@ impl Compiler {
     /// time.  Only the forms a step is actually written in are folded: a literal,
     /// a negated literal, and either wrapped in parentheses.
     fn const_int_expr(expr: &Expr) -> Option<LustInt> {
-        match &expr.kind {
-            ExprKind::Literal(Literal::Integer(value)) => Some(*value),
-            ExprKind::Paren(inner) => Self::const_int_expr(inner),
-            ExprKind::Unary {
-                op: UnaryOp::Neg,
-                operand,
-            } => Self::const_int_expr(operand).map(|value| -value),
-            _ => None,
-        }
+        Self::const_int_literal(expr)
     }
 
     pub(super) fn compile_for_numeric_loop(
@@ -680,62 +1509,78 @@ impl Compiler {
         };
 
         let loop_start = self.current_chunk().instructions.len();
-        let cond_reg = self.allocate_register();
-        match static_step {
-            Some(value) if value < 0 => {
-                self.emit(specialize(Instruction::Ge(cond_reg, var_reg, end_reg)), 0);
+        let jump_to_end = if int_loop
+            && let Some(value) = static_step
+        {
+            if value < 0 {
+                self.emit(Instruction::BranchLeInt(end_reg, var_reg, 0), 0)
+            } else {
+                self.emit(Instruction::BranchLeInt(var_reg, end_reg, 0), 0)
             }
-            Some(_) => {
-                self.emit(specialize(Instruction::Le(cond_reg, var_reg, end_reg)), 0);
-            }
-            None => {
-                // cond = (step < 0) ? (var >= end) : (var <= end), spelled with
-                // the instructions available:
-                //   cond = (neg AND ge) OR ((NOT neg) AND le)
-                let zero_reg = self.allocate_register();
-                let const_idx = self.add_int_const(0);
-                self.emit(Instruction::LoadConst(zero_reg, const_idx), 0);
-                let neg_reg = self.allocate_register();
-                self.emit(specialize(Instruction::Lt(neg_reg, step_reg, zero_reg)), 0);
-                let pos_reg = self.allocate_register();
-                self.emit(Instruction::Not(pos_reg, neg_reg), 0);
+        } else {
+            let cond_reg = self.allocate_register();
+            match static_step {
+                Some(value) if value < 0 => {
+                    self.emit(specialize(Instruction::Ge(cond_reg, var_reg, end_reg)), 0);
+                }
+                Some(_) => {
+                    self.emit(specialize(Instruction::Le(cond_reg, var_reg, end_reg)), 0);
+                }
+                None => {
+                    // cond = (step < 0) ? (var >= end) : (var <= end), spelled with
+                    // the instructions available:
+                    //   cond = (neg AND ge) OR ((NOT neg) AND le)
+                    let zero_reg = self.allocate_register();
+                    let const_idx = self.add_int_const(0);
+                    self.emit(Instruction::LoadConst(zero_reg, const_idx), 0);
+                    let neg_reg = self.allocate_register();
+                    self.emit(specialize(Instruction::Lt(neg_reg, step_reg, zero_reg)), 0);
+                    let pos_reg = self.allocate_register();
+                    self.emit(Instruction::Not(pos_reg, neg_reg), 0);
 
-                let ge_reg = self.allocate_register();
-                self.emit(specialize(Instruction::Ge(ge_reg, var_reg, end_reg)), 0);
-                let le_reg = self.allocate_register();
-                self.emit(specialize(Instruction::Le(le_reg, var_reg, end_reg)), 0);
-                let neg_and_ge_reg = self.allocate_register();
-                self.emit(Instruction::And(neg_and_ge_reg, neg_reg, ge_reg), 0);
-                let pos_and_le_reg = self.allocate_register();
-                self.emit(Instruction::And(pos_and_le_reg, pos_reg, le_reg), 0);
-                self.emit(Instruction::Or(cond_reg, neg_and_ge_reg, pos_and_le_reg), 0);
+                    let ge_reg = self.allocate_register();
+                    self.emit(specialize(Instruction::Ge(ge_reg, var_reg, end_reg)), 0);
+                    let le_reg = self.allocate_register();
+                    self.emit(specialize(Instruction::Le(le_reg, var_reg, end_reg)), 0);
+                    let neg_and_ge_reg = self.allocate_register();
+                    self.emit(Instruction::And(neg_and_ge_reg, neg_reg, ge_reg), 0);
+                    let pos_and_le_reg = self.allocate_register();
+                    self.emit(Instruction::And(pos_and_le_reg, pos_reg, le_reg), 0);
+                    self.emit(Instruction::Or(cond_reg, neg_and_ge_reg, pos_and_le_reg), 0);
 
-                self.free_register(pos_and_le_reg);
-                self.free_register(neg_and_ge_reg);
-                self.free_register(le_reg);
-                self.free_register(ge_reg);
-                self.free_register(pos_reg);
-                self.free_register(neg_reg);
-                self.free_register(zero_reg);
+                    self.free_register(pos_and_le_reg);
+                    self.free_register(neg_and_ge_reg);
+                    self.free_register(le_reg);
+                    self.free_register(ge_reg);
+                    self.free_register(pos_reg);
+                    self.free_register(neg_reg);
+                    self.free_register(zero_reg);
+                }
             }
-        }
-        let jump_to_end = self.emit(Instruction::JumpIfNot(cond_reg, 0), 0);
-        self.free_register(cond_reg);
+            let jump = self.emit(Instruction::JumpIfNot(cond_reg, 0), 0);
+            self.free_register(cond_reg);
+            jump
+        };
         self.loop_contexts.push(LoopContext {
             continue_target: None,
             continue_jumps: Vec::new(),
             break_jumps: Vec::new(),
         });
-        for stmt in body {
-            self.compile_stmt(stmt)?;
-        }
+        self.compile_scoped_statements(body)?;
 
         let loop_ctx = self.loop_contexts.pop().unwrap();
         let increment_pos = self.current_chunk().instructions.len();
-        let temp_reg = self.allocate_register();
-        let increment = self.emit(specialize(Instruction::Add(temp_reg, var_reg, step_reg)), 0);
-        self.move_result(var_reg, temp_reg, increment);
-        self.free_register(temp_reg);
+        if int_loop
+            && let Some(step_val) = static_step
+            && let Ok(imm) = i8::try_from(step_val)
+        {
+            self.emit(Instruction::AddIntImm(var_reg, var_reg, imm), 0);
+        } else {
+            let temp_reg = self.allocate_register();
+            let increment = self.emit(specialize(Instruction::Add(temp_reg, var_reg, step_reg)), 0);
+            self.move_result(var_reg, temp_reg, increment);
+            self.free_register(temp_reg);
+        }
         for continue_jump in loop_ctx.continue_jumps {
             self.current_chunk_mut()
                 .patch_jump(continue_jump, increment_pos);
@@ -795,34 +1640,22 @@ impl Compiler {
             }
 
             let loop_start = self.current_chunk().instructions.len();
-            let cond_reg = self.allocate_register();
-            if *inclusive {
-                self.emit(Instruction::LeInt(cond_reg, var_reg, end_reg), 0);
+            let jump_to_end = if *inclusive {
+                self.emit(Instruction::BranchLeInt(var_reg, end_reg, 0), 0)
             } else {
-                self.emit(Instruction::LtInt(cond_reg, var_reg, end_reg), 0);
-            }
-            let jump_to_end = self.emit(Instruction::JumpIfNot(cond_reg, 0), 0);
-            self.free_register(cond_reg);
+                self.emit(Instruction::BranchLtInt(var_reg, end_reg, 0), 0)
+            };
             self.loop_contexts.push(LoopContext {
                 continue_target: None,
                 continue_jumps: Vec::new(),
                 break_jumps: Vec::new(),
             });
 
-            for stmt in body {
-                self.compile_stmt(stmt)?;
-            }
+            self.compile_scoped_statements(body)?;
 
             let loop_ctx = self.loop_contexts.pop().unwrap();
             let increment_pos = self.current_chunk().instructions.len();
-            let one_reg = self.allocate_register();
-            let one_idx = self.add_int_const(1);
-            self.emit(Instruction::LoadConst(one_reg, one_idx), 0);
-            let tmp_reg = self.allocate_register();
-            let increment = self.emit(Instruction::AddInt(tmp_reg, var_reg, one_reg), 0);
-            self.move_result(var_reg, tmp_reg, increment);
-            self.free_register(tmp_reg);
-            self.free_register(one_reg);
+            self.emit(Instruction::AddIntImm(var_reg, var_reg, 1), 0);
             for continue_jump in loop_ctx.continue_jumps {
                 self.current_chunk_mut()
                     .patch_jump(continue_jump, increment_pos);
@@ -869,30 +1702,18 @@ impl Compiler {
             }
 
             let loop_start = self.current_chunk().instructions.len();
-            let cond_reg = self.allocate_register();
-            self.emit(Instruction::LtInt(cond_reg, i_reg, len_reg), 0);
-            let jump_to_end = self.emit(Instruction::JumpIfNot(cond_reg, 0), 0);
-            self.free_register(cond_reg);
+            let jump_to_end = self.emit(Instruction::BranchLtInt(i_reg, len_reg, 0), 0);
             self.loop_contexts.push(LoopContext {
                 continue_target: None,
                 continue_jumps: Vec::new(),
                 break_jumps: Vec::new(),
             });
             self.emit(Instruction::GetIndex(elem_reg, array_reg, i_reg), 0);
-            for stmt in body {
-                self.compile_stmt(stmt)?;
-            }
+            self.compile_scoped_statements(body)?;
 
             let loop_ctx = self.loop_contexts.pop().unwrap();
             let increment_pos = self.current_chunk().instructions.len();
-            let one_reg = self.allocate_register();
-            let one_idx = self.add_int_const(1);
-            self.emit(Instruction::LoadConst(one_reg, one_idx), 0);
-            let tmp_reg = self.allocate_register();
-            let increment = self.emit(Instruction::AddInt(tmp_reg, i_reg, one_reg), 0);
-            self.move_result(i_reg, tmp_reg, increment);
-            self.free_register(tmp_reg);
-            self.free_register(one_reg);
+            self.emit(Instruction::AddIntImm(i_reg, i_reg, 1), 0);
             for continue_jump in loop_ctx.continue_jumps {
                 self.current_chunk_mut()
                     .patch_jump(continue_jump, increment_pos);
@@ -992,9 +1813,7 @@ impl Compiler {
             }
         }
 
-        for stmt in body {
-            self.compile_stmt(stmt)?;
-        }
+        self.compile_scoped_statements(body)?;
 
         let loop_ctx = self.loop_contexts.pop().unwrap();
         for continue_jump in loop_ctx.continue_jumps {

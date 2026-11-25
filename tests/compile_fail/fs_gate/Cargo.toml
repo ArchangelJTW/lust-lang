@@ -1,0 +1,21 @@
+[workspace]
+
+[package]
+name = "fs-gate-fixture"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+canary_default_violation = []
+canary_read = []
+canary_read_to_string = []
+canary_write = []
+canary_file_open = []
+canary_open_options = []
+canary_dir_builder = []
+canary_path_exists = []
+canary_path_canonicalize = []
+
+[[test]]
+name = "direct_std_fs"
+path = "direct_std_fs.rs"

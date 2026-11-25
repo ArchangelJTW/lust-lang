@@ -1,0 +1,18 @@
+[package]
+name = "lust-napi-rs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "napi-rs v2 Node-API addon host for the Lust scripting engine (actor-pool over !Send VM)"
+
+[lib]
+name = "lust_napi_rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lust = { package = "lust-rs", path = "../..", default-features = false, features = ["std"] }
+napi = { version = "2", features = ["napi8", "async"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"

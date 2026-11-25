@@ -5,7 +5,7 @@ pub mod types;
 pub use expr::{BinaryOp, Expr, ExprKind, Literal, Pattern, StructLiteralField, UnaryOp};
 pub use items::{
     EnumDef, EnumVariant, ExternItem, ExternParam, FieldOwnership, FunctionDef, FunctionParam,
-    ImplBlock, Item, ItemKind, ServiceDef, StructDef, StructField, SuiteDecl, SuiteHooks, TestDecl,
+    ImplBlock, Item, ItemKind, SchemaConstraint, SchemaDef, SchemaField, ServiceDef, StructDef, StructField, SuiteDecl, SuiteHooks, TestDecl,
     TestModifier, TraitBound, TraitDef, TraitMethod, UseTree, UseTreeItem, Visibility,
 };
 pub use stmt::{LocalBinding, Stmt, StmtKind};

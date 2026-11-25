@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+pub mod alloc_budget;
 pub mod ast;
 #[cfg(feature = "bindgen")]
 pub mod bindgen;
@@ -21,6 +22,7 @@ pub mod codegen_c;
 #[cfg(feature = "std")]
 pub mod codegen_zig;
 pub mod effect_abi;
+#[cfg(feature = "std")]
 pub mod embed;
 pub mod error;
 #[cfg(feature = "std")]
@@ -35,6 +37,7 @@ pub mod lexer;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod lua_compat;
 pub mod modules;
+pub mod no_std;
 pub mod number;
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 pub mod packages;
@@ -42,8 +45,21 @@ pub mod parser;
 pub mod test_framework;
 pub mod typechecker;
 pub mod vm;
-#[cfg(target_arch = "wasm32")]
+pub mod sim;
+#[cfg(feature = "std")]
+pub mod sandbox;
+#[cfg(feature = "std")]
+pub mod stdlib;
+#[cfg(feature = "std")]
+pub mod vfs;
 pub mod wasm;
+#[cfg(feature = "std")]
+pub mod wasi;
+#[cfg(feature = "std")]
+pub mod w17_layout;
+#[cfg(feature = "std")]
+pub mod w17_lifetime;
+pub use vm::telemetry;
 pub use ast::{Expr, Item, Span, Stmt, Type};
 pub use bytecode::{Chunk, Compiler, Function, Instruction, Value};
 pub use config::{ConfigError, DependencyKind, DependencySpec, LustConfig};
@@ -96,5 +112,30 @@ pub use packages::{
 };
 pub use parser::Parser;
 pub use typechecker::{FunctionSignature, TypeChecker, TypeCollection};
-pub use vm::{NativeExport, NativeExportParam, VM};
+pub use vm::{
+    NativeEffectSpec, NativeExport, NativeExportParam, NativeGasPolicy, NativeMemoryPolicy,
+    NativePurity, VM,
+    MUTATION_M1_EXECUTION_COUNT, MUTATION_M1_SKIP_GAS, MutationM1Guard,
+    MUTATION_M2_EXECUTION_COUNT, MUTATION_M2_SKIP_PANIC_FINALIZER, MutationM2Guard,
+};
+#[cfg(feature = "std")]
+pub use stdlib::effects::{
+    EnvError, EnvService, FileHandle, FileSystemService, IoError, RandomService,
+};
+pub use sim::{
+    FaultConfiguration, FaultInjectedVfs, FaultKind, GasMonotonicityOracle, GasProgressOracle,
+    InterruptSchedule, InvariantViolation, InvBudget01Oracle, InvFiber01Oracle, InvFiber02Oracle,
+    InvFiber03Oracle, InvRx01Oracle, MemoryFaultPolicy, MinimalSimScheduler,
+    PreemptiveExplorationScheduler, StepCounterWatchdog, StepOutcome, VfsFaultRule, VfsOp,
+};
+#[cfg(feature = "std")]
+pub use vfs::{
+    DirectHostFsBypassPanic, MemFs, OsFs, VfsMetadata, VirtualConsole, VirtualEnv, VirtualFileSystem,
+};
+#[cfg(feature = "std")]
+pub use wasi::{
+    WasiAdapter, WasiCapabilities, WasiContext, WasiContextBuilder, WasiError, WasiErrno,
+    WasiFileHandle, WasiPreopen, WasiTimeoutGuard,
+};
+pub use wasm::{WasmAbi, WasmArchitecture, WasmRuntimeConfig, WasmTarget};
 pub use hashbrown;

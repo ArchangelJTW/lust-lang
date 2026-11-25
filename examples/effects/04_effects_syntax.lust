@@ -1,13 +1,55 @@
 -- Lust Lang Effect System v2.0 - Syntax and Primitives Showcase
 -- Demonstrates Effect<A, E, R> type contracts, scoped resources, defer/errdefer, and lazy effect suspension.
 
-type HttpError = string
-type DbError = string
+struct HttpError
+    message: string
+end
+
+struct DbError
+    message: string
+end
 
 -- Service interfaces
-type Network = { host: string }
-type Database = { connection_string: string }
-type Logger = { log_level: int }
+struct Network
+    host: string
+end
+
+struct Database
+    connection_string: string
+end
+
+struct Logger
+    log_level: int
+end
+
+service NetworkService: Network
+service DatabaseService: Database
+service LoggerService: Logger
+
+-- Function stubs for effect operations
+function open_socket(url: string): int
+    return 1
+end
+
+function close_socket(fd: int): ()
+    return
+end
+
+function record_failure_metric(op: string, url: string): ()
+    return
+end
+
+function begin_transaction(tx_id: int): int
+    return tx_id
+end
+
+function commit_or_rollback(tx: int): ()
+    return
+end
+
+function query_record_count(): int
+    return 21
+end
 
 -- 1. Function with full algebraic effect signature:
 --    Returns: string
@@ -45,16 +87,27 @@ end
 
 -- 3. Lazy Effect Suspension:
 --    `effect do ... end` constructs a cold effect blueprint without executing it immediately.
-function create_pipeline(): Effect<int, string, Database>
+function run_pipeline(): int
     local job = effect do
         local count = query_record_count()
         return count * 2
     end
     
-    return job
+    return job:run_sync()
 end
 
 -- 4. Entrypoint demo
 function main(): ()
-    print("Lust Effect System v2.0 syntax validated.")
+    local data = fetch_data("https://example.com")
+    assert(data == "response_body")
+
+    local tx_ok = process_transaction(101)
+    assert(tx_ok == true)
+
+    local result = run_pipeline()
+    assert(result == 42)
+
+    println("Lust Effect System v2.0 syntax validated.")
 end
+
+main()

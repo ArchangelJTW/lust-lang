@@ -1,0 +1,179 @@
+-- Example 5: Dependency Injection & Mocking via StackContextProjection.
+-- Demonstrates zero-heap stack-allocated context injection, dynamic MockService spies,
+-- call verification, and safe fail-closed service extraction in Effect-TS / ZIO style.
+
+use std.test
+use std.table
+
+enum Exit
+    Success(string),
+    Fail(string),
+end
+
+struct CheckoutOrder
+    order_id: string
+    user_id: string
+    amount_cents: int
+end
+
+function process_checkout(ctx: Map, order: CheckoutOrder): Exit
+    -- 1. Resolve Database dependency from projection
+    local db_opt = test.projection_get(ctx, 1001)
+    if db_opt == Option.None then
+        return Exit.Fail("Context missing Database service")
+    end
+
+    -- 2. Resolve HTTP Client dependency from projection
+    local http_opt = test.projection_get(ctx, 1002)
+    if http_opt == Option.None then
+        return Exit.Fail("Context missing HTTP Client service")
+    end
+
+    local db = db_opt
+    local http = http_opt
+
+    -- Step 1: Query user status and credit in DB
+    println(string.format("  [Step 1] Querying database for user: %s", order.user_id))
+    test.mock_record_call(db, "get_user", [order.user_id], 10)
+
+    -- Step 2: Authorize charge via external HTTP payment gateway
+    local amount_str = tostring(order.amount_cents)
+    println(string.format("  [Step 2] Sending HTTP POST to payment gateway (amount: %d cents)", order.amount_cents))
+    test.mock_record_call(http, "POST /v1/payments/charge", [order.order_id, amount_str], 25)
+
+    -- Step 3: Record transaction in database
+    println(string.format("  [Step 3] Persisting transaction record for order: %s", order.order_id))
+    test.mock_record_call(db, "insert_order", [order.order_id, order.user_id, "PAID"], 40)
+
+    return Exit.Success(string.format("ORDER_COMPLETED:%s", order.order_id))
+end
+
+suite "Dependency Injection & Mocking Suite" do
+    test "projection lookup and mock service call verification" do
+        -- 1. Create MockService instances for Database (1001) and HTTP (1002)
+        local mock_db = test.mock_new(1001)
+        local mock_http = test.mock_new(1002)
+
+        test.mock_set_response(
+            mock_http,
+            "POST /v1/payments/charge",
+            "{\"status\": \"APPROVED\", \"charge_id\": \"ch_999\"}"
+        )
+
+        -- 2. Assembling zero-heap StackContextProjection
+        local projection = test.projection_new([1001, 1002], [mock_db, mock_http])
+        assert(test.projection_get(projection, 1001) != Option.None)
+        assert(test.projection_get(projection, 1002) != Option.None)
+        assert_eq(test.projection_get(projection, 9999), Option.None)
+
+        -- 3. Executing business effect with injected context
+        local order = CheckoutOrder {
+            order_id = "ord_2026_x89",
+            user_id = "usr_alice",
+            amount_cents = 4500
+        }
+
+        local result: Exit = process_checkout(projection, order)
+        local matched = false
+        if result is Success(outcome) then
+            assert_success(outcome)
+            assert_eq(outcome, "ORDER_COMPLETED:ord_2026_x89")
+            matched = true
+        end
+        assert(matched)
+
+        -- 4. Verifying mock call invocations, counts, and parameters
+        assert_eq(test.mock_call_count(mock_db, "get_user"), 1)
+        assert_eq(test.mock_call_count(mock_db, "insert_order"), 1)
+        assert_eq(test.mock_call_count(mock_http, "POST /v1/payments/charge"), 1)
+
+        local last_db_call = test.mock_last_call(mock_db, "insert_order")
+        assert_eq(last_db_call["args"], ["ord_2026_x89", "usr_alice", "PAID"])
+
+        local last_http_call = test.mock_last_call(mock_http, "POST /v1/payments/charge")
+        assert_eq(last_http_call["args"], ["ord_2026_x89", "4500"])
+    end
+
+    test "fail-closed semantics on missing dependency" do
+        local mock_db = test.mock_new(1001)
+        local partial_projection = test.projection_new([1001], [mock_db])
+
+        local order = CheckoutOrder {
+            order_id = "ord_2026_x89",
+            user_id = "usr_alice",
+            amount_cents = 4500
+        }
+
+        local partial_result: Exit = process_checkout(partial_projection, order)
+        local matched = false
+        if partial_result is Fail(err_msg) then
+            assert_fails(err_msg)
+            assert_eq(err_msg, "Context missing HTTP Client service")
+            matched = true
+        end
+        assert(matched)
+    end
+end
+
+function run_di_mocking_main()
+    println("--- [Example 5: Dependency Injection & Mocking via StackContextProjection] ---")
+
+    -- 1. Initializing Dynamic Mock Services
+    println("\n1. Creating MockService instances for Database (tag 1001) and HTTP (tag 1002):")
+    local mock_db = test.mock_new(1001)
+    local mock_http = test.mock_new(1002)
+
+    test.mock_set_response(
+        mock_http,
+        "POST /v1/payments/charge",
+        "{\"status\": \"APPROVED\", \"charge_id\": \"ch_999\"}"
+    )
+
+    -- 2. Assembling StackContextProjection
+    println("\n2. Projecting dependencies onto the stack (Zero-Heap Allocation):")
+    local projection = test.projection_new([1001, 1002], [mock_db, mock_http])
+    println(string.format("  Verified pointer lookup for TAG_DATABASE (1001): %s", tostring(test.projection_get(projection, 1001) != Option.None)))
+    println(string.format("  Verified pointer lookup for TAG_HTTP_CLIENT (1002): %s", tostring(test.projection_get(projection, 1002) != Option.None)))
+    println(string.format("  Verified unknown service (9999) returns None: %s", tostring(test.projection_get(projection, 9999) == Option.None)))
+
+    -- 3. Executing Business Effect with Injected Context
+    println("\n3. Executing order checkout effect with mocked dependencies:")
+    local order = CheckoutOrder {
+        order_id = "ord_2026_x89",
+        user_id = "usr_alice",
+        amount_cents = 4500
+    }
+
+    local result: Exit = process_checkout(projection, order)
+    if result is Success(outcome) then
+        println(string.format("  Checkout succeeded with outcome: %s", outcome))
+        assert(outcome == "ORDER_COMPLETED:ord_2026_x89")
+    end
+
+    -- 4. Verifying Mock Call Spies and Arguments
+    println("\n4. Verifying mock call invocations, counts, and parameters:")
+    assert(test.mock_call_count(mock_db, "get_user") == 1)
+    assert(test.mock_call_count(mock_db, "insert_order") == 1)
+    assert(test.mock_call_count(mock_http, "POST /v1/payments/charge") == 1)
+    println("  [PASS] All expected method calls registered!")
+
+    local last_db_call = test.mock_last_call(mock_db, "insert_order")
+    println(string.format("  Database last_call arguments: %s", tostring(last_db_call["args"])))
+
+    local last_http_call = test.mock_last_call(mock_http, "POST /v1/payments/charge")
+    println(string.format("  HTTP client last_call arguments: %s", tostring(last_http_call["args"])))
+
+    -- 5. Negative Testing (Missing Context Requirement)
+    println("\n5. Testing fail-closed semantics on missing dependency:")
+    local partial_projection = test.projection_new([1001], [mock_db])
+    local partial_result: Exit = process_checkout(partial_projection, order)
+    if partial_result is Fail(err_msg) then
+        println(string.format("  Captured expected missing context error: \"%s\"", err_msg))
+        assert(err_msg == "Context missing HTTP Client service")
+    end
+
+    println("\n[PASS] Dependency Injection and Mocking verified successfully!")
+    println("All dependency injection assertions passed!")
+end
+
+run_di_mocking_main()

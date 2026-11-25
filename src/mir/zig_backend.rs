@@ -1,3 +1,6 @@
+// Host CLI / tooling boundary: Zig compiler backend invokes external zig compiler and writes to host filesystem.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 #[cfg(feature = "std")]
 pub use zig_engine::{
     MirToZigCompiler, MirZigBackendError, ZigArtifactKind, ZigCompileOptions,
@@ -497,8 +500,8 @@ pub mod zig_engine {
                     MirBinaryOp::BitAnd => format!("({l} & {r})"),
                     MirBinaryOp::BitOr => format!("({l} | {r})"),
                     MirBinaryOp::BitXor => format!("({l} ^ {r})"),
-                    MirBinaryOp::Shl => format!("({l} << @as(u6, @intCast({r} & 63)))"),
-                    MirBinaryOp::Shr => format!("({l} >> @as(u6, @intCast({r} & 63)))"),
+                    MirBinaryOp::Shl => format!("(@as(i64, {l}) << @as(u6, @intCast({r} & 63)))"),
+                    MirBinaryOp::Shr => format!("(@as(i64, {l}) >> @as(u6, @intCast({r} & 63)))"),
                     MirBinaryOp::Eq => format!("{l} == {r}"),
                     MirBinaryOp::NotEq => format!("{l} != {r}"),
                     MirBinaryOp::Lt => format!("{l} < {r}"),
@@ -507,6 +510,7 @@ pub mod zig_engine {
                     MirBinaryOp::GtEq => format!("{l} >= {r}"),
                     MirBinaryOp::And => format!("{l} and {r}"),
                     MirBinaryOp::Or => format!("{l} or {r}"),
+                    MirBinaryOp::Concat => format!("__lust_mir_str_concat({l}, {r})"),
                 };
                 Ok(s)
             }
@@ -531,6 +535,7 @@ pub mod zig_engine {
                 }
                 Ok(format!("__alloc_slice(&[_]i64{{{elems}}})"))
             }
+            Rvalue::Closure { .. } => Err(MirZigBackendError::UnsupportedConstant(MirConstant::Unit)),
             _ => Err(MirZigBackendError::UnsupportedConstant(MirConstant::Unit)),
         }
     }

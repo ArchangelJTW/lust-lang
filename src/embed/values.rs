@@ -655,11 +655,11 @@ impl<'a> Deref for StringRef<'a> {
 
 #[derive(Clone)]
 pub struct ArrayHandle {
-    inner: Rc<RefCell<Vec<Value>>>,
+    inner: Rc<crate::bytecode::LustArray>,
 }
 
 impl ArrayHandle {
-    pub(crate) fn from_rc(inner: Rc<RefCell<Vec<Value>>>) -> Self {
+    pub(crate) fn from_rc(inner: Rc<crate::bytecode::LustArray>) -> Self {
         Self { inner }
     }
 
@@ -1681,7 +1681,9 @@ mod tests {
 
         let mut program = build_program(source);
         program
-            .register_typed_native::<(), Value, _>("bad_native", |_| Ok(Value::Bool(true)))
+            .register_typed_native::<(), Value, _, _>("bad_native", |_| {
+                Ok::<_, String>(Value::Bool(true))
+            })
             .expect("register native");
 
         let error = program.call_raw("main.invoke", Vec::new()).unwrap_err();
@@ -1782,7 +1784,9 @@ mod tests {
         }
 
         program
-            .register_typed_native::<(), LustInt, _>("math.origin_x", |_| Ok(123_i64))
+            .register_typed_native::<(), LustInt, _, _>("math.origin_x", |_| {
+                Ok::<_, String>(123_i64)
+            })
             .expect("register static origin");
         let signature = program.signature("math.origin_x");
         assert!(signature.is_some());

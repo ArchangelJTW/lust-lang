@@ -1,0 +1,57 @@
+-- Lust Reactive Streams (Rx) Observable Foundation
+-- Demonstrates cold Observable streams, Observer subscriptions, virtual scheduling
+-- to quiescence, and joining subscriptions with guaranteed zero lingering callbacks.
+
+suite "Rx Observable Foundation Suite" do
+    test "from_iter delivery order and completion callback" do
+        local received = []
+        local completed = []
+        local scheduler = rx.Scheduler()
+
+        -- 1. Create cold Observable from iterable [10, 20, 30, 40]
+        local stream = rx.from_iter([10, 20, 30, 40])
+
+        -- 2. Subscribe with on_next and on_complete callbacks
+        local sub = rx.subscribe_with(
+            stream,
+            function(item)
+                table.push(received, item)
+            end,
+            function(err)
+            end,
+            function()
+                table.push(completed, true)
+            end
+        )
+
+        -- 3. Join subscription and verify completion
+        local completion = rx.join(sub)
+        assert_eq(completion["exit"], "Completed")
+        assert_eq(completion["items_delivered"], 4)
+        assert_eq(received, [10, 20, 30, 40])
+        assert(table.len(completed) > 0, "Observable stream must report completed")
+    end
+
+    test "interval and RxScheduler advance_by tick count" do
+        local scheduler = rx.Scheduler()
+        local ticks = []
+        local iv = rx.interval(50)
+
+        local sub = rx.subscribe(
+            iv,
+            function(tick)
+                table.push(ticks, tick)
+            end,
+            scheduler
+        )
+
+        rx.advance_by(scheduler, 150)
+        assert_eq(table.len(ticks), 3)
+        assert_eq(ticks, [0, 1, 2])
+
+        rx.unsubscribe(sub)
+        rx.advance_by(scheduler, 100)
+        -- After unsubscribe, tick delivery stops
+        assert_eq(table.len(ticks), 3)
+    end
+end

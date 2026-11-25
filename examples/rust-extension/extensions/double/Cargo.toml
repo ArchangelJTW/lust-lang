@@ -8,5 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 lust = { path = "../../../..", package = "lust-rs" }
+lust-macros = { path = "../../../../crates/lust-macros" }
+lust-ext-abi = { path = "../../../../crates/lust-ext-abi" }
 
 [workspace]

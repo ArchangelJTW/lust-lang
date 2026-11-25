@@ -22,6 +22,13 @@ impl Schema {
                 return Ok(val);
             }
         }
+        if errors.is_empty() {
+            errors.push(ValidationError::new(
+                path,
+                "Validation failed",
+                "validation_failed",
+            ));
+        }
         Err(ValidationErrors::new(errors))
     }
 
@@ -83,6 +90,31 @@ impl Schema {
                 f: Arc::new(transform_fn),
             },
         })
+    }
+
+    pub fn to_json_schema(&self) -> Result<crate::data::Document, crate::schema::interop::SchemaExportError> {
+        crate::schema::interop::to_json_schema(self, None)
+    }
+
+    pub fn to_json_schema_with_options(
+        &self,
+        options: &crate::schema::interop::ExportOptions,
+    ) -> Result<crate::data::Document, crate::schema::interop::SchemaExportError> {
+        crate::schema::interop::to_json_schema(self, Some(options))
+    }
+
+    pub fn as_json_schema_portable(
+        &self,
+        options: Option<&crate::schema::interop::ExportOptions>,
+    ) -> Result<crate::schema::interop::JsonSchemaPortable, crate::schema::interop::SchemaExportError> {
+        crate::schema::interop::as_json_schema_portable(self, options)
+    }
+
+    pub fn export_json_schema_projection(
+        &self,
+        projection: crate::schema::interop::ProjectionMode,
+    ) -> Result<crate::schema::interop::SchemaProjection, crate::schema::interop::SchemaExportError> {
+        crate::schema::interop::export_json_schema_projection(self, projection)
     }
 
     pub fn min(mut self, min: usize) -> Self {
@@ -208,6 +240,14 @@ impl StringBuilder {
     {
         self.build().transform(transform_fn)
     }
+
+    pub fn optional(self) -> Schema {
+        self.build().optional()
+    }
+
+    pub fn nullable(self) -> Schema {
+        self.build().nullable()
+    }
 }
 
 impl From<StringBuilder> for Schema {
@@ -267,6 +307,14 @@ impl IntBuilder {
     {
         self.build().transform(transform_fn)
     }
+
+    pub fn optional(self) -> Schema {
+        self.build().optional()
+    }
+
+    pub fn nullable(self) -> Schema {
+        self.build().nullable()
+    }
 }
 
 impl From<IntBuilder> for Schema {
@@ -325,6 +373,14 @@ impl FloatBuilder {
         F: Fn(DataValue) -> DataValue + Send + Sync + 'static,
     {
         self.build().transform(transform_fn)
+    }
+
+    pub fn optional(self) -> Schema {
+        self.build().optional()
+    }
+
+    pub fn nullable(self) -> Schema {
+        self.build().nullable()
     }
 }
 
@@ -391,11 +447,45 @@ impl ArrayBuilder {
     {
         self.build().transform(transform_fn)
     }
+
+    pub fn optional(self) -> Schema {
+        self.build().optional()
+    }
+
+    pub fn nullable(self) -> Schema {
+        self.build().nullable()
+    }
 }
 
 impl From<ArrayBuilder> for Schema {
     fn from(b: ArrayBuilder) -> Self {
         b.build()
+    }
+}
+
+pub fn unpack_optional(ir: SchemaIR) -> (SchemaIR, bool) {
+    match ir {
+        SchemaIR::Optional(inner) => {
+            let (unwrapped, _) = unpack_optional(*inner);
+            (unwrapped, true)
+        }
+        SchemaIR::Nullable(inner) => {
+            let (unwrapped, is_opt) = unpack_optional(*inner);
+            (SchemaIR::Nullable(Box::new(unwrapped)), is_opt)
+        }
+        SchemaIR::Refine { inner, predicate, message } => {
+            let (unwrapped, is_opt) = unpack_optional(*inner);
+            (SchemaIR::Refine { inner: Box::new(unwrapped), predicate, message }, is_opt)
+        }
+        SchemaIR::Pattern { inner, pattern, mode } => {
+            let (unwrapped, is_opt) = unpack_optional(*inner);
+            (SchemaIR::Pattern { inner: Box::new(unwrapped), pattern, mode }, is_opt)
+        }
+        SchemaIR::Transform { inner, transform } => {
+            let (unwrapped, is_opt) = unpack_optional(*inner);
+            (SchemaIR::Transform { inner: Box::new(unwrapped), transform }, is_opt)
+        }
+        other => (other, false),
     }
 }
 
@@ -414,10 +504,7 @@ impl ObjectBuilder {
 
     pub fn field(mut self, name: impl Into<String>, schema: impl Into<Schema>) -> Self {
         let sch = schema.into();
-        let (schema_ir, optional) = match sch.ir {
-            SchemaIR::Optional(inner) => (*inner, true),
-            other => (other, false),
-        };
+        let (schema_ir, optional) = unpack_optional(sch.ir);
         self.fields.push(ObjectFieldIR {
             name: name.into(),
             schema: schema_ir,
@@ -479,10 +566,88 @@ impl ObjectBuilder {
     {
         self.build().transform(transform_fn)
     }
+
+    pub fn optional(self) -> Schema {
+        self.build().optional()
+    }
+
+    pub fn nullable(self) -> Schema {
+        self.build().nullable()
+    }
 }
 
 impl From<ObjectBuilder> for Schema {
     fn from(b: ObjectBuilder) -> Self {
+        b.build()
+    }
+}
+
+pub struct BinaryBuilder {
+    min_len: Option<usize>,
+    max_len: Option<usize>,
+}
+
+impl BinaryBuilder {
+    pub fn new() -> Self {
+        Self {
+            min_len: None,
+            max_len: None,
+        }
+    }
+
+    pub fn min(mut self, len: usize) -> Self {
+        self.min_len = Some(len);
+        self
+    }
+
+    pub fn max(mut self, len: usize) -> Self {
+        self.max_len = Some(len);
+        self
+    }
+
+    pub fn build(self) -> Schema {
+        Schema::new(SchemaIR::Binary {
+            min_len: self.min_len,
+            max_len: self.max_len,
+        })
+    }
+
+    pub fn compile(self) -> SchemaIR {
+        self.build().ir
+    }
+
+    pub fn refine<F>(self, predicate: F) -> Schema
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        self.build().refine(predicate)
+    }
+
+    pub fn refine_with_message<F>(self, predicate: F, message: impl Into<String>) -> Schema
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        self.build().refine_with_message(predicate, message)
+    }
+
+    pub fn transform<F>(self, transform_fn: F) -> Schema
+    where
+        F: Fn(DataValue) -> DataValue + Send + Sync + 'static,
+    {
+        self.build().transform(transform_fn)
+    }
+
+    pub fn optional(self) -> Schema {
+        self.build().optional()
+    }
+
+    pub fn nullable(self) -> Schema {
+        self.build().nullable()
+    }
+}
+
+impl From<BinaryBuilder> for Schema {
+    fn from(b: BinaryBuilder) -> Self {
         b.build()
     }
 }
@@ -507,6 +672,22 @@ impl SchemaFactory {
 
     pub fn bool(&self) -> Schema {
         Schema::new(SchemaIR::Bool)
+    }
+
+    pub fn binary(&self) -> BinaryBuilder {
+        BinaryBuilder::new()
+    }
+
+    pub fn object_id(&self) -> Schema {
+        Schema::new(SchemaIR::ObjectId)
+    }
+
+    pub fn datetime_utc(&self) -> Schema {
+        Schema::new(SchemaIR::DateTimeUtc)
+    }
+
+    pub fn decimal128(&self) -> Schema {
+        Schema::new(SchemaIR::Decimal128)
     }
 
     pub fn any(&self) -> Schema {
@@ -549,5 +730,13 @@ impl SchemaFactory {
 
     pub fn derive_schema<T: crate::schema::binding::DeriveSchemaTarget>(&self, target: T) -> Schema {
         target.derive_schema()
+    }
+
+    pub fn schema_from_json_schema(
+        &self,
+        doc: &crate::data::Document,
+        options: Option<&crate::schema::interop::ImportOptions>,
+    ) -> Result<Schema, crate::schema::interop::SchemaImportError> {
+        crate::schema::interop::schema_from_json_schema(doc, options)
     }
 }

@@ -717,7 +717,10 @@ pub fn register_dead_after(
                 };
                 pending.push(target);
             }
-            Instruction::JumpIf(_, offset) | Instruction::JumpIfNot(_, offset) => {
+            Instruction::JumpIf(_, offset)
+            | Instruction::JumpIfNot(_, offset)
+            | Instruction::BranchLtInt(_, _, offset)
+            | Instruction::BranchLeInt(_, _, offset) => {
                 let Some(target) = (ip as i64 + 1 + i64::from(offset)).try_into().ok() else {
                     return false;
                 };
@@ -2037,7 +2040,11 @@ impl TraceRecorder {
         if callee_fn.chunk.instructions.iter().any(|inst| {
             matches!(
                 inst,
-                Instruction::Jump(_) | Instruction::JumpIf(..) | Instruction::JumpIfNot(..)
+                Instruction::Jump(_)
+                    | Instruction::JumpIf(..)
+                    | Instruction::JumpIfNot(..)
+                    | Instruction::BranchLtInt(..)
+                    | Instruction::BranchLeInt(..)
             )
         }) {
             return false;
@@ -2573,7 +2580,8 @@ impl TraceRecorder {
                 Ok(())
             }
 
-            Instruction::GetIndex(dest, array, index) => {
+            Instruction::GetIndex(dest, array, index)
+            | Instruction::ArrayGetUnwrap(dest, array, index) => {
                 if let Some(owner) = self.specialized_owner(array, registers)
                     && let Some((specialized_id, _)) =
                         self.specialized_registers.get(&owner).cloned()
@@ -2735,7 +2743,7 @@ impl TraceRecorder {
                 let value_type = registers
                     .get(value_dest as usize)
                     .and_then(Self::get_value_type)
-                    .or_else(|| arr.borrow().first().and_then(Self::get_value_type));
+                    .or_else(|| arr.get_value_fast(0).as_ref().and_then(Self::get_value_type));
                 self.push_op(TraceOp::ArrayIndexOk {
                     value_dest,
                     condition_dest,
@@ -2775,6 +2783,74 @@ impl TraceRecorder {
                 self.push_op(TraceOp::ArrayLen { dest, array });
                 self.mark_guarded(dest);
                 Ok(())
+            }
+
+            Instruction::ArrayPush(array, value) => {
+                if let Some(owner) = self.specialized_owner(array, registers)
+                    && let Some((specialized_id, ref layout)) =
+                        self.specialized_registers.get(&owner).cloned()
+                {
+                    use crate::jit::specialization::SpecializedLayout;
+                    let expected_type = match layout {
+                        SpecializedLayout::Vec {
+                            element_size: 1, ..
+                        } => {
+                            if !matches!(registers[value as usize], Value::Bool(_)) {
+                                self.stop_recording();
+                                return Err(LustError::RuntimeError {
+                                    message: "Trace aborted: ArrayPush element type mismatch"
+                                        .to_string(),
+                                });
+                            }
+                            ValueType::Bool
+                        }
+                        SpecializedLayout::Vec {
+                            element_layout, ..
+                        } if matches!(
+                            **element_layout,
+                            SpecializedLayout::Scalar { is_float: true, .. }
+                        ) =>
+                        {
+                            if !matches!(registers[value as usize], Value::Float(_)) {
+                                self.stop_recording();
+                                return Err(LustError::RuntimeError {
+                                    message: "Trace aborted: ArrayPush element type mismatch"
+                                        .to_string(),
+                                });
+                            }
+                            ValueType::Float
+                        }
+                        _ => {
+                            if !matches!(registers[value as usize], Value::Int(_)) {
+                                self.stop_recording();
+                                return Err(LustError::RuntimeError {
+                                    message: "Trace aborted: ArrayPush element type mismatch"
+                                        .to_string(),
+                                });
+                            }
+                            ValueType::Int
+                        }
+                    };
+                    if !self.is_guarded(value) {
+                        self.push_op(TraceOp::Guard {
+                            register: value,
+                            expected_type,
+                        });
+                        self.mark_guarded(value);
+                    }
+                    self.push_op(TraceOp::SpecializedOp {
+                        op: SpecializedOpKind::VecPush,
+                        operands: vec![
+                            Operand::Specialized(specialized_id),
+                            Operand::Register(value),
+                        ],
+                    });
+                    return Ok(());
+                }
+                self.stop_recording();
+                Err(LustError::RuntimeError {
+                    message: "Trace aborted: ArrayPush on unspecialized array".to_string(),
+                })
             }
 
             Instruction::CallMethod(obj_reg, method_name_idx, first_arg, arg_count, dest_reg) => {
@@ -3055,6 +3131,106 @@ impl TraceRecorder {
                     field_name,
                     value: value_reg,
                     field_index,
+                    value_type,
+                    is_weak: is_weak_field,
+                });
+                Ok(())
+            }
+
+            Instruction::GetFieldSlot(dest, obj_reg, slot_idx) => {
+                let idx = slot_idx as usize;
+                let (field_name, is_weak_field) = match &registers[obj_reg as usize] {
+                    Value::Struct(object) if object.name != "LuaTable" => {
+                        let StructObject { layout, .. } = object.as_ref();
+                        let Some(name) = layout.field_names().get(idx) else {
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "GetFieldSlot index {} out of bounds during trace recording",
+                                    idx
+                                ),
+                            });
+                        };
+                        ((**name).clone(), layout.is_weak(idx))
+                    }
+                    _ => {
+                        return Err(LustError::RuntimeError {
+                            message: "GetFieldSlot on non-struct during trace recording"
+                                .to_string(),
+                        });
+                    }
+                };
+                if let Some(ty) = Self::get_value_type(&registers[obj_reg as usize])
+                    && !self.is_guarded(obj_reg)
+                {
+                    self.push_op(TraceOp::Guard {
+                        register: obj_reg,
+                        expected_type: ty,
+                    });
+                    self.mark_guarded(obj_reg);
+                }
+
+                let value_type = Self::get_value_type(&registers[dest as usize]);
+                self.push_op(TraceOp::GetField {
+                    dest,
+                    object: obj_reg,
+                    field_name,
+                    field_index: Some(idx),
+                    value_type,
+                    is_weak: is_weak_field,
+                });
+                Ok(())
+            }
+
+            Instruction::SetFieldSlot(obj_reg, slot_idx, value_reg) => {
+                let idx = slot_idx as usize;
+                let (field_name, is_weak_field) = match &registers[obj_reg as usize] {
+                    Value::Struct(object) if object.name != "LuaTable" => {
+                        let StructObject { layout, .. } = object.as_ref();
+                        let Some(name) = layout.field_names().get(idx) else {
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "SetFieldSlot index {} out of bounds during trace recording",
+                                    idx
+                                ),
+                            });
+                        };
+                        ((**name).clone(), layout.is_weak(idx))
+                    }
+                    _ => {
+                        return Err(LustError::RuntimeError {
+                            message: "SetFieldSlot on non-struct during trace recording"
+                                .to_string(),
+                        });
+                    }
+                };
+                if let Some(ty) = Self::get_value_type(&registers[obj_reg as usize])
+                    && !self.is_guarded(obj_reg)
+                {
+                    self.push_op(TraceOp::Guard {
+                        register: obj_reg,
+                        expected_type: ty,
+                    });
+                    self.mark_guarded(obj_reg);
+                }
+
+                let value_type = Self::get_value_type(&registers[value_reg as usize]);
+                if let Some(ty) = value_type
+                    && !self.is_guarded(value_reg)
+                {
+                    self.push_op(TraceOp::Guard {
+                        register: value_reg,
+                        expected_type: ty,
+                    });
+                    self.mark_guarded(value_reg);
+                }
+
+                self.rebox_specialized_register(value_reg, "SetFieldSlot");
+
+                self.push_op(TraceOp::SetField {
+                    object: obj_reg,
+                    field_name,
+                    value: value_reg,
+                    field_index: Some(idx),
                     value_type,
                     is_weak: is_weak_field,
                 });
@@ -3590,7 +3766,10 @@ impl TraceRecorder {
                 Ok(())
             }
 
-            Instruction::NewMap(_) => {
+            Instruction::NewMap(_)
+            | Instruction::MapGet(..)
+            | Instruction::MapSet(..)
+            | Instruction::MapGetUnwrap(..) => {
                 self.stop_recording();
                 Err(LustError::RuntimeError {
                     message: "Trace aborted: unsupported index operation".to_string(),
@@ -4220,7 +4399,12 @@ mod tests {
         assert!(!recorder.is_recording());
     }
 
-    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(all(
+        feature = "legacy-dynasm",
+        feature = "std",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn compiled_typed_arithmetic_bails_before_reading_wrong_payloads() {
         let functions = vec![crate::bytecode::Function::new("typed_guard", 0, false)];

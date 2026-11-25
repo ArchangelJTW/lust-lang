@@ -1,0 +1,4 @@
+println("w17-lust-error-path")
+local denom: int = 0
+local bad: int = 42 / denom
+println(tostring(bad))

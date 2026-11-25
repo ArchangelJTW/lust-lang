@@ -26,6 +26,12 @@ fn parse_program(source: &str) -> Vec<lust::ast::Item> {
         .expect("parsing should succeed")
 }
 
+fn try_parse_program(source: &str) -> lust::Result<Vec<lust::ast::Item>> {
+    let mut interner = Interner::new();
+    let tokens = Lexer::new(source, &mut interner).tokenize()?;
+    Parser::new(tokens).parse()
+}
+
 #[test]
 fn test_pipe_lexer_tokens() {
     let mut interner = Interner::new();
@@ -490,6 +496,527 @@ fn test_pipe_cranelift_jit_lowered_call_execution() {
     // 21 |> double (42) |> add_five (47)
     let res = native_pipeline(21);
     assert_eq!(res, 47);
+}
+
+#[test]
+fn test_pipe_placeholder_arbitrary_positions() {
+    let source = r#"
+        function sub(a: int, b: int): int
+            return a - b
+        end
+
+        function clamp(min: int, val: int, max: int): int
+            if val < min then return min end
+            if val > max then return max end
+            return val
+        end
+
+        function test(): int
+            -- first pos: 50 |> sub(_, 20) => sub(50, 20) = 30
+            local r1 = 50 |> sub(_, 20)
+            -- last pos: 50 |> sub(100, _) => sub(100, 50) = 50
+            local r2 = 50 |> sub(100, _)
+            -- middle pos: 25 |> clamp(0, _, 100) => clamp(0, 25, 100) = 25
+            local r3 = 25 |> clamp(0, _, 100)
+            -- middle pos clamped low: -5 |> clamp(0, _, 100) => 0
+            local r4 = -5 |> clamp(0, _, 100)
+            -- middle pos clamped high: 150 |> clamp(0, _, 100) => 100
+            local r5 = 150 |> clamp(0, _, 100)
+            return r1 + r2 + r3 + r4 + r5
+        end
+    "#;
+    let res = run_vm(source, "test").expect("execution should succeed");
+    // 30 + 50 + 25 + 0 + 100 = 205
+    assert_eq!(res, Value::Int(205));
+}
+
+#[test]
+fn test_pipe_method_call_placeholder() {
+    let source = r#"
+        struct Calculator
+            factor: int
+        end
+
+        impl Calculator
+            function compute(self, base: int, extra: int): int
+                return (base - extra) * self.factor
+            end
+        end
+
+        function test(): int
+            local calc = Calculator { factor = 2 }
+            -- 30 piped into extra: calc:compute(100, 30) = (100 - 30) * 2 = 140
+            local r1 = 30 |> calc:compute(100, _)
+            -- 50 piped into base: calc:compute(50, 20) = (50 - 20) * 2 = 60
+            local r2 = 50 |> calc:compute(_, 20)
+            return r1 + r2
+        end
+    "#;
+    let res = run_vm(source, "test").expect("execution should succeed");
+    // 140 + 60 = 200
+    assert_eq!(res, Value::Int(200));
+}
+
+#[test]
+fn test_pipe_unwrap_option_and_result() {
+    let source = r#"
+        function make_some(x: int): Option<int>
+            return Option.Some(x * 2)
+        end
+
+        function make_none(x: int): Option<int>
+            return Option.None
+        end
+
+        function make_ok(x: int): Result<int, string>
+            return Result.Ok(x + 10)
+        end
+
+        function test_unwrap_some(): int ! string
+            return 21 |> make_some?
+        end
+
+        function test_unwrap_ok(): int ! string
+            return 32 |> make_ok?
+        end
+    "#;
+    let res_some = run_vm(source, "test_unwrap_some").expect("unwrap some should succeed");
+    assert_eq!(res_some, Value::Int(42));
+
+    let res_ok = run_vm(source, "test_unwrap_ok").expect("unwrap ok should succeed");
+    assert_eq!(res_ok, Value::Int(42));
+
+    let fail_source = r#"
+        function make_none(x: int): Option<int>
+            return Option.None
+        end
+
+        function test_fail(): int ! string
+            return 10 |> make_none?
+        end
+    "#;
+    assert!(run_vm(fail_source, "test_fail").is_err());
+}
+
+#[test]
+fn test_pipe_unwrap_chained_with_placeholder() {
+    let source = r#"
+        function sub_res(a: int, b: int): Result<int, string>
+            return Result.Ok(a - b)
+        end
+
+        function mul_res(a: int, b: int): Result<int, string>
+            return Result.Ok(a * b)
+        end
+
+        function test(): int ! string
+            -- 20 |> sub_res(100, _)? => Result.Ok(100 - 20) = 80
+            -- 80 |> mul_res(2)? => Result.Ok(80 * 2) = 160
+            return 20 |> sub_res(100, _)? |> mul_res(2)?
+        end
+    "#;
+    let res = run_vm(source, "test").expect("execution should succeed");
+    assert_eq!(res, Value::Int(160));
+}
+
+#[test]
+fn test_currying_partial_application() {
+    let source = r#"
+        function add(a: int, b: int): int
+            return a + b
+        end
+
+        function sub(a: int, b: int): int
+            return a - b
+        end
+
+        function clamp(min: int, val: int, max: int): int
+            if val < min then return min end
+            if val > max then return max end
+            return val
+        end
+
+        function test(): int
+            local add10 = add(10, _)
+            local r1 = add10(5) -- 15
+
+            local sub_from_100 = sub(100, _)
+            local r2 = sub_from_100(30) -- 70
+
+            local sub_20 = sub(_, 20)
+            local r3 = sub_20(50) -- 30
+
+            local clamp_pct = clamp(0, _, 100)
+            local r4 = clamp_pct(150) -- 100
+            local r5 = clamp_pct(-20) -- 0
+            local r6 = clamp_pct(42) -- 42
+
+            local mul = function(a: int, b: int): int return a * b end
+            local curried_mul = mul(_, _)
+            local r7 = curried_mul(6, 7) -- 42
+
+            return r1 + r2 + r3 + r4 + r5 + r6 + r7
+        end
+    "#;
+    let res = run_vm(source, "test").expect("execution should succeed");
+    // 15 + 70 + 30 + 100 + 0 + 42 + 42 = 299
+    assert_eq!(res, Value::Int(299));
+}
+
+#[test]
+fn test_currying_with_pipe_interop() {
+    let source = r#"
+        struct Calculator
+            factor: int
+        end
+
+        impl Calculator
+            function compute(self, base: int, extra: int): int
+                return (base - extra) * self.factor
+            end
+        end
+
+        function add(a: int, b: int): int
+            return a + b
+        end
+
+        function test(): int
+            -- 1. Pipe value into a curried function
+            local add5 = add(5, _)
+            local r1 = 37 |> add5
+
+            -- 2. Pipe directly into placeholder
+            local r2 = 37 |> add(5, _)
+
+            -- 3. Pipe into method currying
+            local calc = Calculator { factor = 2 }
+            local m = calc:compute(10, _)
+            local r3 = 5 |> m
+
+            return r1 + r2 + r3
+        end
+    "#;
+    let res = run_vm(source, "test").expect("execution should succeed");
+    // (37 + 5) + (5 + 37) + (10 - 5) * 2 = 42 + 42 + 10 = 94
+    assert_eq!(res, Value::Int(94));
+}
+
+#[test]
+fn test_pipe_side_effects_evaluated_exactly_once() {
+    let source = r#"
+        struct BoxState
+            count: int
+        end
+
+        impl BoxState
+            function tick(self): int
+                self.count += 1
+                return 25
+            end
+        end
+
+        function sub(a: int, b: int): int
+            return a - b
+        end
+
+        function make_opt(x: int): Option<int>
+            return Option.Some(x + 5)
+        end
+
+        function test(): int ! string
+            local state = BoxState { count = 0 }
+
+            -- state:tick() piped into placeholder: tick() must execute exactly once
+            local r1 = state:tick() |> sub(100, _)
+            local c1 = state.count
+
+            -- state:tick() piped into unwrap: tick() must execute exactly once
+            local r2 = state:tick() |> make_opt?
+            local c2 = state.count
+
+            return r1 + r2 + c1 + c2
+        end
+    "#;
+    let res = run_vm(source, "test").expect("execution should succeed");
+    // r1 = 100 - 25 = 75
+    // c1 = 1
+    // r2 = 25 + 5 = 30
+    // c2 = 2
+    // total = 75 + 30 + 1 + 2 = 108
+    assert_eq!(res, Value::Int(108));
+}
+
+#[test]
+fn test_pipe_parse_failures() {
+    // 1. Multiple placeholders in single pipe step
+    let src1 = "function t() return 10 |> f(_, _) end";
+    let err1 = try_parse_program(src1).unwrap_err();
+    assert!(
+        err1.to_string().contains("Multiple placeholders"),
+        "Expected multiple placeholders error, got: {}",
+        err1
+    );
+
+    // 2. Multiple placeholders with extra arguments
+    let src2 = "function t() return 10 |> f(1, _, _) end";
+    let err2 = try_parse_program(src2).unwrap_err();
+    assert!(
+        err2.to_string().contains("Multiple placeholders"),
+        "Expected multiple placeholders error, got: {}",
+        err2
+    );
+
+    // 3. Multiple placeholders in method call
+    let src3 = "function t() return 10 |> obj:m(_, _) end";
+    let err3 = try_parse_program(src3).unwrap_err();
+    assert!(
+        err3.to_string().contains("Multiple placeholders"),
+        "Expected multiple placeholders error, got: {}",
+        err3
+    );
+
+    // 4. Placeholder as pipe source
+    let src4 = "function t() return _ |> f end";
+    let err4 = try_parse_program(src4).unwrap_err();
+    assert!(
+        err4.to_string().contains("pipe source"),
+        "Expected pipe source error, got: {}",
+        err4
+    );
+
+    // 5. Placeholder as pipe target without call
+    let src5 = "function t() return 10 |> _ end";
+    let err5 = try_parse_program(src5).unwrap_err();
+    assert!(
+        err5.to_string().contains("pipe target"),
+        "Expected pipe target error, got: {}",
+        err5
+    );
+
+    // 6. Standalone placeholder in assignment
+    let src6 = "function t() local x = _ end";
+    let err6 = try_parse_program(src6).unwrap_err();
+    assert!(
+        err6.to_string().contains("Placeholder '_' is only valid in call argument positions"),
+        "Expected standalone placeholder error, got: {}",
+        err6
+    );
+
+    // 7. Standalone placeholder in binary op
+    let src7 = "function t() return 1 + _ end";
+    let err7 = try_parse_program(src7).unwrap_err();
+    assert!(
+        err7.to_string().contains("Placeholder '_' is only valid in call argument positions"),
+        "Expected placeholder binary op error, got: {}",
+        err7
+    );
+
+    // 8. Invalid token after pipe
+    let src8 = "function t() return 10 |> ? end";
+    assert!(try_parse_program(src8).is_err());
+
+    // 9. Multiple parenthesized placeholders
+    let src9 = "function t() return 10 |> f((_), (_)) end";
+    let err9 = try_parse_program(src9).unwrap_err();
+    assert!(
+        err9.to_string().contains("Multiple placeholders"),
+        "Expected multiple placeholders error, got: {}",
+        err9
+    );
+
+    // 10. Multiple nested parenthesized placeholders
+    let src10 = "function t() return 10 |> f(((_)), _) end";
+    let err10 = try_parse_program(src10).unwrap_err();
+    assert!(
+        err10.to_string().contains("Multiple placeholders"),
+        "Expected multiple placeholders error, got: {}",
+        err10
+    );
+
+    // 11. Parenthesized placeholder as pipe target without call
+    let src11 = "function t() return 10 |> ((_)) end";
+    let err11 = try_parse_program(src11).unwrap_err();
+    assert!(
+        err11.to_string().contains("pipe target")
+            || err11
+                .to_string()
+                .contains("Placeholder '_' is only valid in call argument positions"),
+        "Expected pipe target or invalid placeholder error, got: {}",
+        err11
+    );
+
+    // 12. Parenthesized placeholder as pipe source
+    let src12 = "function t() return ((_)) |> f end";
+    let err12 = try_parse_program(src12).unwrap_err();
+    assert!(
+        err12.to_string().contains("pipe source")
+            || err12
+                .to_string()
+                .contains("Placeholder '_' is only valid in call argument positions"),
+        "Expected pipe source or invalid placeholder error, got: {}",
+        err12
+    );
+}
+
+#[test]
+fn test_pipe_placeholder_strict_mir_zero_cost() {
+    let source = r#"
+        function sub(a: int, b: int): int
+            return a - b
+        end
+
+        function compute(x: int): int
+            return x |> sub(100, _)
+        end
+    "#;
+
+    let mut prog = EmbeddedProgram::builder()
+        .with_config(lust::LustConfig::default().with_strict_mir(true))
+        .module("main", source)
+        .entry_module("main")
+        .compile()
+        .expect("Strict MIR compilation should succeed");
+
+    let result = prog
+        .vm_mut()
+        .call("main.compute", vec![Value::Int(30)])
+        .expect("Execution under strict MIR should succeed");
+    // 100 - 30 = 70
+    assert_eq!(result, Value::Int(70));
+}
+
+#[test]
+fn test_pipe_placeholder_cranelift_jit_execution() {
+    use lust::ast::ItemKind;
+    use lust::mir::lowering::AstLowering;
+    use lust::mir::cranelift_backend::jit_engine::CraneliftJitCompiler;
+    use lust::mir::ir::MirModule;
+
+    let source = r#"
+        function sub(a: int, b: int): int
+            return a - b
+        end
+
+        function add(a: int, b: int): int
+            return a + b
+        end
+
+        function pipeline(x: int): int
+            return x |> sub(100, _) |> add(12)
+        end
+    "#;
+
+    let items = parse_program(source);
+    let mut module = MirModule::new("test_pipe_jit_placeholder".into());
+
+    for item in items {
+        if let ItemKind::Function(func_def) = item.kind {
+            let mir_fn = AstLowering::lower_function(&func_def).expect("lower function to MIR");
+            module.add_function(mir_fn);
+        }
+    }
+
+    let mut jit = CraneliftJitCompiler::new().expect("JIT initialization");
+    let func_ptrs = jit.compile_module(&module).expect("Cranelift JIT compilation");
+    let pipe_ptr = *func_ptrs.get("pipeline").expect("pipeline function found");
+    let native_pipeline: extern "C" fn(i64) -> i64 = unsafe { core::mem::transmute(pipe_ptr) };
+
+    // 100 - 30 = 70; 70 + 12 = 82
+    let res = native_pipeline(30);
+    assert_eq!(res, 82);
+}
+
+#[test]
+fn test_pipe_parenthesized_targets_and_nested_parens() {
+    let source = r#"
+        function sub(a: int, b: int): int
+            return a - b
+        end
+
+        function add(a: int, b: int): int
+            return a + b
+        end
+
+        function make_some(x: int): Option<int>
+            return Option.Some(x * 2)
+        end
+
+        function test(): int ! string
+            -- 1. Parens around target call with placeholder
+            local r1 = 10 |> (sub(100, _)) -- 90
+
+            -- 2. Double parens around target call
+            local r2 = 10 |> ((sub(100, _))) -- 90
+
+            -- 3. Parens around unwrap target
+            local r3 = 21 |> (make_some?) -- 42
+
+            -- 4. Parens around callee with unwrap outside
+            local r4 = 21 |> (make_some)? -- 42
+
+            -- 5. Nested parens around placeholder in call arg
+            local r5 = 10 |> sub(100, ((_))) -- 90
+
+            -- 6. Currying with nested parens around placeholder
+            local curried_add = add((((_))), 5)
+            local r6 = curried_add(10) -- 15
+
+            return r1 + r2 + r3 + r4 + r5 + r6
+        end
+    "#;
+    let res = run_vm(source, "test").expect("execution should succeed");
+    // 90 + 90 + 42 + 42 + 90 + 15 = 369
+    assert_eq!(res, Value::Int(369));
+}
+
+#[test]
+fn test_pipe_method_call_unwrap() {
+    let source = r#"
+        struct Calculator
+            factor: int
+        end
+
+        impl Calculator
+            function compute_opt(self, base: int, extra: int): Option<int>
+                return Option.Some((base - extra) * self.factor)
+            end
+
+            function default_opt(self, base: int): Option<int>
+                return Option.Some(base * self.factor)
+            end
+        end
+
+        function test(): int ! string
+            local calc = Calculator { factor = 3 }
+
+            -- method call unwrap with placeholder: (100 - 20) * 3 = 240
+            local r1 = 20 |> calc:compute_opt(100, _)?
+
+            -- method call unwrap with thread-first: 10 * 3 = 30
+            local r2 = 10 |> calc:default_opt()?
+
+            return r1 + r2
+        end
+    "#;
+    let res = run_vm(source, "test").expect("execution should succeed");
+    // 240 + 30 = 270
+    assert_eq!(res, Value::Int(270));
+}
+
+#[test]
+fn test_pipe_function_call_empty_parens_unwrap() {
+    let source = r#"
+        function make_opt(x: int): Option<int>
+            return Option.Some(x + 100)
+        end
+
+        function test(): int ! string
+            -- unwrap with empty parens: make_opt(50)? => 150
+            return 50 |> make_opt()?
+        end
+    "#;
+    let res = run_vm(source, "test").expect("execution should succeed");
+    assert_eq!(res, Value::Int(150));
 }
 
 

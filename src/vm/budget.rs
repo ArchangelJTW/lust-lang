@@ -5,21 +5,48 @@ const MAP_ENTRY_BYTES_ESTIMATE: usize = 64;
 const UPVALUE_BYTES_ESTIMATE: usize = 64;
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct BudgetState {
-    gas: GasBudget,
-    memory: MemoryBudget,
+pub struct BudgetState {
+    pub(crate) gas: GasBudget,
+    pub(crate) memory: MemoryBudget,
+    #[cfg(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    ))]
+    pub(crate) telemetry_sink: Option<alloc::sync::Arc<dyn crate::vm::telemetry::TelemetrySink>>,
+    #[cfg(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    ))]
+    pub(crate) telemetry_mask: crate::vm::telemetry::TelemetrySignalMask,
+    #[cfg(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    ))]
+    pub(crate) last_gas_consumed_flushed: u64,
 }
 
 #[derive(Debug, Clone, Default)]
-struct GasBudget {
-    limit: Option<u64>,
-    used: u64,
+pub(crate) struct GasBudget {
+    pub(crate) limit: Option<u64>,
+    pub(crate) used: u64,
 }
 
 #[derive(Debug, Clone, Default)]
-struct MemoryBudget {
-    limit_bytes: Option<usize>,
-    used_bytes: usize,
+pub(crate) struct MemoryBudget {
+    pub(crate) limit_bytes: Option<usize>,
+    pub(crate) used_bytes: usize,
 }
 
 impl BudgetState {
@@ -130,10 +157,12 @@ impl VM {
             self.invalidate_jit_code();
         }
         self.budgets.gas.limit = Some(limit);
+        self.sync_slow_path_flags();
     }
 
     pub fn clear_gas_budget(&mut self) {
         self.budgets.gas.limit = None;
+        self.sync_slow_path_flags();
     }
 
     /// Whether compiled code must charge gas at loop back-edges.
@@ -154,11 +183,31 @@ impl VM {
     pub(crate) fn sync_gas_from_cells(&mut self) {
         if let Some(limit) = self.budgets.gas.limit {
             self.budgets.gas.used = limit.saturating_sub(self.jit_cells.gas_left);
+            #[cfg(any(
+                feature = "telemetry",
+                feature = "telemetry-all",
+                feature = "telemetry-vm"
+            ))]
+            self.flush_gas_telemetry();
         }
     }
 
     pub fn reset_gas_counter(&mut self) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        self.flush_gas_telemetry();
         self.budgets.gas.used = 0;
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            self.budgets.last_gas_consumed_flushed = 0;
+        }
     }
 
     pub fn gas_used(&self) -> u64 {
@@ -233,6 +282,12 @@ impl VM {
         }
         self.budgets.memory.limit_bytes = None;
         self.budgets.memory.used_bytes = 0;
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        self.record_memory_used(0);
         self.invalidate_jit_code();
         Ok(())
     }
@@ -251,6 +306,12 @@ impl VM {
             });
         }
         self.budgets.memory.used_bytes = 0;
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        self.record_memory_used(0);
         Ok(())
     }
 
@@ -265,8 +326,45 @@ impl VM {
             .map(|limit| limit.saturating_sub(self.budgets.memory.used_bytes))
     }
 
-    pub(crate) fn try_charge_memory_bytes(&mut self, bytes: usize) -> bool {
-        self.budgets.try_charge_mem_bytes(bytes)
+    pub fn memory_budget_bytes(&self) -> Option<usize> {
+        self.budgets.memory.limit_bytes
+    }
+
+    pub fn memory_used(&self) -> usize {
+        self.budgets.memory.used_bytes
+    }
+
+    pub fn try_charge_memory_bytes(&mut self, bytes: usize) -> bool {
+        let success = self.budgets.try_charge_mem_bytes(bytes);
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if success {
+                self.record_memory_used(self.budgets.memory.used_bytes);
+            } else {
+                self.record_memory_limit_rejection();
+            }
+        }
+        success
+    }
+
+    pub fn refund_memory_bytes(&mut self, bytes: usize) {
+        self.budgets.memory.used_bytes = self.budgets.memory.used_bytes.saturating_sub(bytes);
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        self.record_memory_used(self.budgets.memory.used_bytes);
+    }
+
+    /// Releases memory safely using saturating_sub without resetting bytecode-charged bytes.
+    /// Provided for FFI capacity accounting (Track 2B).
+    pub fn release_memory_bytes(&mut self, bytes: usize) {
+        self.refund_memory_bytes(bytes);
     }
 
     pub(crate) fn try_charge_memory_value_vec(&mut self, element_count: usize) -> bool {
@@ -419,14 +517,35 @@ mod tests {
                         local arr: Array<int> = []
                         array.push(arr, 1)
                     end
+                    function grow_many(): ()
+                        local arr: Array<int> = []
+                        local i: int = 0
+                        while i < 16 do
+                            array.push(arr, i)
+                            i = i + 1
+                        end
+                    end
                 "#,
             )
             .entry_module("main")
             .compile()?;
 
-        program.vm_mut().set_memory_budget_bytes(32)?;
+        // Single unboxed int push allocates size_of::<i64>() (8 bytes), so a 4-byte budget traps immediately.
+        program.vm_mut().set_memory_budget_bytes(4)?;
         program.vm_mut().reset_memory_counter()?;
         let err = program.call_raw("main.grow", vec![]).unwrap_err();
+        match err {
+            LustError::RuntimeErrorWithTrace { message, .. }
+            | LustError::RuntimeError { message } => {
+                assert!(message.to_lowercase().contains("memory budget"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        // Geometric growth across multiple pushes traps under a 32-byte budget.
+        program.vm_mut().set_memory_budget_bytes(32)?;
+        program.vm_mut().reset_memory_counter()?;
+        let err = program.call_raw("main.grow_many", vec![]).unwrap_err();
         match err {
             LustError::RuntimeErrorWithTrace { message, .. }
             | LustError::RuntimeError { message } => {
@@ -437,6 +556,8 @@ mod tests {
         Ok(())
     }
 
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(feature = "legacy-dynasm")]
     #[test]
     fn warm_root_trace_before_budget_then_no_native_entry_and_budget_error() -> Result<()> {
         let source = r#"
@@ -510,6 +631,8 @@ mod tests {
         Ok(())
     }
 
+    // Legacy Dynasm whole-function JIT test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(feature = "legacy-dynasm")]
     #[test]
     fn warm_whole_function_before_budget_then_interpreter_fallback() -> Result<()> {
         let source = r#"
@@ -711,6 +834,8 @@ mod tests {
         Ok(())
     }
 
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(feature = "legacy-dynasm")]
     #[test]
     fn root_trace_invoking_callback_rejects_budget_mutations() -> Result<()> {
         let source = r#"
@@ -898,6 +1023,8 @@ mod tests {
         Ok(())
     }
 
+    // Legacy Dynasm trace test: Dynasm JIT was retired in favor of Cranelift JIT.
+    #[cfg(feature = "legacy-dynasm")]
     #[test]
     fn idle_clear_invalidates_stale_code_and_resumes_jit() -> Result<()> {
         let source = r#"
@@ -1049,7 +1176,10 @@ mod tests {
         assert_eq!(program.memory_remaining_bytes(), None);
         assert_eq!(program.memory_used_bytes(), 0);
         assert!(!program.vm().budgets.mem_budget_enabled());
-        assert!(program.effective_jit_enabled());
+        assert_eq!(
+            program.effective_jit_enabled(),
+            program.jit_configured_enabled()
+        );
 
         Ok(())
     }

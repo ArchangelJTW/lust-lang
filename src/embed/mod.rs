@@ -4,7 +4,9 @@ pub mod native_types;
 pub mod program;
 pub mod values;
 
-pub use async_runtime::{AsyncTaskQueue, PendingAsyncTask};
+pub use async_runtime::{
+    AsyncCompleter, AsyncSignalFuture, AsyncTaskQueue, PendingAsyncTask, signal_pair,
+};
 pub use conversions::{
     FromLustArgs, FromLustValue, FromStructField, FunctionArgs, IntoLustValue, IntoTypedValue,
     LustStructView,

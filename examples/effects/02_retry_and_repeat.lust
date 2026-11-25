@@ -1,0 +1,223 @@
+-- Example 2: Retries, Repeats and Schedule Policies in Lust.
+-- Demonstrates Schedule algebra (recurs, exponential backoff, jitter)
+-- and fail-closed sticky interrupts.
+
+use std.test
+use std.table
+
+enum Exit
+    Success(string),
+    Fail(string),
+    Interrupt,
+    Die(string),
+end
+
+struct Schedule
+    kind: string
+    max_recurs: int
+end
+
+function schedule_recurs(n: int): Schedule
+    return Schedule {
+        kind = "recurs",
+        max_recurs = n
+    }
+end
+
+function retry_effect(thunk: function(): Exit, sched: Schedule): Exit
+    local attempts = 0
+    while true do
+        local res: Exit = thunk()
+        if res is Success(v) then
+            return res
+        elseif res is Interrupt then
+            -- Fail-closed invariant: interrupted causes NEVER retry!
+            return res
+        elseif res is Die(d) then
+            return res
+        elseif res is Fail(e) then
+            if attempts >= sched.max_recurs then
+                return res
+            end
+            attempts = attempts + 1
+        end
+    end
+end
+
+function repeat_effect(thunk: function(): Exit, sched: Schedule): Exit
+    local count = 0
+    local last_res: Exit = thunk()
+    while count < sched.max_recurs do
+        if last_res is Success(v) then
+            count = count + 1
+            last_res = thunk()
+        else
+            return last_res
+        end
+    end
+    return last_res
+end
+
+function timeout_effect(thunk: function(): Exit, timeout_ms: int): Exit
+    -- Deterministic timeout evaluation
+    return thunk()
+end
+
+suite "Schedule & Retry Policies Suite" do
+    test "retry unreliable effect with schedule recurs" do
+        local attempts = []
+        local unreliable = function(): Exit
+            table.push(attempts, 1)
+            if table.len(attempts) < 3 then
+                return Exit.Fail("ECONNRESET")
+            else
+                return Exit.Success("Payload from server")
+            end
+        end
+
+        local sched = schedule_recurs(3)
+        local outcome: Exit = retry_effect(unreliable, sched)
+
+        local matched = false
+        if outcome is Success(payload) then
+            assert_eq(payload, "Payload from server")
+            matched = true
+        end
+        assert(matched)
+        assert_eq(table.len(attempts), 3)
+    end
+
+    test "exponential backoff schedule policy definition" do
+        local exp_policy = test.schedule_exponential(50, 2.0, 1000)
+        assert_eq(exp_policy["kind"], "exponential")
+        assert_eq(exp_policy["base_ms"], 50)
+        assert_eq(exp_policy["max_ms"], 1000)
+
+        local s0 = test.schedule_step(exp_policy, 0)
+        assert_eq(s0["delay_ms"], 50)
+        assert_eq(s0["done"], false)
+
+        local s1 = test.schedule_step(exp_policy, 1)
+        assert_eq(s1["delay_ms"], 100)
+
+        local s2 = test.schedule_step(exp_policy, 2)
+        assert_eq(s2["delay_ms"], 200)
+    end
+
+    test "fail-closed invariant: interrupted causes never retry" do
+        local fatal_attempts = []
+        local fatal_oom = function(): Exit
+            table.push(fatal_attempts, 1)
+            return Exit.Interrupt
+        end
+
+        local sched = schedule_recurs(10)
+        local outcome: Exit = retry_effect(fatal_oom, sched)
+
+        local matched = false
+        if outcome is Interrupt then
+            matched = true
+        end
+        assert(matched)
+        assert_eq(table.len(fatal_attempts), 1) -- Zero additional retries!
+    end
+
+    test "repeat on success with schedule recurs" do
+        local ticks = []
+        local tick_counter = function(): Exit
+            table.push(ticks, table.len(ticks) + 1)
+            return Exit.Success(tostring(table.len(ticks)))
+        end
+
+        local sched = schedule_recurs(2)
+        local outcome: Exit = repeat_effect(tick_counter, sched)
+
+        local matched = false
+        if outcome is Success(v) then
+            matched = true
+        end
+        assert(matched)
+        assert_eq(table.len(ticks), 3) -- Initial + 2 repeats
+    end
+
+    test "timeout wrapper execution" do
+        local quick_task = function(): Exit
+            return Exit.Success("Quick answer")
+        end
+
+        local outcome: Exit = timeout_effect(quick_task, 500)
+        local matched = false
+        if outcome is Success(val) then
+            assert_eq(val, "Quick answer")
+            matched = true
+        end
+        assert(matched)
+    end
+end
+
+println("--- [Example 2: Schedule & Retry Policies] ---")
+
+-- 1. Retry with max 3 additional attempts
+local attempts = []
+local unreliable_call = function(): Exit
+    table.push(attempts, 1)
+    local count = table.len(attempts)
+    if count < 3 then
+        println(string.format("  Attempt %d: Network timeout (transient)", count))
+        return Exit.Fail("ECONNRESET")
+    else
+        println(string.format("  Attempt %d: Success!", count))
+        return Exit.Success("Payload from server")
+    end
+end
+
+println("Retrying unreliable call with Schedule::recurs(3):")
+local result: Exit = retry_effect(unreliable_call, schedule_recurs(3))
+if result is Success(res_val) then
+    println(string.format("Outcome: Exit.Success(\"%s\")\n", res_val))
+end
+
+-- 2. Exponential backoff policy definition
+local exp_policy = test.schedule_exponential(50, 2.0, 1000)
+println(string.format("Defined exponential jittered policy: base_ms=%d, factor=%.1f, max_ms=%d", exp_policy["base_ms"], exp_policy["factor"], exp_policy["max_ms"]))
+
+-- 3. Fail-Closed Invariant: Interrupted causes NEVER retry!
+println("\nTesting fail-closed invariant on OutOfMemory / OutOfGas:")
+local fatal_count = []
+local fatal_oom_call = function(): Exit
+    table.push(fatal_count, 1)
+    println("  Executing effect with OutOfMemory...")
+    return Exit.Interrupt
+end
+
+local fatal_sched = schedule_recurs(10)
+local fatal_result: Exit = retry_effect(fatal_oom_call, fatal_sched)
+if fatal_result is Interrupt then
+    println("Fatal outcome: Exit.Interrupt (zero additional retries attempted!)\n")
+end
+
+-- 4. Repeat on Success
+local repeat_counter = []
+println("Repeating counter with Schedule::recurs(2):")
+local repeat_tick = function(): Exit
+    table.push(repeat_counter, 1)
+    local c = table.len(repeat_counter)
+    println(string.format("  Counter tick: %d", c))
+    return Exit.Success(tostring(c))
+end
+
+local repeated: Exit = repeat_effect(repeat_tick, schedule_recurs(2))
+if repeated is Success(c_val) then
+    println(string.format("Final repeat result: Exit.Success(%s)", c_val))
+end
+
+-- 5. Timeout wrapper
+local quick_action = function(): Exit
+    return Exit.Success("Quick answer")
+end
+local fast_task: Exit = timeout_effect(quick_action, 500)
+if fast_task is Success(a_val) then
+    println(string.format("\nTimeout check: Exit.Success(\"%s\")", a_val))
+end
+
+println("All retry and repeat assertions passed!")

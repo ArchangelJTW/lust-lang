@@ -291,6 +291,6 @@ fn collect_inlay_hints_from_expr(
             }
         }
 
-        ExprKind::Literal(_) | ExprKind::Identifier(_) => {}
+        ExprKind::Literal(_) | ExprKind::Identifier(_) | ExprKind::RegexLiteral { .. } => {}
     }
 }

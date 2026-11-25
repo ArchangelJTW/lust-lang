@@ -26,6 +26,12 @@ pub enum ItemKind {
     Service(ServiceDef),
     Test(TestDecl),
     Suite(SuiteDecl),
+    Schema(SchemaDef),
+    TypeAlias {
+        name: String,
+        ty: Type,
+        visibility: Visibility,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -273,4 +279,30 @@ pub enum ExternItem {
     },
     Struct(StructDef),
     Enum(EnumDef),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchemaDef {
+    pub name: String,
+    pub fields: Vec<SchemaField>,
+    pub visibility: Visibility,
+    pub doc: Option<String>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchemaField {
+    pub name: String,
+    pub ty: Type,
+    pub constraints: Vec<SchemaConstraint>,
+    pub visibility: Visibility,
+    pub doc: Option<String>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchemaConstraint {
+    pub name: String,
+    pub args: Vec<super::Expr>,
+    pub span: Span,
 }

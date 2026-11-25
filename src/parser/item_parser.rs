@@ -70,7 +70,13 @@ impl Parser {
 
             TokenKind::Use => {
                 self.advance();
-                let mut path = vec![self.expect_identifier()?];
+                let mut path = if self.check(TokenKind::String) {
+                    let s = self.current_token().lexeme.clone();
+                    self.advance();
+                    vec![s]
+                } else {
+                    vec![self.expect_identifier()?]
+                };
                 while self.match_token(&[TokenKind::Dot]) {
                     if self.match_token(&[TokenKind::LeftBrace]) {
                         let mut items = Vec::new();
@@ -138,6 +144,13 @@ impl Parser {
                 } else {
                     None
                 };
+                if path.iter().any(|p| p == "@std/regex" || p == "regex") {
+                    if let Some(a) = &alias {
+                        if !self.regex_aliases.contains(a) {
+                            self.regex_aliases.push(a.clone());
+                        }
+                    }
+                }
                 ItemKind::Use {
                     public: is_export,
                     tree: crate::ast::UseTree::Path {
@@ -179,6 +192,9 @@ impl Parser {
                     TokenKind::End
                 };
                 while !self.check(terminator) && !self.is_at_end() {
+                    if self.match_token(&[TokenKind::Semicolon]) {
+                        continue;
+                    }
                     self.collect_pending_docs();
                     let mut item_doc = self.take_pending_docs();
                     if item_doc.is_none() {
@@ -303,6 +319,84 @@ impl Parser {
             {
                 let suite_decl = self.parse_suite_decl()?;
                 ItemKind::Suite(suite_decl)
+            }
+
+            TokenKind::Identifier
+                if self.current_token().lexeme == "schema"
+                    && self.peek_ahead(1).is_some_and(|t| t.kind == TokenKind::Identifier) =>
+            {
+                self.advance();
+                let name = self.expect_identifier()?;
+                let mut fields = Vec::new();
+                while !self.check(TokenKind::End) && !self.is_at_end() {
+                    self.collect_pending_docs();
+                    let field_doc = self.take_pending_docs();
+                    let f_start = self.current_token().clone();
+                    let field_name = self.expect_identifier()?;
+                    self.consume(TokenKind::Colon, "Expected ':' after field name")?;
+                    let field_ty = self.parse_type()?;
+                    let mut constraints = Vec::new();
+                    while self.match_token(&[TokenKind::At]) {
+                        let c_start = self.tokens[self.current - 1].clone();
+                        let c_name = self.expect_identifier()?;
+                        let args = if self.match_token(&[TokenKind::LeftParen]) {
+                            let mut a = Vec::new();
+                            if !self.check(TokenKind::RightParen) {
+                                a.push(self.parse_expr()?);
+                                while self.match_token(&[TokenKind::Comma]) {
+                                    a.push(self.parse_expr()?);
+                                }
+                            }
+                            self.consume(TokenKind::RightParen, "Expected ')' after constraint arguments")?;
+                            a
+                        } else {
+                            Vec::new()
+                        };
+                        let c_end = self.tokens[self.current - 1].clone();
+                        constraints.push(crate::ast::SchemaConstraint {
+                            name: c_name,
+                            args,
+                            span: self.make_span(&c_start, &c_end),
+                        });
+                    }
+                    self.match_token(&[TokenKind::Comma, TokenKind::Semicolon]);
+                    let f_end = self.tokens[self.current - 1].clone();
+                    fields.push(crate::ast::SchemaField {
+                        name: field_name,
+                        ty: field_ty,
+                        constraints,
+                        visibility: Visibility::Public,
+                        doc: field_doc,
+                        span: self.make_span(&f_start, &f_end),
+                    });
+                }
+                self.consume(TokenKind::End, "Expected 'end' after schema definition")?;
+                let end_token = self.tokens[self.current - 1].clone();
+                let span = self.make_span(&start_token, &end_token);
+                ItemKind::Schema(crate::ast::SchemaDef {
+                    name,
+                    fields,
+                    visibility,
+                    doc,
+                    span,
+                })
+            }
+
+            TokenKind::Identifier
+                if self.current_token().lexeme == "type"
+                    && self.peek_ahead(1).is_some_and(|t| t.kind == TokenKind::Identifier)
+                    && self.peek_ahead(2).is_some_and(|t| t.kind == TokenKind::Equal) =>
+            {
+                self.advance();
+                let name = self.expect_identifier()?;
+                self.consume(TokenKind::Equal, "Expected '=' after type alias name")?;
+                let ty = self.parse_type()?;
+                self.match_token(&[TokenKind::Semicolon]);
+                ItemKind::TypeAlias {
+                    name,
+                    ty,
+                    visibility,
+                }
             }
 
             _ => {

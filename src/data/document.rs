@@ -14,7 +14,7 @@ impl fmt::Display for DuplicateKeyError {
 /// Ordered map of unique string keys to DataValue entries
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Document {
-    entries: Vec<(String, DataValue)>,
+    pub(crate) entries: Vec<(String, DataValue)>,
 }
 
 impl Document {

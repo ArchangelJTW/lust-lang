@@ -5,9 +5,11 @@
   "patterns": [
     { "include": "#comments" },
     { "include": "#strings" },
-    { "include": "#constants" },
+    { "include": "#attributes" },
     { "include": "#declarations" },
+    { "include": "#constants" },
     { "include": "#keywords" },
+    { "include": "#stdlib" },
     { "include": "#types" },
     { "include": "#functions" },
     { "include": "#operators" },
@@ -22,8 +24,19 @@
           "end": "\\]\\]"
         },
         {
+          "name": "comment.line.double-dash.lust",
+          "match": "----.*$"
+        },
+        {
           "name": "comment.line.documentation.lust",
-          "match": "---\\s.*$"
+          "begin": "---(?!-)",
+          "end": "$",
+          "patterns": [
+            {
+              "name": "entity.other.attribute-name.documentation.lust",
+              "match": "@[a-zA-Z_][a-zA-Z0-9_]*"
+            }
+          ]
         },
         {
           "name": "comment.line.double-dash.lust",
@@ -40,6 +53,44 @@
     "strings": {
       "patterns": [
         {
+          "name": "string.regexp.lust",
+          "begin": "\\b(regex)(!)(\")",
+          "beginCaptures": {
+            "1": { "name": "support.function.macro.lust" },
+            "2": { "name": "keyword.operator.macro.lust" },
+            "3": { "name": "punctuation.definition.string.begin.lust" }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.lust" }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.regexp.lust",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.regexp.lust",
+          "begin": "\\b(regex)(!)(')",
+          "beginCaptures": {
+            "1": { "name": "support.function.macro.lust" },
+            "2": { "name": "keyword.operator.macro.lust" },
+            "3": { "name": "punctuation.definition.string.begin.lust" }
+          },
+          "end": "'",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.lust" }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.regexp.lust",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
           "name": "string.quoted.other.multiline.lust",
           "begin": "\\[\\[",
           "end": "\\]\\]"
@@ -51,7 +102,11 @@
           "patterns": [
             {
               "name": "constant.character.escape.lust",
-              "match": "\\\\(?:[abfnrtvz\\\\\"']|x[0-9a-fA-F]{2}|u\\{[0-9a-fA-F]+\\}|[0-9]{1,3})"
+              "match": "\\\\(?:[abfnrtvz\\\\\"'0]|x[0-9a-fA-F]{2}|u\\{[0-9a-fA-F]+\\}|[0-9]{1,3})"
+            },
+            {
+              "name": "support.module.std.lust",
+              "match": "(?<=\")@std/[a-zA-Z_][a-zA-Z0-9_./-]*(?=\")"
             }
           ]
         },
@@ -62,9 +117,143 @@
           "patterns": [
             {
               "name": "constant.character.escape.lust",
-              "match": "\\\\(?:[abfnrtvz\\\\\"']|x[0-9a-fA-F]{2}|u\\{[0-9a-fA-F]+\\}|[0-9]{1,3})"
+              "match": "\\\\(?:[abfnrtvz\\\\\"'0]|x[0-9a-fA-F]{2}|u\\{[0-9a-fA-F]+\\}|[0-9]{1,3})"
+            },
+            {
+              "name": "support.module.std.lust",
+              "match": "(?<=')@std/[a-zA-Z_][a-zA-Z0-9_./-]*(?=')"
             }
           ]
+        }
+      ]
+    },
+    "attributes": {
+      "patterns": [
+        {
+          "name": "support.module.std.lust",
+          "match": "@std/[a-zA-Z_][a-zA-Z0-9_/-]*(?:\\.[a-zA-Z_][a-zA-Z0-9_]*)*"
+        },
+        {
+          "name": "meta.attribute.lust",
+          "match": "(@)([a-zA-Z_][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "punctuation.definition.attribute.lust" },
+            "2": { "name": "entity.other.attribute-name.lust" }
+          }
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(function)\\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\\.[a-zA-Z_][a-zA-Z0-9_]*)*(?::[a-zA-Z_][a-zA-Z0-9_]*)?)",
+          "captures": {
+            "1": { "name": "storage.type.function.lust" },
+            "2": { "name": "entity.name.function.lust" }
+          }
+        },
+        {
+          "match": "\\b(struct)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.struct.lust" },
+            "2": { "name": "entity.name.type.struct.lust" }
+          }
+        },
+        {
+          "match": "\\b(enum)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.enum.lust" },
+            "2": { "name": "entity.name.type.enum.lust" }
+          }
+        },
+        {
+          "match": "\\b(trait)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.trait.lust" },
+            "2": { "name": "entity.name.type.trait.lust" }
+          }
+        },
+        {
+          "match": "\\b(schema)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.schema.lust" },
+            "2": { "name": "entity.name.type.schema.lust" }
+          }
+        },
+        {
+          "match": "\\b(type)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*(?:<[^>]*>\\s*)?=)",
+          "captures": {
+            "1": { "name": "storage.type.alias.lust" },
+            "2": { "name": "entity.name.type.alias.lust" }
+          }
+        },
+        {
+          "match": "\\b(service)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*:|\\s*$)",
+          "captures": {
+            "1": { "name": "storage.type.service.lust" },
+            "2": { "name": "entity.name.type.service.lust" }
+          }
+        },
+        {
+          "match": "\\b(effect)\\s+(?!do\\b)([A-Z][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.effect.lust" },
+            "2": { "name": "entity.name.type.effect.lust" }
+          }
+        },
+        {
+          "match": "\\b(impl)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s+(for)\\s+([a-zA-Z_][a-zA-Z0-9_.]*)",
+          "captures": {
+            "1": { "name": "storage.type.impl.lust" },
+            "2": { "name": "entity.name.type.trait.lust" },
+            "3": { "name": "keyword.control.lust" },
+            "4": { "name": "entity.name.type.lust" }
+          }
+        },
+        {
+          "match": "\\b(impl)\\s+([a-zA-Z_][a-zA-Z0-9_.]*)",
+          "captures": {
+            "1": { "name": "storage.type.impl.lust" },
+            "2": { "name": "entity.name.type.lust" }
+          }
+        },
+        {
+          "match": "\\b(module)\\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\\.[a-zA-Z_][a-zA-Z0-9_]*)*)",
+          "captures": {
+            "1": { "name": "storage.modifier.lust" },
+            "2": { "name": "entity.name.section.module.lust" }
+          }
+        },
+        {
+          "match": "\\b(import)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s+(from)\\b",
+          "captures": {
+            "1": { "name": "keyword.control.import.lust" },
+            "2": { "name": "entity.name.section.module.lust" },
+            "3": { "name": "keyword.control.import.lust" }
+          }
+        },
+        {
+          "match": "\\b(test|suite|describe)(\\.)(skip|only|timeout)\\b",
+          "captures": {
+            "1": { "name": "keyword.control.test.lust" },
+            "2": { "name": "punctuation.delimiter.lust" },
+            "3": { "name": "entity.other.attribute-name.test.lust" }
+          }
+        },
+        {
+          "name": "keyword.control.test.lust",
+          "match": "\\b(test|suite|describe)\\b(?=\\s*[\"'])"
+        },
+        {
+          "match": "\\b(test)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*(?:do\\b|\\{))",
+          "captures": {
+            "1": { "name": "keyword.control.test.lust" },
+            "2": { "name": "entity.name.function.test.lust" }
+          }
+        },
+        {
+          "name": "keyword.control.test.lust",
+          "match": "\\b(before_each|after_each|before_all|after_all)\\b(?=\\s*(?:do\\b|\\{))"
         }
       ]
     },
@@ -84,62 +273,31 @@
         },
         {
           "name": "constant.numeric.hex.lust",
-          "match": "\\b0[xX][0-9a-fA-F_]+\\b"
+          "match": "\\b0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*\\b"
         },
         {
           "name": "constant.numeric.binary.lust",
-          "match": "\\b0[bB][01_]+\\b"
+          "match": "\\b0[bB][01](?:_?[01])*\\b"
+        },
+        {
+          "name": "constant.numeric.octal.lust",
+          "match": "\\b0[oO][0-7](?:_?[0-7])*\\b"
         },
         {
           "name": "constant.numeric.float.lust",
-          "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9_]+)?\\b"
+          "match": "\\b[0-9](?:_?[0-9])*\\.[0-9](?:_?[0-9])*(?:[eE][+-]?[0-9](?:_?[0-9])*)?\\b"
+        },
+        {
+          "name": "constant.numeric.float.lust",
+          "match": "\\b[0-9](?:_?[0-9])*[eE][+-]?[0-9](?:_?[0-9])*\\b"
         },
         {
           "name": "constant.numeric.integer.lust",
-          "match": "\\b[0-9][0-9_]*([eE][+-]?[0-9_]+)?\\b"
+          "match": "\\b[0-9](?:_?[0-9])*\\b"
         },
         {
           "name": "constant.other.lust",
-          "match": "\\b[A-Z][A-Z0-9_]*\\b"
-        }
-      ]
-    },
-    "declarations": {
-      "patterns": [
-        {
-          "match": "\\b(function)\\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\\.[a-zA-Z_][a-zA-Z0-9_]*)*(?::[a-zA-Z_][a-zA-Z0-9_]*)?)",
-          "captures": {
-            "1": { "name": "storage.type.function.lust" },
-            "2": { "name": "entity.name.function.lust" }
-          }
-        },
-        {
-          "match": "\\b(struct)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-          "captures": {
-            "1": { "name": "storage.type.lust" },
-            "2": { "name": "entity.name.type.struct.lust" }
-          }
-        },
-        {
-          "match": "\\b(enum)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-          "captures": {
-            "1": { "name": "storage.type.lust" },
-            "2": { "name": "entity.name.type.enum.lust" }
-          }
-        },
-        {
-          "match": "\\b(trait)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-          "captures": {
-            "1": { "name": "storage.type.lust" },
-            "2": { "name": "entity.name.type.trait.lust" }
-          }
-        },
-        {
-          "match": "\\b(module)\\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\\.[a-zA-Z_][a-zA-Z0-9_]*)*)",
-          "captures": {
-            "1": { "name": "storage.modifier.lust" },
-            "2": { "name": "entity.name.section.module.lust" }
-          }
+          "match": "\\b[A-Z][A-Z0-9_]+\\b"
         }
       ]
     },
@@ -150,12 +308,24 @@
           "match": "\\b(if|then|elseif|else)\\b"
         },
         {
+          "name": "keyword.control.conditional.lust",
+          "match": "(?<!\\.)(?<!:)\\b(match|case)\\b"
+        },
+        {
           "name": "keyword.control.repeat.lust",
           "match": "\\b(while|for|in|do|break|continue)\\b"
         },
         {
           "name": "keyword.control.return.lust",
           "match": "\\b(return)\\b"
+        },
+        {
+          "name": "keyword.control.effect.lust",
+          "match": "\\b(defer|errdefer|scoped)\\b"
+        },
+        {
+          "name": "keyword.control.effect.lust",
+          "match": "(?<!\\.)(?<!:)\\b(effect|handle|with|perform|resume|pure)\\b"
         },
         {
           "name": "keyword.control.lust",
@@ -171,15 +341,35 @@
         },
         {
           "name": "storage.modifier.lust",
-          "match": "\\b(local|ref|module|extern|use|const)\\b"
+          "match": "\\b(local|module|extern|use)\\b"
+        },
+        {
+          "name": "storage.modifier.lust",
+          "match": "(?<!\\.)(?<!:)\\b(pub|priv|weak|ref|let|const|mut|export)\\b"
         },
         {
           "name": "keyword.operator.logical.lust",
           "match": "\\b(and|or|not)\\b"
         },
         {
-          "name": "keyword.operator.lust",
-          "match": "\\b(is|as)\\b"
+          "name": "keyword.operator.type.lust",
+          "match": "(?<!\\.)(?<!:)\\b(typeof|is|as)\\b"
+        }
+      ]
+    },
+    "stdlib": {
+      "patterns": [
+        {
+          "match": "(?<!\\.)(?<!:)\\b(std)(\\.)(table|array|map|string|math|io|os|json|jsonc|jsonl|bson|yaml|toon|msgpack|csv|regex|task|sync|coord|stream|schedule|time|rx|test|net|http|sqlite|services|lua|fmt|iter|random|data|model|view|effect|schema|assert)\\b",
+          "captures": {
+            "1": { "name": "support.module.stdlib.lust" },
+            "2": { "name": "punctuation.delimiter.lust" },
+            "3": { "name": "support.module.stdlib.lust" }
+          }
+        },
+        {
+          "name": "support.module.stdlib.lust",
+          "match": "(?<!\\.)(?<!:)\\b(std|table|array|map|string|math|io|os|json|jsonc|jsonl|bson|yaml|toon|msgpack|csv|regex|task|sync|coord|stream|schedule|time|rx|test|net|http|sqlite|services|lua|fmt|iter|random|data|model|view)\\b(?=\\s*\\.)"
         }
       ]
     },
@@ -187,11 +377,15 @@
       "patterns": [
         {
           "name": "support.type.primitive.lust",
-          "match": "\\b(int|float|bool|string|unknown)\\b"
+          "match": "(?<!\\.)(?<!:)\\b(int|float|bool|string|usize|unknown|never)\\b"
+        },
+        {
+          "name": "support.type.constructor.lust",
+          "match": "\\b(Some|None|Ok|Err)\\b"
         },
         {
           "name": "support.type.lust",
-          "match": "\\b(Option|Result|Array|Map)\\b"
+          "match": "\\b(Self|Option|Result|Array|Map|Table|Queue|Task|TaskStatus|TaskInfo|Scope|Fiber|Schema|Regex|Weak|Effect|Infer|InferInput|InferOutput|Iterator|IndexError|Ref|Deferred|Semaphore|Stream|Sink|Schedule|Observable|Subject|Scheduler|BoundedQueue|BufferOptions|LuaValue|LuaTable|LuaFunction|LuaUserdata|LuaThread)\\b"
         },
         {
           "name": "entity.name.type.lust",
@@ -203,7 +397,7 @@
       "patterns": [
         {
           "name": "support.function.builtin.lust",
-          "match": "\\b(print|println|type|tostring)\\b"
+          "match": "(?<!\\.)(?<!:)\\b(print|println|type|tostring|tonumber|assert|error|pcall|xpcall|pairs|ipairs|select|random|randomseed|unpack|setmetatable|len|panic|channel|assert_eq|assert_ne|assert_matches|assert_almost_eq|assert_success|assert_fails|assert_interrupted|assert_dies|assert_snapshot|bench|bench_with_options)\\b(?=\\s*\\()"
         },
         {
           "match": "(?<=:)([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
@@ -223,19 +417,43 @@
       "patterns": [
         {
           "name": "keyword.operator.assignment.compound.lust",
-          "match": "\\+=|-=|\\*=|/="
+          "match": "//=|\\^\\^=|<<=|>>=|\\+=|-=|\\*=|/=|%=|\\^=|&=|\\|="
+        },
+        {
+          "name": "keyword.operator.pipe.lust",
+          "match": "\\|>"
+        },
+        {
+          "name": "keyword.operator.arrow.lust",
+          "match": "->|=>"
+        },
+        {
+          "name": "keyword.operator.namespace.lust",
+          "match": "::"
         },
         {
           "name": "keyword.operator.comparison.lust",
-          "match": "==|!=|~=|<=|>=|<|>"
+          "match": "==|!=|~=|<=|>="
         },
         {
-          "name": "keyword.operator.assignment.lust",
-          "match": "="
+          "name": "keyword.operator.bitwise.lust",
+          "match": "<<|>>|\\^\\^"
+        },
+        {
+          "name": "keyword.operator.arithmetic.lust",
+          "match": "//"
         },
         {
           "name": "keyword.operator.range.lust",
           "match": "\\.\\."
+        },
+        {
+          "name": "keyword.operator.comparison.lust",
+          "match": "<|>"
+        },
+        {
+          "name": "keyword.operator.assignment.lust",
+          "match": "="
         },
         {
           "name": "keyword.operator.arithmetic.lust",
@@ -243,7 +461,11 @@
         },
         {
           "name": "keyword.operator.bitwise.lust",
-          "match": "[|&]"
+          "match": "[|&~]"
+        },
+        {
+          "name": "keyword.operator.error.lust",
+          "match": "!"
         },
         {
           "name": "keyword.operator.optional.lust",

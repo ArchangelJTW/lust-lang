@@ -1,5 +1,7 @@
 #![cfg(feature = "std")]
-#[cfg(all(feature = "mimalloc", not(target_arch = "wasm32")))]
+// Host CLI boundary: lust CLI binary runs on host OS and orchestrates process execution.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#[cfg(all(feature = "cli-mimalloc", not(target_arch = "wasm32")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -17,6 +19,7 @@ use lust::packages::{
     load_prepared_rust_dependencies, prepare_rust_dependencies, resolve_dependencies,
     save_credentials, write_stub_files,
 };
+use lust::error::IntoDiagnostic;
 use lust::{Compiler, Item, LustConfig, ModuleLoader, Span, TypeChecker, VM};
 use std::{
     env, fs,
@@ -28,11 +31,64 @@ use std::{
 use toml::{self, Value, map::Map};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+mod cli {
+    #[path = "diag.rs"]
+    pub mod diag;
+    #[path = "ext.rs"]
+    pub mod ext;
+    #[path = "test.rs"]
+    pub mod test;
+    #[path = "sim.rs"]
+    pub mod sim;
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         print_usage(&args[0]);
         process::exit(1);
+    }
+
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+    if let Some(pos) = args.iter().position(|a| a == "--test-load-extension" || a.starts_with("--test-load-extension=")) {
+        let dylib_path = if args[pos] == "--test-load-extension" {
+            if pos + 1 < args.len() {
+                PathBuf::from(&args[pos + 1])
+            } else {
+                eprintln!("Error: IncompatibleAbiVersion: --test-load-extension requires a path argument");
+                process::exit(1);
+            }
+        } else {
+            PathBuf::from(args[pos].strip_prefix("--test-load-extension=").unwrap())
+        };
+
+        let canary_path = if let Some(cpos) = args.iter().position(|a| a == "--host-canary-path" || a.starts_with("--host-canary-path=")) {
+            if args[cpos] == "--host-canary-path" {
+                if cpos + 1 < args.len() {
+                    Some(PathBuf::from(&args[cpos + 1]))
+                } else {
+                    eprintln!("Error: IncompatibleAbiVersion: --host-canary-path requires a path argument");
+                    process::exit(1);
+                }
+            } else {
+                Some(PathBuf::from(args[cpos].strip_prefix("--host-canary-path=").unwrap()))
+            }
+        } else {
+            None
+        };
+
+        match lust::packages::test_load_extension_cli(&dylib_path, canary_path.as_deref()) {
+            Ok(()) => process::exit(0),
+            Err(err) => {
+                eprintln!("Error: {err}");
+                process::exit(1);
+            }
+        }
+    }
+
+    if args.iter().any(|a| a == "--test-hang-probe") {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        process::exit(0);
     }
 
     // Collect all paths from --transpile / --tr flags before dispatching.
@@ -97,6 +153,24 @@ fn main() {
             return;
         }
 
+        "test" => {
+            cli::test::test_command(&args[2..]);
+            return;
+        }
+
+        "sim" => {
+            cli::sim::sim_command(&args[2..]);
+            return;
+        }
+
+        "ext" => {
+            if let Err(err) = cli::ext::run_ext_command(&args[2..]) {
+                eprintln!("Error: {err}");
+                process::exit(1);
+            }
+            return;
+        }
+
         "build" | "--aot" => {
             build_command(&args[2..]);
             return;
@@ -123,10 +197,19 @@ fn main() {
     let mut disassemble = false;
     let mut use_mir = false;
     let mut strict_mir = false;
+    let mut cranelift_jit = false;
     let mut no_gc = false;
     let mut pure_core = false;
     let mut backend_mode: Option<String> = None;
+    let mut jit_mode: Option<String> = None;
     let mut script_file: Option<String> = None;
+    let mut capture_failure: Option<String> = env::var("LUST_CAPTURE_FAILURE").ok();
+    let mut json_diag = env::var("LUST_ERROR_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+        || env::var("LUST_DIAG_FORMAT")
+            .map(|v| v.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
 
     let mut i = 0;
     while i < run_args.len() {
@@ -135,6 +218,34 @@ fn main() {
             "--help" | "-h" => {
                 print_help(&args[0]);
                 return;
+            }
+            "--error-format" | "--diag-format" | "--format" => {
+                i += 1;
+                let Some(val) = run_args.get(i) else {
+                    eprintln!("Error: flag requires a format argument (human, json)");
+                    process::exit(1);
+                };
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
+            }
+            opt if opt.starts_with("--error-format=") => {
+                let val = opt.strip_prefix("--error-format=").unwrap();
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
+            }
+            opt if opt.starts_with("--diag-format=") => {
+                let val = opt.strip_prefix("--diag-format=").unwrap();
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
+            }
+            opt if opt.starts_with("--format=") => {
+                let val = opt.strip_prefix("--format=").unwrap();
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
             }
             "--disassemble" | "-d" => disassemble = true,
             "--mir" => use_mir = true,
@@ -148,6 +259,25 @@ fn main() {
             }
             "--no-gc" => no_gc = true,
             "--pure-core" | "--no-prelude" => pure_core = true,
+            "--capture-failure" | "--capture-on-failure" => {
+                i += 1;
+                let Some(val) = run_args.get(i) else {
+                    eprintln!("Error: --capture-failure requires a path argument");
+                    process::exit(1);
+                };
+                capture_failure = Some(val.clone());
+            }
+            opt if opt.starts_with("--capture-failure=") => {
+                let val = opt.strip_prefix("--capture-failure=").unwrap();
+                capture_failure = Some(val.to_string());
+            }
+            opt if opt.starts_with("--capture-on-failure=") => {
+                let val = opt.strip_prefix("--capture-on-failure=").unwrap();
+                capture_failure = Some(val.to_string());
+            }
+            "--panic-for-test" => {
+                // Testing probe flag accepted
+            }
             "--backend" => {
                 i += 1;
                 let Some(val) = run_args.get(i) else {
@@ -159,6 +289,18 @@ fn main() {
             opt if opt.starts_with("--backend=") => {
                 let val = opt.strip_prefix("--backend=").unwrap();
                 backend_mode = Some(val.to_string());
+            }
+            "--jit" => {
+                i += 1;
+                let Some(val) = run_args.get(i) else {
+                    eprintln!("Error: --jit requires a mode argument (cranelift, auto, off)");
+                    process::exit(1);
+                };
+                jit_mode = Some(val.clone());
+            }
+            opt if opt.starts_with("--jit=") => {
+                let val = opt.strip_prefix("--jit=").unwrap();
+                jit_mode = Some(val.to_string());
             }
             other if other.starts_with('-') => {
                 eprintln!("Unknown option '{}'", other);
@@ -175,6 +317,7 @@ fn main() {
     }
 
     let mut is_zig_aot = false;
+    let mut is_rust_aot = false;
     if let Some(mode) = backend_mode {
         match mode.to_ascii_lowercase().as_str() {
             "vm" => {
@@ -185,16 +328,42 @@ fn main() {
             }
             "cranelift" | "jit" => {
                 use_mir = true;
+                cranelift_jit = true;
             }
             "zig" | "aot" => {
                 is_zig_aot = true;
+            }
+            "rust" => {
+                is_rust_aot = true;
             }
             "auto" => {
                 // Auto: default VM with JIT/MIR
             }
             other => {
                 eprintln!(
-                    "Error: unknown backend '{}'. Supported backends for run: vm, mir, cranelift, zig, auto",
+                    "Error: unknown backend '{}'. Supported backends for run: vm, mir, cranelift, zig, rust, auto",
+                    other
+                );
+                process::exit(1);
+            }
+        }
+    }
+    let mut jit_disabled = false;
+    if let Some(mode) = jit_mode {
+        match mode.to_ascii_lowercase().as_str() {
+            "cranelift" => {
+                cranelift_jit = true;
+            }
+            "auto" | "default" => {
+                cranelift_jit = false;
+            }
+            "off" | "none" | "vm" | "bytecode" => {
+                cranelift_jit = false;
+                jit_disabled = true;
+            }
+            other => {
+                eprintln!(
+                    "Error: unknown --jit mode '{}'. Supported modes: cranelift, auto, off",
                     other
                 );
                 process::exit(1);
@@ -203,10 +372,23 @@ fn main() {
     }
 
     if let Some(file) = script_file {
-        if is_zig_aot {
+        if is_rust_aot {
+            run_file_rust_aot(&file, pure_core);
+        } else if is_zig_aot {
             run_file_zig_aot(&file);
         } else {
-            run_file_with_options(&file, disassemble, use_mir, strict_mir, no_gc, pure_core);
+            run_file_with_options(
+                &file,
+                disassemble,
+                use_mir,
+                strict_mir,
+                cranelift_jit,
+                jit_disabled,
+                no_gc,
+                pure_core,
+                json_diag,
+                capture_failure.as_deref(),
+            );
         }
     } else {
         print_usage(&args[0]);
@@ -1396,12 +1578,17 @@ fn build_command(args: &[String]) {
         eprintln!("       lust build [options] <entry.lust>");
         eprintln!();
         eprintln!("OPTIONS:");
-        eprintln!("    --backend <name>          Backend compiler: zig (default), mir-zig, mir");
+        eprintln!("    --backend <name>          Backend compiler: zig (default), rust, mir-zig, mir");
         eprintln!("    -o, --output <path>       Specify output binary or library path");
         eprintln!("    --cdylib, --dylib         Build dynamic shared library (.dylib, .so, .dll)");
         eprintln!("    --staticlib               Build static library (.a, .lib)");
         eprintln!("    --emit-h [path]           Generate C header file (.h)");
         eprintln!("    --emit-zig                Generate Zig source file without compiling");
+        eprintln!("    --emit-rs                 Generate Rust source file without compiling (--backend rust)");
+        eprintln!("    --emit=rust-crate         Generate Cargo library crate (Cargo.toml + src/lib.rs) depending on lust-aot-rt");
+        eprintln!("    --link-crate <dir|rlib>   Link external Rust crate (Zero-FFI rlib + ThinLTO for --backend rust; C-ABI for zig)");
+        eprintln!("    --gas-metering <mode>     Gas metering for Rust AOT: none (default), loop-chunked, exact");
+        eprintln!("    --gas-limit <units>       Gas limit for Rust AOT execution");
         eprintln!("    --release-fast            Optimize for speed (default)");
         eprintln!("    --release-safe            Optimize for speed with safety checks");
         eprintln!("    --release-small           Optimize for binary size");
@@ -1411,31 +1598,85 @@ fn build_command(args: &[String]) {
         eprintln!("    --tree-shake              Enable dead code elimination (default: true)");
         eprintln!("    --no-tree-shake           Disable dead code elimination");
         eprintln!("    --target <triple>         Cross-compile target triple");
-        eprintln!("    --cache-dir <dir>         Zig compilation cache directory");
+        eprintln!("    --no-std                  Emit #![no_std] Rust AOT code (StaticSlabAllocator<65536> preamble)");
+        eprintln!("    --cache-dir <dir>         AOT compilation cache directory");
         return;
     }
 
     let mut entry_file: Option<String> = None;
     let mut backend = "zig".to_string();
+    let mut backend_explicit = false;
     let mut output_bin = None;
     let mut emit_zig = false;
     let mut emit_c = false;
+    let mut emit_rs = false;
+    let mut emit_rust_crate = false;
+    let mut no_std = false;
+    let mut gas_metering = lust::codegen_zig::aot::GasMetering::None;
+    let mut gas_limit: Option<u64> = None;
     let mut emit_header_requested = false;
     let mut opts = lust::codegen_zig::CompileOptions::default();
+    let mut link_libraries: Vec<PathBuf> = Vec::new();
+    let mut link_dirs: Vec<PathBuf> = Vec::new();
+    let mut allow_ffi = true;
+    let mut link_crates: Vec<PathBuf> = Vec::new();
+    let mut thin_lto = false;
+    let mut pgo_generate: Option<PathBuf> = None;
+    let mut pgo_use: Option<PathBuf> = None;
+    let mut pgo_sample_use: Option<PathBuf> = None;
+    let aot_rt_rlib_override: Option<PathBuf> = env::var_os("LUST_AOT_RT_RLIB")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let mut json_diag = env::var("LUST_ERROR_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+        || env::var("LUST_DIAG_FORMAT")
+            .map(|v| v.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
 
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--error-format" | "--diag-format" | "--format" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: flag requires a format argument (human, json)");
+                    process::exit(1);
+                };
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
+            }
+            opt if opt.starts_with("--error-format=") => {
+                let val = opt.strip_prefix("--error-format=").unwrap();
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
+            }
+            opt if opt.starts_with("--diag-format=") => {
+                let val = opt.strip_prefix("--diag-format=").unwrap();
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
+            }
+            opt if opt.starts_with("--format=") => {
+                let val = opt.strip_prefix("--format=").unwrap();
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
+            }
             "--backend" => {
                 index += 1;
                 let Some(val) = args.get(index) else {
-                    eprintln!("Error: --backend requires a backend name (c, mir-c, zig, mir-zig, mir)");
+                    eprintln!("Error: --backend requires a backend name (c, mir-c, zig, rust, mir-zig, mir, cranelift-aot)");
                     process::exit(1);
                 };
                 backend = val.clone();
+                backend_explicit = true;
             }
             opt if opt.starts_with("--backend=") => {
                 backend = opt.strip_prefix("--backend=").unwrap().to_string();
+                backend_explicit = true;
             }
             "-o" | "--output" => {
                 index += 1;
@@ -1496,6 +1737,13 @@ fn build_command(args: &[String]) {
                 };
                 opts.target_triple = Some(val.clone());
             }
+            opt if opt.starts_with("--target=") => {
+                let val = opt.strip_prefix("--target=").unwrap();
+                opts.target_triple = Some(val.to_string());
+            }
+            "--no-std" | "--nostd" => {
+                no_std = true;
+            }
             "--cache-dir" => {
                 index += 1;
                 let Some(val) = args.get(index) else {
@@ -1503,6 +1751,211 @@ fn build_command(args: &[String]) {
                     process::exit(1);
                 };
                 opts.cache_dir = Some(PathBuf::from(val));
+            }
+            "--emit-rs" => {
+                emit_rs = true;
+            }
+            "--emit-rust-crate" => {
+                emit_rust_crate = true;
+            }
+            "--emit" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!(
+                        "Error: --emit requires a kind (rust-crate, rs, zig, c)"
+                    );
+                    process::exit(1);
+                };
+                match val.to_ascii_lowercase().as_str() {
+                    "rust-crate" | "rust_crate" => emit_rust_crate = true,
+                    "rs" | "rust" => emit_rs = true,
+                    "zig" => emit_zig = true,
+                    "c" => emit_c = true,
+                    other => {
+                        eprintln!(
+                            "Error: unknown --emit kind '{}'. Supported: rust-crate, rs, zig, c",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                }
+            }
+            opt if opt.starts_with("--emit=") => {
+                let val = opt.strip_prefix("--emit=").unwrap();
+                match val.to_ascii_lowercase().as_str() {
+                    "rust-crate" | "rust_crate" => emit_rust_crate = true,
+                    "rs" | "rust" => emit_rs = true,
+                    "zig" => emit_zig = true,
+                    "c" => emit_c = true,
+                    other => {
+                        eprintln!(
+                            "Error: unknown --emit kind '{}'. Supported: rust-crate, rs, zig, c",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                }
+            }
+            "--gas-metering" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --gas-metering requires a mode (none, loop-chunked, exact)");
+                    process::exit(1);
+                };
+                gas_metering = match val.to_ascii_lowercase().as_str() {
+                    "none" | "off" => lust::codegen_zig::aot::GasMetering::None,
+                    "loop-chunked" | "loop" => lust::codegen_zig::aot::GasMetering::LoopChunked,
+                    "exact" => lust::codegen_zig::aot::GasMetering::Exact,
+                    other => {
+                        eprintln!(
+                            "Error: unknown --gas-metering mode '{}'. Supported: none, loop-chunked, exact",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                };
+            }
+            opt if opt.starts_with("--gas-metering=") => {
+                let val = opt.strip_prefix("--gas-metering=").unwrap();
+                gas_metering = match val.to_ascii_lowercase().as_str() {
+                    "none" | "off" => lust::codegen_zig::aot::GasMetering::None,
+                    "loop-chunked" | "loop" => lust::codegen_zig::aot::GasMetering::LoopChunked,
+                    "exact" => lust::codegen_zig::aot::GasMetering::Exact,
+                    other => {
+                        eprintln!(
+                            "Error: unknown --gas-metering mode '{}'. Supported: none, loop-chunked, exact",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                };
+            }
+            "--gas-limit" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --gas-limit requires a positive integer argument");
+                    process::exit(1);
+                };
+                match val.parse::<u64>() {
+                    Ok(v) => {
+                        gas_limit = Some(v);
+                        if gas_metering == lust::codegen_zig::aot::GasMetering::None {
+                            gas_metering = lust::codegen_zig::aot::GasMetering::Exact;
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!("Error: invalid --gas-limit '{}'", val);
+                        process::exit(1);
+                    }
+                }
+            }
+            opt if opt.starts_with("--gas-limit=") => {
+                let val = opt.strip_prefix("--gas-limit=").unwrap();
+                match val.parse::<u64>() {
+                    Ok(v) => {
+                        gas_limit = Some(v);
+                        if gas_metering == lust::codegen_zig::aot::GasMetering::None {
+                            gas_metering = lust::codegen_zig::aot::GasMetering::Exact;
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!("Error: invalid --gas-limit '{}'", val);
+                        process::exit(1);
+                    }
+                }
+            }
+            "--deny-ffi" | "--pure" => {
+                allow_ffi = false;
+            }
+            "--allow-ffi" => {
+                allow_ffi = true;
+            }
+            "--link" | "--link-lib" | "-l" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --link requires a library path or name");
+                    process::exit(1);
+                };
+                link_libraries.push(PathBuf::from(val));
+            }
+            opt if opt.starts_with("--link=") => {
+                let val = opt.strip_prefix("--link=").unwrap();
+                link_libraries.push(PathBuf::from(val));
+            }
+            opt if opt.starts_with("--link-lib=") => {
+                let val = opt.strip_prefix("--link-lib=").unwrap();
+                link_libraries.push(PathBuf::from(val));
+            }
+            "--link-crate" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --link-crate requires a crate directory");
+                    process::exit(1);
+                };
+                link_crates.push(PathBuf::from(val));
+            }
+            opt if opt.starts_with("--link-crate=") => {
+                let val = opt.strip_prefix("--link-crate=").unwrap();
+                link_crates.push(PathBuf::from(val));
+            }
+            "--link-dir" | "-L" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --link-dir requires a directory path");
+                    process::exit(1);
+                };
+                link_dirs.push(PathBuf::from(val));
+            }
+            opt if opt.starts_with("--link-dir=") => {
+                let val = opt.strip_prefix("--link-dir=").unwrap();
+                link_dirs.push(PathBuf::from(val));
+            }
+            "--lto=thin" => {
+                thin_lto = true;
+            }
+            "--lto" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --lto requires a mode (thin)");
+                    process::exit(1);
+                };
+                if val.eq_ignore_ascii_case("thin") {
+                    thin_lto = true;
+                } else {
+                    eprintln!("Error: unknown --lto mode '{val}'. Supported: thin");
+                    process::exit(1);
+                }
+            }
+            "--pgo-generate" => {
+                pgo_generate = Some(env::temp_dir().join("lust_pgo_data"));
+            }
+            opt if opt.starts_with("--pgo-generate=") => {
+                let val = opt.strip_prefix("--pgo-generate=").unwrap();
+                pgo_generate = Some(PathBuf::from(val));
+            }
+            "--pgo-use" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --pgo-use requires a profdata path");
+                    process::exit(1);
+                };
+                pgo_use = Some(PathBuf::from(val));
+            }
+            opt if opt.starts_with("--pgo-use=") => {
+                let val = opt.strip_prefix("--pgo-use=").unwrap();
+                pgo_use = Some(PathBuf::from(val));
+            }
+            "--pgo-sample-use" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --pgo-sample-use requires a profile path");
+                    process::exit(1);
+                };
+                pgo_sample_use = Some(PathBuf::from(val));
+            }
+            opt if opt.starts_with("--pgo-sample-use=") => {
+                let val = opt.strip_prefix("--pgo-sample-use=").unwrap();
+                pgo_sample_use = Some(PathBuf::from(val));
             }
             opt if opt.starts_with('-') => {
                 eprintln!("Error: unknown option '{opt}'");
@@ -1525,19 +1978,143 @@ fn build_command(args: &[String]) {
         process::exit(1);
     };
 
+    if emit_rust_crate && !backend_explicit {
+        backend = "rust".to_string();
+    }
+
     let backend_lc = backend.to_ascii_lowercase();
     match backend_lc.as_str() {
-        "c" | "mir-c" | "zig" | "mir-zig" | "mir" => {}
+        "c" | "mir-c" | "zig" | "rust" | "mir-zig" | "mir" | "cranelift-aot" => {}
         other => {
             eprintln!(
-                "Error: unknown backend '{}'. Supported backends for build: c, mir-c, zig, mir-zig, mir",
+                "Error: unknown backend '{}'. Supported backends for build: c, mir-c, zig, rust, mir-zig, mir, cranelift-aot",
                 other
             );
             process::exit(1);
         }
     }
 
+    let is_rust_backend = backend.eq_ignore_ascii_case("rust");
+    let is_cranelift_aot_backend = backend.eq_ignore_ascii_case("cranelift-aot");
+
+    // Preserve legacy Zig/WASI-P2 offline-blocked rejection while lifting the hardcoded ban
+    // for `--backend rust` (which performs real `rustc --print target-libdir` detection and
+    // emits full `#![no_std]` `.rs` with `TargetStdlibNotInstalledOffline`, `NG-W13-2` / `F-11`).
+    if !is_rust_backend && !is_cranelift_aot_backend && opts.target_triple.as_deref() == Some("wasm32-wasip2") {
+        eprintln!("offline-blocked: target 'wasm32-wasip2' is not installed offline");
+        process::exit(1);
+    }
+
     let entry_path = PathBuf::from(&entry_arg);
+    let project_dir = entry_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut config = lust::config::LustConfig::load_for_entry(&entry_path).unwrap_or_default();
+    if !allow_ffi {
+        config.capability_mask_mut().allow_ffi = false;
+    } else {
+        allow_ffi = config.capability_mask().allow_ffi;
+    }
+
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+    {
+        if !config.dependencies().is_empty() {
+            if let Ok(dep_res) = resolve_dependencies(&config, project_dir) {
+                if let Ok(prepared) = prepare_rust_dependencies(&dep_res, project_dir) {
+                    for dep in prepared {
+                        link_libraries.push(dep.build.library_path);
+                    }
+                }
+            }
+        }
+    }
+
+    if !allow_ffi && (!link_libraries.is_empty() || !link_dirs.is_empty() || !link_crates.is_empty()) {
+        eprintln!("Error: CapabilityDenied: external library linking requires 'ffi' capability");
+        process::exit(1);
+    }
+
+    let mut linked_rust_crates: Vec<lust::codegen_zig::aot::compiler::RustLinkedCrate> = Vec::new();
+    let mut rust_crate_deps: Vec<lust::codegen_zig::aot::compiler::RustCrateDependency> = Vec::new();
+
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+    {
+        if is_rust_backend {
+            for crate_path in &link_crates {
+                if emit_rust_crate && crate_path.is_dir() {
+                    if !crate_path.join("Cargo.toml").exists() {
+                        eprintln!(
+                            "Error: missing external library at '{}'",
+                            crate_path.display()
+                        );
+                        process::exit(1);
+                    }
+                    let package_name = match lust::packages::read_crate_name(crate_path) {
+                        Ok(name) => name,
+                        Err(err) => {
+                            eprintln!("Error: {}", err);
+                            process::exit(1);
+                        }
+                    };
+                    let crate_name = match lust::packages::read_crate_lib_name(crate_path) {
+                        Ok(name) => name,
+                        Err(err) => {
+                            eprintln!("Error: {}", err);
+                            process::exit(1);
+                        }
+                    };
+                    rust_crate_deps.push(lust::codegen_zig::aot::compiler::RustCrateDependency {
+                        package_name,
+                        crate_name,
+                        path: crate_path.clone(),
+                    });
+                } else {
+                    match lust::packages::prepare_external_rlib(
+                        crate_path,
+                        allow_ffi,
+                        opts.target_triple.as_deref(),
+                        opts.release_mode.starts_with("Release"),
+                    ) {
+                        Ok(rlib) => {
+                            linked_rust_crates.push(
+                                lust::codegen_zig::aot::compiler::RustLinkedCrate {
+                                    crate_name: rlib.crate_name,
+                                    rlib_path: rlib.rlib_path,
+                                    dependency_dirs: rlib.dependency_dirs,
+                                },
+                            );
+                        }
+                        Err(err) => {
+                            eprintln!("Error: {}", err);
+                            process::exit(1);
+                        }
+                    }
+                }
+            }
+        } else {
+            for crate_dir in &link_crates {
+                match lust::packages::build_and_prepare_external_crate(
+                    crate_dir,
+                    allow_ffi,
+                    opts.target_triple.as_deref(),
+                    opts.release_mode.starts_with("Release"),
+                ) {
+                    Ok(out) => {
+                        link_libraries.push(out.library_path);
+                    }
+                    Err(err) => {
+                        eprintln!("Error: {}", err);
+                        process::exit(1);
+                    }
+                }
+            }
+        }
+
+        for lib_path in &link_libraries {
+            if let Err(err) = lust::packages::verify_external_library(lib_path, allow_ffi) {
+                eprintln!("Error: {}", err);
+                process::exit(1);
+            }
+        }
+    }
     if emit_header_requested && opts.emit_header.is_none() {
         opts.emit_header = Some(entry_path.with_extension("h"));
     }
@@ -1546,7 +2123,11 @@ fn build_command(args: &[String]) {
     let program = match loader.load_program_from_entry(&entry_arg) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Error loading program: {}", e);
+            if json_diag {
+                eprint!("{}", cli::diag::json(format!("Error loading program: {e}"), "error", None, None));
+            } else {
+                eprintln!("Error loading program: {}", e);
+            }
             process::exit(1);
         }
     };
@@ -1556,11 +2137,12 @@ fn build_command(args: &[String]) {
         all_items.extend(module.items.clone());
     }
 
-    let is_library = matches!(
-        opts.target_kind,
-        lust::codegen_zig::BuildTargetKind::SharedLibrary
-            | lust::codegen_zig::BuildTargetKind::StaticLibrary
-    );
+    let is_library = emit_rust_crate
+        || matches!(
+            opts.target_kind,
+            lust::codegen_zig::BuildTargetKind::SharedLibrary
+                | lust::codegen_zig::BuildTargetKind::StaticLibrary
+        );
 
     if backend_lc == "c" && !is_library {
         let filtered_items = if opts.tree_shake {
@@ -1728,8 +2310,457 @@ fn build_command(args: &[String]) {
     let filtered_items = if opts.tree_shake {
         lust::codegen_zig::tree_shake_items(&all_items, is_library)
     } else {
-        all_items
+        all_items.clone()
     };
+
+    let stem = entry_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+
+    let is_wasm = opts
+        .target_triple
+        .as_ref()
+        .map(|t| t.contains("wasm32"))
+        .unwrap_or(false);
+
+    let default_extension = if is_wasm {
+        "wasm"
+    } else {
+        match opts.target_kind {
+            lust::codegen_zig::BuildTargetKind::Executable => "",
+            lust::codegen_zig::BuildTargetKind::SharedLibrary => {
+                if cfg!(target_os = "macos") {
+                    "dylib"
+                } else if cfg!(target_os = "windows") {
+                    "dll"
+                } else {
+                    "so"
+                }
+            }
+            lust::codegen_zig::BuildTargetKind::StaticLibrary => {
+                if cfg!(target_os = "windows") {
+                    "lib"
+                } else {
+                    "a"
+                }
+            }
+        }
+    };
+
+    let target_bin = output_bin.clone().unwrap_or_else(|| {
+        let parent = entry_path.parent().unwrap_or_else(|| Path::new("."));
+        if default_extension.is_empty() {
+            parent.join(stem)
+        } else {
+            parent.join(format!("{}.{}", stem, default_extension))
+        }
+    });
+
+    if is_cranelift_aot_backend {
+        let mut imports_map = lust::hashbrown::HashMap::new();
+        for m in &program.modules {
+            imports_map.insert(m.path.clone(), m.imports.clone());
+        }
+        let mut typechecker = TypeChecker::with_config(&config);
+        typechecker.set_imports_by_module(imports_map);
+        if let Err(e) = typechecker.check_program(&program.modules) {
+            if json_diag {
+                eprint!(
+                    "{}",
+                    cli::diag::json(format!("Type error: {e}"), "error", None, None)
+                );
+            } else {
+                eprintln!("Type error: {}", e);
+            }
+            process::exit(1);
+        }
+
+        let prepared_items = lust::codegen_zig::aot::prepare_items_for_mir(&filtered_items);
+        let mir_module =
+            match lust::mir::lowering::AstLowering::lower_module_items_with_native_queues(
+                "main_module",
+                &prepared_items,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("MIR lowering error: {}", e);
+                    process::exit(1);
+                }
+            };
+
+        let wants_object_only = target_bin
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("o") || e.eq_ignore_ascii_case("obj"));
+
+        if wants_object_only {
+            match lust::codegen_zig::aot::compile_mir_to_object_file(
+                &mir_module,
+                &target_bin,
+                opts.target_triple.as_deref(),
+            ) {
+                Ok(obj) => {
+                    println!("Successfully built Cranelift AOT object: {}", obj.display());
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    process::exit(1);
+                }
+            }
+        }
+
+        let obj_path = target_bin.with_extension("cranelift_aot.o");
+        if let Err(e) = lust::codegen_zig::aot::compile_mir_to_object_file(
+            &mir_module,
+            &obj_path,
+            opts.target_triple.as_deref(),
+        ) {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+
+        let dylib_name = if cfg!(target_os = "macos") {
+            "liblust.dylib"
+        } else if cfg!(target_os = "windows") {
+            "lust.dll"
+        } else {
+            "liblust.so"
+        };
+        let lib_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+            .filter(|dir| dir.join(dylib_name).exists())
+            .or_else(|| {
+                let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                [manifest.join("target/release"), manifest.join("target/debug")]
+                    .into_iter()
+                    .find(|dir| dir.join(dylib_name).exists())
+            });
+        let Some(lib_dir) = lib_dir else {
+            let _ = std::fs::remove_file(&obj_path);
+            eprintln!(
+                "Error: could not locate {} next to lust executable or in target/{{release,debug}} for cranelift-aot linking",
+                dylib_name
+            );
+            process::exit(1);
+        };
+
+        let has_raw_main = mir_module.functions.iter().any(|f| f.signature.name == "main");
+        let mod_main_name = mir_module
+            .functions
+            .iter()
+            .find(|f| f.signature.name.ends_with(".main"))
+            .map(|f| f.signature.name.as_str());
+        let entry_shim_c = if !has_raw_main && let Some(mod_main) = mod_main_name {
+            let sym = if cfg!(target_os = "macos") {
+                format!("_{mod_main}")
+            } else {
+                mod_main.to_string()
+            };
+            let shim_path = target_bin.with_extension("cranelift_entry.c");
+            let shim_src = format!(
+                "#include <stdint.h>\nextern int64_t lust_entry(void) __asm__(\"{sym}\");\nint main(void) {{ (void)lust_entry(); return 0; }}\n"
+            );
+            if let Err(e) = std::fs::write(&shim_path, shim_src) {
+                let _ = std::fs::remove_file(&obj_path);
+                eprintln!("Failed to write cranelift-aot entry shim: {}", e);
+                process::exit(1);
+            }
+            Some(shim_path)
+        } else {
+            None
+        };
+
+        let mut cc_cmd = std::process::Command::new("cc");
+        if cfg!(all(target_os = "macos", target_arch = "x86_64"))
+            && opts.target_triple.as_deref().is_none_or(|t| t.starts_with("x86_64"))
+        {
+            cc_cmd.args(["-arch", "x86_64"]);
+        }
+        cc_cmd.arg(&obj_path);
+        if let Some(ref shim_path) = entry_shim_c {
+            cc_cmd.arg(shim_path);
+        }
+        cc_cmd
+            .arg(format!("-L{}", lib_dir.display()))
+            .arg("-llust");
+        if !cfg!(target_os = "windows") {
+            cc_cmd
+                .arg(format!("-Wl,-rpath,{}", lib_dir.display()))
+                .arg("-lm");
+        }
+        cc_cmd.arg("-o").arg(&target_bin);
+
+        let link_out = cc_cmd.output();
+        let _ = std::fs::remove_file(&obj_path);
+        if let Some(ref shim_path) = entry_shim_c {
+            let _ = std::fs::remove_file(shim_path);
+        }
+        match link_out {
+            Ok(out) if out.status.success() => {
+                println!(
+                    "Successfully built Cranelift AOT executable: {}",
+                    target_bin.display()
+                );
+                return;
+            }
+            Ok(out) => {
+                eprintln!(
+                    "Cranelift AOT link failed (exit {:?}):\n{}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Failed to invoke host linker 'cc': {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    if is_rust_backend {
+        // Mandatory NG-W12-4A + NG-W13-1C + NG-W13-2 frontend pipeline:
+        // TypeChecker::check_program -> prepare_items_for_mir -> desugar_effects_for_rust_aot
+        // -> AstLowering -> MirOptimizer + SROA -> refine_mir_function_with_layouts
+        // -> EscapeAnalysis -> cfg_structurer -> Rust emitter
+        let mut imports_map = lust::hashbrown::HashMap::new();
+        for m in &program.modules {
+            imports_map.insert(m.path.clone(), m.imports.clone());
+        }
+        let mut typechecker = TypeChecker::with_config(&config);
+        typechecker.set_imports_by_module(imports_map);
+        if let Err(e) = typechecker.check_program(&program.modules) {
+            if json_diag {
+                eprint!(
+                    "{}",
+                    cli::diag::json(format!("Type error: {e}"), "error", None, None)
+                );
+            } else {
+                eprintln!("Type error: {}", e);
+            }
+            process::exit(1);
+        }
+
+        let mir_module =
+            match lust::codegen_zig::aot::compiler::prepare_and_lower_items_for_rust_aot(
+                &filtered_items,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("MIR lowering error: {}", e);
+                    process::exit(1);
+                }
+            };
+
+        let effective_no_std = no_std
+            || opts
+                .target_triple
+                .as_deref()
+                .is_some_and(lust::codegen_zig::aot::is_nostd_target);
+
+        let rust_opts = lust::codegen_zig::aot::RustCompileOptions {
+            aot: lust::codegen_zig::aot::AotCompileOptions {
+                target_kind: match opts.target_kind {
+                    lust::codegen_zig::BuildTargetKind::Executable => {
+                        lust::codegen_zig::aot::AotTargetKind::Executable
+                    }
+                    lust::codegen_zig::BuildTargetKind::SharedLibrary => {
+                        lust::codegen_zig::aot::AotTargetKind::SharedLibrary
+                    }
+                    lust::codegen_zig::BuildTargetKind::StaticLibrary => {
+                        lust::codegen_zig::aot::AotTargetKind::StaticLibrary
+                    }
+                },
+                release_mode: opts.release_mode.clone(),
+                strip: opts.strip,
+                max_memory_bytes: opts.max_memory_bytes,
+                target_triple: opts.target_triple.clone(),
+            },
+            gas_metering,
+            gas_limit,
+            pure_core: !allow_ffi,
+            no_std: effective_no_std,
+            cache_dir: opts.cache_dir.clone(),
+        };
+
+        if emit_rust_crate {
+            let crate_out_dir = output_bin.unwrap_or_else(|| {
+                let parent = entry_path.parent().unwrap_or_else(|| Path::new("."));
+                parent.join(format!("{stem}_crate"))
+            });
+            let pkg_name = crate_out_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(stem);
+            match lust::codegen_zig::aot::AotCompiler::emit_rust_crate(
+                &mir_module,
+                &all_items,
+                &crate_out_dir,
+                pkg_name,
+                &rust_opts,
+                &rust_crate_deps,
+            ) {
+                Ok(emitted) => {
+                    println!(
+                        "Generated Rust Cargo crate '{}' at {} ({} + {})",
+                        emitted.package_name,
+                        emitted.crate_dir.display(),
+                        emitted.manifest_path.display(),
+                        emitted.lib_rs_path.display()
+                    );
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("Rust Cargo crate emission error: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+
+        if emit_rs {
+            let interop = lust::codegen_zig::aot::rust_emitter::RustInteropOptions {
+                linked_crates: linked_rust_crates
+                    .iter()
+                    .map(|c| c.crate_name.clone())
+                    .collect(),
+                emit_as_include_module: false,
+                export_public_api: is_library,
+            };
+            let rust_source = match lust::codegen_zig::aot::AotCompiler::emit_rust_module_with_interop(
+                &mir_module,
+                &all_items,
+                &rust_opts,
+                &interop,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Rust AOT codegen error: {}", e);
+                    process::exit(1);
+                }
+            };
+            let rs_file = if target_bin.extension().and_then(|e| e.to_str()) == Some("rs") {
+                target_bin
+            } else {
+                entry_path.with_extension("rs")
+            };
+            if let Some(parent) = rs_file.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if let Err(e) = fs::write(&rs_file, &rust_source) {
+                eprintln!("Failed to write {}: {}", rs_file.display(), e);
+                process::exit(1);
+            }
+            println!("Generated Rust source: {}", rs_file.display());
+            return;
+        }
+
+        let aot_links = lust::codegen_zig::aot::AotLinkOptions {
+            link_libraries: link_libraries.clone(),
+            link_dirs: link_dirs.clone(),
+            allow_ffi,
+        };
+        let lto_thin = thin_lto || !linked_rust_crates.is_empty();
+        let rust_links = lust::codegen_zig::aot::compiler::RustLinkOptions {
+            aot_links,
+            linked_crates: linked_rust_crates,
+            lto_thin,
+            pgo_generate: pgo_generate.clone(),
+            pgo_use: pgo_use.clone(),
+            pgo_sample_use: pgo_sample_use.clone(),
+            aot_rt_rlib_override: aot_rt_rlib_override.clone(),
+        };
+
+        match lust::codegen_zig::aot::AotCompiler::compile_module_rust_cross(
+            &mir_module,
+            &all_items,
+            &target_bin,
+            &rust_opts,
+            &rust_links,
+        ) {
+            Ok(lust::codegen_zig::aot::RustAotBuildOutcome::Compiled { artifact_path, .. }) => {
+                println!("Successfully built AOT artifact: {}", artifact_path.display());
+                return;
+            }
+            Ok(lust::codegen_zig::aot::RustAotBuildOutcome::TargetStdlibNotInstalledOffline {
+                target,
+                generated_rs_path,
+            }) => {
+                eprintln!(
+                    "TargetStdlibNotInstalledOffline {{ target: \"{target}\", generated_rs_path: \"{}\" }}",
+                    generated_rs_path.display()
+                );
+                process::exit(2);
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    if backend.to_ascii_lowercase() == "mir" {
+        let prepared_items = lust::codegen_zig::aot::prepare_items_for_mir(&filtered_items);
+        let mir_module = match lust::mir::lowering::AstLowering::lower_module_items("main_module", &prepared_items) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("MIR lowering error: {}", e);
+                process::exit(1);
+            }
+        };
+
+        if emit_c {
+            let emitter_opts = lust::codegen_zig::aot::c_emitter::CEmitterOptions {
+                is_library,
+                max_memory_bytes: opts.max_memory_bytes,
+            };
+            let c_source = lust::codegen_zig::aot::c_emitter::emit_c_from_mir(&mir_module, &emitter_opts);
+            let c_file = entry_path.with_extension("c");
+            if let Err(e) = fs::write(&c_file, &c_source) {
+                eprintln!("Failed to write {}: {}", c_file.display(), e);
+                process::exit(1);
+            }
+            println!("Generated C source: {}", c_file.display());
+            return;
+        }
+
+        let aot_opts = lust::codegen_zig::aot::AotCompileOptions {
+            target_kind: match opts.target_kind {
+                lust::codegen_zig::BuildTargetKind::Executable => lust::codegen_zig::aot::AotTargetKind::Executable,
+                lust::codegen_zig::BuildTargetKind::SharedLibrary => lust::codegen_zig::aot::AotTargetKind::SharedLibrary,
+                lust::codegen_zig::BuildTargetKind::StaticLibrary => lust::codegen_zig::aot::AotTargetKind::StaticLibrary,
+            },
+            release_mode: opts.release_mode.clone(),
+            strip: opts.strip,
+            max_memory_bytes: opts.max_memory_bytes,
+            target_triple: opts.target_triple.clone(),
+        };
+
+        let aot_links = lust::codegen_zig::aot::AotLinkOptions {
+            link_libraries: link_libraries.clone(),
+            link_dirs: link_dirs.clone(),
+            allow_ffi,
+        };
+
+        match lust::codegen_zig::aot::AotCompiler::compile_module_with_links(
+            &mir_module,
+            &target_bin,
+            &aot_opts,
+            &aot_links,
+        ) {
+            Ok(bin) => {
+                println!("Successfully built AOT artifact: {}", bin.display());
+                return;
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        }
+    }
 
     let runtime_opts = lust::codegen_zig::analyze_runtime_requirements(
         &filtered_items,
@@ -1747,10 +2778,6 @@ fn build_command(args: &[String]) {
         }
     };
 
-    let stem = entry_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("output");
     let zig_file = entry_path.with_extension("zig");
     if let Err(e) = fs::write(&zig_file, &zig_source) {
         eprintln!("Failed to write {}: {}", zig_file.display(), e);
@@ -1771,35 +2798,19 @@ fn build_command(args: &[String]) {
         return;
     }
 
-    let default_extension = match opts.target_kind {
-        lust::codegen_zig::BuildTargetKind::Executable => "",
-        lust::codegen_zig::BuildTargetKind::SharedLibrary => {
-            if cfg!(target_os = "macos") {
-                "dylib"
-            } else if cfg!(target_os = "windows") {
-                "dll"
-            } else {
-                "so"
-            }
-        }
-        lust::codegen_zig::BuildTargetKind::StaticLibrary => {
-            if cfg!(target_os = "windows") {
-                "lib"
-            } else {
-                "a"
-            }
-        }
+    let zig_links = lust::codegen_zig::ZigLinkOptions {
+        link_libraries,
+        link_dirs,
+        allow_ffi,
     };
-    let target_bin = output_bin.unwrap_or_else(|| {
-        let parent = entry_path.parent().unwrap_or_else(|| Path::new("."));
-        if default_extension.is_empty() {
-            parent.join(stem)
-        } else {
-            parent.join(format!("{}.{}", stem, default_extension))
-        }
-    });
 
-    match lust::codegen_zig::compile_zig(&zig_file, &target_bin, &opts, link_libc) {
+    match lust::codegen_zig::compile_zig_with_links(
+        &zig_file,
+        &target_bin,
+        &opts,
+        link_libc,
+        &zig_links,
+    ) {
         Ok(bin) => {
             println!("Successfully built AOT artifact: {}", bin.display());
         }
@@ -1905,21 +2916,76 @@ fn bindgen_command(args: &[String]) {
 }
 
 
+fn handle_dst_failure_capture(
+    cap_path: &str,
+    filename: &str,
+    source: &str,
+    failure: lust::sim::replay::FailureKind,
+) {
+    let cap_config = lust::sim::replay::CaptureConfig::new(cap_path)
+        .with_script(filename, source)
+        .with_args(env::args().collect())
+        .with_env_vars(env::vars().collect());
+    let capture_res = lust::sim::replay::capture_failure_to_bundle(
+        &cap_config,
+        &failure,
+        lust::sim::replay::EventLog::new(),
+        lust::sim::replay::global_shadow_vfs().snapshot(),
+    );
+    match capture_res {
+        Ok(bundle) => {
+            if let Err(write_err) = lust::sim::replay::write_bundle_and_reproduction_task(
+                &bundle,
+                Path::new(cap_path),
+            ) {
+                eprintln!("[DST-CAP] Warning: Failed to write replay bundle: {}", write_err);
+            } else {
+                eprintln!("[DST-CAP] Failure captured to replay bundle: {}", cap_path);
+                eprintln!("[DST-CAP] Reproduce with: lust sim replay {}", cap_path);
+            }
+        }
+        Err(err) => {
+            eprintln!("[DST-CAP] Warning: Failed to capture replay bundle: {}", err);
+        }
+    }
+}
+
 fn run_file_with_options(
     filename: &str,
     disassemble: bool,
     use_mir: bool,
     strict_mir: bool,
+    cranelift_jit: bool,
+    jit_disabled: bool,
     no_gc: bool,
     pure_core: bool,
+    json_diag: bool,
+    capture_failure: Option<&str>,
 ) {
     let source = match fs::read_to_string(filename) {
         Ok(content) => content,
         Err(e) => {
-            eprintln!("Error reading file '{}': {}", filename, e);
+            if json_diag {
+                eprint!("{}", cli::diag::json(format!("Error reading file '{filename}': {e}"), "error", None, None));
+            } else {
+                eprintln!("Error reading file '{}': {}", filename, e);
+            }
             process::exit(1);
         }
     };
+
+    if let Some(cap_path) = capture_failure {
+        let cap_config = lust::sim::replay::CaptureConfig::new(cap_path)
+            .with_script(filename, &source)
+            .with_args(env::args().collect())
+            .with_env_vars(env::vars().collect());
+        lust::sim::replay::install_failure_panic_hook(cap_config);
+        lust::sim::replay::global_shadow_vfs().record_write(filename, source.as_bytes().to_vec());
+    }
+
+    if env::var("LUST_TRIGGER_PANIC_FOR_TEST").is_ok() || env::args().any(|a| a == "--panic-for-test") {
+        panic!("FORCED_PANIC_FOR_TEST: Artificial panic triggered to verify DST failure capture");
+    }
     let entry_path = Path::new(filename);
     let project_dir = entry_path
         .parent()
@@ -1928,18 +2994,32 @@ fn run_file_with_options(
     let mut config = match LustConfig::load_for_entry(filename) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("Error loading configuration: {}", e);
+            if json_diag {
+                eprint!("{}", cli::diag::json(format!("Error loading configuration: {e}"), "error", None, None));
+            } else {
+                eprintln!("Error loading configuration: {}", e);
+            }
             process::exit(1);
         }
     };
     if pure_core {
         config.set_prelude_mode(lust::config::PreludeMode::Pure);
     }
+    let config_had_use_mir = config.use_mir();
     if use_mir {
         config.set_use_mir(true);
     }
     if strict_mir {
         config.set_strict_mir(true);
+    }
+    if cranelift_jit {
+        config.set_cranelift_jit(true);
+        if !config_had_use_mir && !use_mir && !strict_mir {
+            config.set_use_mir(false);
+        }
+    }
+    if jit_disabled {
+        config.set_jit_enabled(false);
     }
     if no_gc {
         config.set_gc_enabled(false);
@@ -1960,7 +3040,7 @@ fn run_file_with_options(
             process::exit(1);
         }
     };
-    let (functions, trait_impls, init_funcs, struct_defs) = match compile_program(
+    let (functions, mir_functions, trait_impls, init_funcs, mut struct_defs) = match compile_program(
         filename,
         &config,
         #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
@@ -1970,7 +3050,15 @@ fn run_file_with_options(
     ) {
         Ok(result) => result,
         Err(e) => {
-            print_error_with_context(&source, filename, &e);
+            if let Some(cap_path) = capture_failure {
+                handle_dst_failure_capture(
+                    cap_path,
+                    filename,
+                    &source,
+                    lust::sim::replay::FailureKind::CompilationError(e.to_string()),
+                );
+            }
+            print_error_with_context(&source, filename, &e, json_diag);
             process::exit(1);
         }
     };
@@ -1988,6 +3076,13 @@ fn run_file_with_options(
     let mut vm = VM::with_config(&config);
     vm.load_functions(functions);
     vm.register_structs(&struct_defs);
+    // `Compiler::compile_module` already lowered eligible MIR functions into `functions`
+    // with struct layouts, field slots, and direct callee indices when `config.use_mir()` is
+    // enabled. Register MIR candidates without overwriting the compiled bytecode.
+    for mir_fn in mir_functions {
+        vm.register_mir_candidate(mir_fn);
+    }
+    lust::mir::vm_backend::register_struct_value_decoders(&mut vm, &struct_defs);
     for (type_name, trait_name) in trait_impls {
         vm.register_trait_impl(type_name, trait_name);
     }
@@ -2062,19 +3157,146 @@ fn run_file_with_options(
                 vm.set_global(module_path, module_value);
             }
             Err(e) => {
-                print_error_with_context(&source, filename, &e);
+                if let Some(cap_path) = capture_failure {
+                    handle_dst_failure_capture(
+                        cap_path,
+                        filename,
+                        &source,
+                        lust::sim::replay::FailureKind::RuntimeError(e.to_string()),
+                    );
+                }
+                print_error_with_context(&source, filename, &e, json_diag);
                 process::exit(1);
             }
         }
     }
 
     if let Err(e) = vm.call("__script", vec![]) {
-        print_error_with_context(&source, filename, &e);
+        if let Some(cap_path) = capture_failure {
+            handle_dst_failure_capture(
+                cap_path,
+                filename,
+                &source,
+                lust::sim::replay::FailureKind::RuntimeError(e.to_string()),
+            );
+        }
+        print_error_with_context(&source, filename, &e, json_diag);
         process::exit(1);
     }
 
     if std::env::var_os("LUST_JIT_STATS").is_some() {
         eprintln!("JIT stats: {:?}", vm.jit_stats());
+        eprintln!(
+            "Cranelift stats: entries={} compilations={}",
+            vm.cranelift_entry_count, vm.cranelift_compilation_count
+        );
+    }
+}
+
+fn run_file_rust_aot(filename: &str, pure_core: bool) {
+    let entry_path = Path::new(filename);
+    let parent = entry_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut loader = ModuleLoader::new(parent);
+    let program = match loader.load_program_from_entry(filename) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error loading program: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let mut config = lust::config::LustConfig::load_for_entry(entry_path).unwrap_or_default();
+    if pure_core {
+        config.capability_mask_mut().allow_ffi = false;
+    }
+    let mut imports_map = lust::hashbrown::HashMap::new();
+    for m in &program.modules {
+        imports_map.insert(m.path.clone(), m.imports.clone());
+    }
+    let mut typechecker = TypeChecker::with_config(&config);
+    typechecker.set_imports_by_module(imports_map);
+    if let Err(e) = typechecker.check_program(&program.modules) {
+        eprintln!("Type error: {}", e);
+        process::exit(1);
+    }
+
+    let mut all_items = Vec::new();
+    for module in &program.modules {
+        all_items.extend(module.items.clone());
+    }
+    let filtered_items = lust::codegen_zig::tree_shake_items(&all_items, false);
+    let mir_module =
+        match lust::codegen_zig::aot::compiler::prepare_and_lower_items_for_rust_aot(&filtered_items)
+        {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("MIR lowering error: {}", e);
+                process::exit(1);
+            }
+        };
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = process::id();
+    let temp_dir = env::temp_dir().join(format!("lust_run_rust_{}_{}", pid, nanos));
+    if let Err(e) = fs::create_dir_all(&temp_dir) {
+        eprintln!("Failed to create temporary directory: {}", e);
+        process::exit(1);
+    }
+
+    let stem = entry_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("script");
+    let target_bin = temp_dir.join(if cfg!(target_os = "windows") {
+        format!("{}.exe", stem)
+    } else {
+        stem.to_string()
+    });
+
+    let rust_opts = lust::codegen_zig::aot::RustCompileOptions {
+        aot: lust::codegen_zig::aot::AotCompileOptions::default(),
+        gas_metering: lust::codegen_zig::aot::GasMetering::None,
+        gas_limit: None,
+        pure_core,
+        no_std: false,
+        cache_dir: None,
+    };
+
+    let compiled_bin =
+        match lust::codegen_zig::aot::AotCompiler::compile_module_rust(&mir_module, &target_bin, &rust_opts) {
+            Ok(bin) => bin,
+            Err(e) => {
+                eprintln!("{}", e);
+                let _ = fs::remove_dir_all(&temp_dir);
+                process::exit(1);
+            }
+        };
+
+    let status = Command::new(&compiled_bin).status();
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    match status {
+        Ok(s) => {
+            if let Some(code) = s.code() {
+                process::exit(code);
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    if let Some(sig) = s.signal() {
+                        process::exit(128 + sig);
+                    }
+                }
+                process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to execute compiled binary: {}", e);
+            process::exit(1);
+        }
     }
 }
 
@@ -2194,6 +3416,7 @@ fn run_file_zig_aot(filename: &str) {
 /// definitions.
 type CompiledProgram = (
     Vec<lust::bytecode::Function>,
+    Vec<lust::mir::ir::MirFunction>,
     Vec<(String, String)>,
     Vec<(String, String)>,
     lust::hashbrown::HashMap<String, lust::ast::StructDef>,
@@ -2321,7 +3544,8 @@ fn compile_program(
     let checked_array_indices = typechecker.take_checked_array_indices();
     let lambda_return_types = typechecker.take_lambda_return_types();
     let numeric_types = typechecker.take_numeric_types();
-    let struct_defs = typechecker.struct_definitions();
+    let mut struct_defs = typechecker.struct_definitions();
+    register_synthetic_enum_struct_defs(&mut struct_defs, &wrapped_items);
     let function_signatures = typechecker.function_signatures();
     let mut compiler = Compiler::new();
     compiler.set_option_coercions(option_coercions);
@@ -2332,9 +3556,12 @@ fn compile_program(
     compiler.set_imports_by_module(imports_map);
     compiler.set_entry_module(program.entry_module.clone());
     compiler.set_function_signatures(function_signatures);
+    compiler.set_struct_defs(struct_defs.clone());
     compiler.set_use_mir(config.use_mir());
+    compiler.set_collect_mir(config.use_mir() || config.cranelift_jit());
     compiler.set_strict_mir(config.strict_mir());
     let functions = compiler.compile_module(&wrapped_items)?;
+    let mir_functions = compiler.take_mir_functions();
     let trait_impls = compiler.get_trait_impls().to_vec();
     let mut init_funcs: Vec<(String, String)> = Vec::new();
     for m in &program.modules {
@@ -2351,10 +3578,104 @@ fn compile_program(
         }
     }
 
-    Ok((functions, trait_impls, init_funcs, struct_defs))
+    Ok((functions, mir_functions, trait_impls, init_funcs, struct_defs))
 }
 
-fn print_error_with_context(source: &str, filename: &str, error: &lust::LustError) {
+/// Synthesizes scalar `__Enum_<Name>` `StructDef` entries for every scalar `ItemKind::Enum`
+/// so `vm.register_structs(&struct_defs)` populates `vm.struct_metadata` for Cranelift JIT
+/// (`W16-JIT-ENUM`).
+fn register_synthetic_enum_struct_defs(
+    struct_defs: &mut lust::hashbrown::HashMap<String, lust::ast::StructDef>,
+    items: &[Item],
+) {
+    use lust::ast::{FieldOwnership, ItemKind, StructDef, StructField, Type, TypeKind, Visibility};
+
+    for item in items {
+        match &item.kind {
+            ItemKind::Enum(enum_def) => {
+                let synth_name = format!("__Enum_{}", enum_def.name);
+                if struct_defs.contains_key(&synth_name) {
+                    continue;
+                }
+                let mut slot_types: Vec<Option<TypeKind>> = Vec::new();
+                let mut is_scalar = true;
+                for variant in &enum_def.variants {
+                    if let Some(fields) = &variant.fields {
+                        for (idx, ty) in fields.iter().enumerate() {
+                            let scalar_kind = match &ty.kind {
+                                TypeKind::Int => TypeKind::Int,
+                                TypeKind::Float => TypeKind::Float,
+                                TypeKind::Bool => TypeKind::Bool,
+                                _ => {
+                                    is_scalar = false;
+                                    break;
+                                }
+                            };
+                            if slot_types.len() <= idx {
+                                slot_types.resize(idx + 1, None);
+                            }
+                            match &slot_types[idx] {
+                                None => slot_types[idx] = Some(scalar_kind),
+                                Some(prev) if prev == &scalar_kind => {}
+                                Some(_) => {
+                                    is_scalar = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !is_scalar {
+                        break;
+                    }
+                }
+                if !is_scalar {
+                    continue;
+                }
+                let mut fields = Vec::with_capacity(1 + slot_types.len());
+                fields.push(StructField {
+                    name: "__tag".to_string(),
+                    ty: Type::new(TypeKind::Int, Span::dummy()),
+                    visibility: Visibility::Public,
+                    ownership: FieldOwnership::Strong,
+                    weak_target: None,
+                });
+                for (i, slot) in slot_types.into_iter().enumerate() {
+                    let kind = slot.unwrap_or(TypeKind::Int);
+                    fields.push(StructField {
+                        name: format!("__f{i}"),
+                        ty: Type::new(kind, Span::dummy()),
+                        visibility: Visibility::Public,
+                        ownership: FieldOwnership::Strong,
+                        weak_target: None,
+                    });
+                }
+                struct_defs.insert(
+                    synth_name.clone(),
+                    StructDef {
+                        name: synth_name,
+                        type_params: Vec::new(),
+                        trait_bounds: Vec::new(),
+                        fields,
+                        visibility: Visibility::Public,
+                        doc: None,
+                    },
+                );
+            }
+            ItemKind::Module { items: sub, .. } => {
+                register_synthetic_enum_struct_defs(struct_defs, sub);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn print_error_with_context(source: &str, filename: &str, error: &lust::LustError, json_diag: bool) {
+    if json_diag {
+        let mut bag = cli::diag::DiagnosticBag::new();
+        bag.add(error.clone().into_diagnostic(Some(filename), Some(source)));
+        cli::diag::emit_diagnostics(&bag);
+        return;
+    }
     const RED: &str = "\x1b[31m";
     const BOLD: &str = "\x1b[1m";
     const DIM: &str = "\x1b[90m";
@@ -2451,6 +3772,10 @@ fn print_error_with_context(source: &str, filename: &str, error: &lust::LustErro
 
         lust::LustError::Unknown(msg) => {
             eprintln!("{RED}{BOLD}error{RESET}: {msg}");
+        }
+
+        lust::LustError::BlockingHostCallViolation(msg) => {
+            eprintln!("{RED}{BOLD}blocking host call violation{RESET}: {msg}");
         }
     }
 }

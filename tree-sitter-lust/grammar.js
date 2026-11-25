@@ -796,10 +796,18 @@ module.exports = grammar({
     ),
 
     number: $ => token(choice(
-      /\d+(\.\d+)?([eE][+-]?\d+)?/,
-      /0[xX][0-9a-fA-F]+/,
-      /0[bB][01]+/,
-      /0[oO][0-7]+/,
+      // Hexadecimal
+      /0[xX][0-9a-fA-F](_?[0-9a-fA-F])*/,
+      // Binary
+      /0[bB][01](_?[01])*/,
+      // Octal
+      /0[oO][0-7](_?[0-7])*/,
+      // Float with decimal point and optional exponent
+      /[0-9](_?[0-9])*\.[0-9](_?[0-9])*([eE][+-]?[0-9](_?[0-9])*)?/,
+      // Float without decimal point with exponent
+      /[0-9](_?[0-9])*[eE][+-]?[0-9](_?[0-9])*/,
+      // Integer with underscore separators
+      /[0-9](_?[0-9])*/,
     )),
 
     string: $ => token(choice(

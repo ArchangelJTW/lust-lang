@@ -1,3 +1,6 @@
+// Host CLI / tooling boundary: program embedding tests use host filesystem fixtures.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use super::async_runtime::{
     AsyncRegistry, AsyncTaskEntry, AsyncTaskQueue, AsyncTaskTarget, AsyncValueFuture,
     PendingAsyncTask, signal_pair,
@@ -35,6 +38,7 @@ pub struct EmbeddedBuilder {
     entry_module: Option<String>,
     config: LustConfig,
     extern_registry: ExternRegistry,
+    extern_exports: Vec<NativeExport>,
 }
 
 impl Default for EmbeddedBuilder {
@@ -46,6 +50,7 @@ impl Default for EmbeddedBuilder {
             entry_module: None,
             config: LustConfig::default(),
             extern_registry: ExternRegistry::new(),
+            extern_exports: Vec::new(),
         }
     }
 }
@@ -150,6 +155,11 @@ impl EmbeddedBuilder {
         self
     }
 
+    pub fn declare_exported_native(mut self, export: NativeExport) -> Self {
+        self.extern_exports.push(export);
+        self
+    }
+
     pub fn with_extern_registry(mut self, registry: ExternRegistry) -> Self {
         self.extern_registry = registry;
         self
@@ -192,6 +202,17 @@ impl EmbeddedBuilder {
         self
     }
 
+    pub fn entry(
+        &mut self,
+        module_path: impl Into<String>,
+        source: impl Into<String>,
+    ) -> &mut Self {
+        let path = module_path.into();
+        self.modules.insert(path.clone(), source.into());
+        self.entry_module = Some(path);
+        self
+    }
+
     /// Select the entry module to compile and execute.
     ///
     /// Its source must either be registered with [`Self::module`] / [`Self::add_module`]
@@ -229,6 +250,7 @@ impl EmbeddedBuilder {
             overrides,
             self.config,
             self.extern_registry,
+            self.extern_exports,
         )
     }
 
@@ -258,6 +280,7 @@ impl EmbeddedBuilder {
             overrides,
             self.config,
             self.extern_registry,
+            self.extern_exports,
         )
     }
 }
@@ -268,6 +291,7 @@ pub struct CompiledBytecode {
     pub(crate) entry_module: String,
     pub(crate) entry_script: Option<String>,
     pub(crate) functions: Vec<crate::bytecode::Function>,
+    pub(crate) mir_functions: Vec<crate::mir::ir::MirFunction>,
     pub(crate) signatures: HashMap<String, FunctionSignature>,
     pub(crate) struct_defs: HashMap<String, StructDef>,
     pub(crate) enum_defs: HashMap<String, EnumDef>,
@@ -275,6 +299,7 @@ pub struct CompiledBytecode {
     pub(crate) init_funcs: Vec<(String, String)>,
     pub(crate) config: LustConfig,
     pub(crate) extern_registry: ExternRegistry,
+    pub(crate) extern_exports: Vec<NativeExport>,
 }
 
 impl CompiledBytecode {
@@ -346,6 +371,111 @@ impl<'a> AsyncDriver<'a> {
     }
 }
 
+/// Trait for converting host callback outputs into an embed callback result (`Result<T, String>`).
+/// Seamlessly supports:
+/// - `Result<T, String>`
+/// - `Result<T, core::convert::Infallible>` / `Result<T, !>`
+/// - `Result<T, &'static str>`
+/// - `PureExit<T>` / `Exit<T, core::convert::Infallible>`
+/// - `Exit<T, String>`
+/// - Infallible primitive types (`i64`, `f64`, `bool`, `String`, `()`, `Value`, `Rc<String>`)
+pub trait IntoEmbedCallbackResult<T> {
+    fn into_embed_callback_result(self) -> std::result::Result<T, String>;
+}
+
+impl<T> IntoEmbedCallbackResult<T> for std::result::Result<T, String> {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<T, String> {
+        self
+    }
+}
+
+impl<T> IntoEmbedCallbackResult<T> for std::result::Result<T, core::convert::Infallible> {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<T, String> {
+        match self {
+            Ok(v) => Ok(v),
+            Err(infallible) => match infallible {},
+        }
+    }
+}
+
+impl<T> IntoEmbedCallbackResult<T> for std::result::Result<T, &'static str> {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<T, String> {
+        self.map_err(|s| s.to_string())
+    }
+}
+
+impl<T> IntoEmbedCallbackResult<T> for crate::effect_abi::Exit<T, core::convert::Infallible> {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<T, String> {
+        match self.into_ok_or_defect() {
+            Ok(v) => Ok(v),
+            Err(defect) => Err(defect.to_string()),
+        }
+    }
+}
+
+impl<T> IntoEmbedCallbackResult<T> for crate::effect_abi::Exit<T, String> {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<T, String> {
+        match self {
+            crate::effect_abi::Exit::Success(v) => Ok(v),
+            crate::effect_abi::Exit::Failure(cause) => Err(format!("{cause:?}")),
+        }
+    }
+}
+
+impl IntoEmbedCallbackResult<i64> for i64 {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<i64, String> {
+        Ok(self)
+    }
+}
+
+impl IntoEmbedCallbackResult<f64> for f64 {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<f64, String> {
+        Ok(self)
+    }
+}
+
+impl IntoEmbedCallbackResult<bool> for bool {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<bool, String> {
+        Ok(self)
+    }
+}
+
+impl IntoEmbedCallbackResult<String> for String {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<String, String> {
+        Ok(self)
+    }
+}
+
+impl IntoEmbedCallbackResult<()> for () {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<(), String> {
+        Ok(())
+    }
+}
+
+impl IntoEmbedCallbackResult<Value> for Value {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<Value, String> {
+        Ok(self)
+    }
+}
+
+impl IntoEmbedCallbackResult<Rc<String>> for Rc<String> {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<Rc<String>, String> {
+        Ok(self)
+    }
+}
+
 impl EmbeddedProgram {
     pub fn builder() -> EmbeddedBuilder {
         EmbeddedBuilder::default()
@@ -356,11 +486,17 @@ impl EmbeddedProgram {
         let mut vm = VM::with_config(&bytecode.config);
         vm.load_functions(bytecode.functions.clone());
         vm.register_structs(&bytecode.struct_defs);
+        for mir_fn in &bytecode.mir_functions {
+            vm.register_mir_candidate(mir_fn.clone());
+        }
         bytecode.extern_registry.register_type_stubs(&mut vm);
         for (type_name, trait_name) in &bytecode.trait_impls {
             vm.register_trait_impl(type_name.clone(), trait_name.clone());
         }
         bytecode.extern_registry.register_trait_impls(&mut vm);
+        for export in &bytecode.extern_exports {
+            vm.record_exported_native(export.clone());
+        }
 
         for (module_path, init) in &bytecode.init_funcs {
             let value = vm.call(init, Vec::new())?;
@@ -521,8 +657,13 @@ impl EmbeddedProgram {
         self.vm.dump_externs_to_dir(output_root)
     }
 
-    pub(crate) fn vm(&self) -> &VM {
+    pub fn vm(&self) -> &VM {
         &self.vm
+    }
+
+    #[inline]
+    pub fn cranelift_native_entry_count(&self) -> u64 {
+        self.vm.cranelift_native_entry_count()
     }
 
     pub fn global_names(&self) -> Vec<String> {
@@ -915,11 +1056,12 @@ impl EmbeddedProgram {
         Ok(())
     }
 
-    pub fn register_typed_native<Args, R, F>(&mut self, name: &str, func: F) -> Result<()>
+    pub fn register_typed_native<Args, R, F, Res>(&mut self, name: &str, func: F) -> Result<()>
     where
         Args: FromLustArgs,
         R: IntoLustValue + FromLustValue,
-        F: Fn(Args) -> std::result::Result<R, String> + 'static,
+        Res: IntoEmbedCallbackResult<R>,
+        F: Fn(Args) -> Res + 'static,
     {
         let (canonical, signature) = self.resolve_signature(name)?;
         if !Args::matches_signature(&signature.params) {
@@ -938,7 +1080,7 @@ impl EmbeddedProgram {
         let native_name = name.to_string();
         let handler = move |values: &[Value]| -> std::result::Result<NativeCallResult, String> {
             let args = Args::from_values(values)?;
-            let result = func(args)?;
+            let result = func(args).into_embed_callback_result()?;
             let value = result.into_value();
             VM::with_current(|vm| {
                 if vm.value_matches_type(&value, &return_type) {
@@ -955,6 +1097,21 @@ impl EmbeddedProgram {
         };
         self.register_native_with_aliases(name, canonical, handler);
         Ok(())
+    }
+
+    /// Register an infallible typed native callback without requiring Result wrapping.
+    pub fn register_infallible_typed_native<Args, R, F>(&mut self, name: &str, func: F) -> Result<()>
+    where
+        Args: FromLustArgs,
+        R: IntoLustValue + FromLustValue,
+        F: Fn(Args) -> R + 'static,
+    {
+        self.register_typed_native(
+            name,
+            move |args: Args| -> std::result::Result<R, core::convert::Infallible> {
+                Ok(func(args))
+            },
+        )
     }
 
     pub fn register_async_typed_native<Args, R, F, Fut>(
@@ -1153,27 +1310,69 @@ impl EmbeddedProgram {
         Args: FunctionArgs,
         Ret: FromLustValue,
     {
-        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
-        if self.vm.has_native_entry(handle.func_idx) {
-            let mut opt_args = Some(args);
-            if let Some(res) = self.vm.call_direct_fast_with(handle.func_idx, |dst| {
-                opt_args.take().unwrap().write_args(dst)
-            }) {
-                return Ret::from_value(res?);
-            }
-            if let Some(args) = opt_args {
-                let mut stack_args = [const { Value::Nil }; 16];
+        #[cfg(feature = "std")]
+        if self.vm.has_native_entry(handle.func_idx)
+            || self.vm.has_cranelift_direct_scalar_entry_5_6(handle.func_idx)
+        {
+            if self
+                .vm
+                .functions()
+                .get(handle.func_idx)
+                .is_some_and(|f| f.param_count <= 6 && f.name == handle.expected_name)
+            {
+                let mut stack_args = [const { Value::Nil }; 6];
                 let arg_count = args.write_args(&mut stack_args);
-                let value = self.vm.call_retained_target_slice(
-                    handle.func_idx,
-                    &handle.expected_name,
-                    &stack_args[..arg_count],
-                )?;
-                return Ret::from_value(value);
+                if arg_count <= 6 {
+                    let direct_res = if arg_count <= 4 {
+                        self.vm.try_call_cranelift_scalar_direct(
+                            handle.func_idx,
+                            &stack_args[..arg_count],
+                        )
+                    } else {
+                        self.vm.try_call_cranelift_scalar_direct_5_6(
+                            handle.func_idx,
+                            &stack_args[..arg_count],
+                        )
+                    };
+                    if let Some(res) = direct_res {
+                        return Ret::from_value(res?);
+                    }
+                    let value = self.vm.call_retained_target_slice(
+                        handle.func_idx,
+                        &handle.expected_name,
+                        &stack_args[..arg_count],
+                    )?;
+                    return Ret::from_value(value);
+                }
+                return Err(LustError::RuntimeError {
+                    message: format!(
+                        "Arity mismatch in call_handle for '{}': expected <= 6 arguments, got {}",
+                        handle.expected_name, arg_count
+                    ),
+                });
             }
-            return Err(LustError::RuntimeError {
-                message: "Internal error in native call".to_string(),
-            });
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            {
+                let mut opt_args = Some(args);
+                if let Some(res) = self.vm.call_direct_fast_with(handle.func_idx, |dst| {
+                    opt_args.take().unwrap().write_args(dst)
+                }) {
+                    return Ret::from_value(res?);
+                }
+                if let Some(args) = opt_args {
+                    let mut stack_args = [const { Value::Nil }; 16];
+                    let arg_count = args.write_args(&mut stack_args);
+                    let value = self.vm.call_retained_target_slice(
+                        handle.func_idx,
+                        &handle.expected_name,
+                        &stack_args[..arg_count],
+                    )?;
+                    return Ret::from_value(value);
+                }
+                return Err(LustError::RuntimeError {
+                    message: "Internal error in native call".to_string(),
+                });
+            }
         }
 
         let mut stack_args = [const { Value::Nil }; 16];
@@ -1230,27 +1429,67 @@ impl EmbeddedProgram {
             idx
         };
 
-        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
-        if self.vm.has_native_entry(func_idx) {
-            let mut opt_args = Some(args);
-            if let Some(res) = self.vm.call_direct_fast_with(func_idx, |dst| {
-                opt_args.take().unwrap().write_args(dst)
-            }) {
-                return R::from_value(res?);
-            }
-            if let Some(args) = opt_args {
-                let mut stack_args = [const { Value::Nil }; 16];
+        #[cfg(feature = "std")]
+        if self.vm.has_native_entry(func_idx)
+            || self.vm.has_cranelift_direct_scalar_entry_5_6(func_idx)
+        {
+            if self
+                .vm
+                .functions()
+                .get(func_idx)
+                .is_some_and(|f| f.param_count <= 6 && f.name == function_name)
+            {
+                let mut stack_args = [const { Value::Nil }; 6];
                 let arg_count = args.write_args(&mut stack_args);
-                let value = self.vm.call_retained_target_slice(
-                    func_idx,
-                    function_name,
-                    &stack_args[..arg_count],
-                )?;
-                return R::from_value(value);
+                if arg_count <= 6 {
+                    let direct_res = if arg_count <= 4 {
+                        self.vm
+                            .try_call_cranelift_scalar_direct(func_idx, &stack_args[..arg_count])
+                    } else {
+                        self.vm.try_call_cranelift_scalar_direct_5_6(
+                            func_idx,
+                            &stack_args[..arg_count],
+                        )
+                    };
+                    if let Some(res) = direct_res {
+                        return R::from_value(res?);
+                    }
+                    let value = self.vm.call_retained_target_slice(
+                        func_idx,
+                        function_name,
+                        &stack_args[..arg_count],
+                    )?;
+                    return R::from_value(value);
+                }
+                return Err(LustError::RuntimeError {
+                    message: format!(
+                        "Arity mismatch in call_typed for '{}': expected <= 6 arguments, got {}",
+                        function_name, arg_count
+                    ),
+                });
             }
-            return Err(LustError::RuntimeError {
-                message: "Internal error in native call".to_string(),
-            });
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            {
+                let mut opt_args = Some(args);
+                if let Some(res) = self.vm.call_direct_fast_with(func_idx, |dst| {
+                    opt_args.take().unwrap().write_args(dst)
+                }) {
+                    return R::from_value(res?);
+                }
+                if let Some(args) = opt_args {
+                    let mut stack_args = [const { Value::Nil }; 16];
+                    let arg_count = args.write_args(&mut stack_args);
+                    let value = self.vm.call_retained_target_slice(
+                        func_idx,
+                        function_name,
+                        &stack_args[..arg_count],
+                    )?;
+                    return R::from_value(value);
+                }
+                return Err(LustError::RuntimeError {
+                    message: "Internal error in native call".to_string(),
+                });
+            }
         }
 
         let mut stack_args = [const { Value::Nil }; 16];
@@ -1364,6 +1603,49 @@ impl EmbeddedProgram {
 
     pub fn has_pending_async_tasks(&self) -> bool {
         !self.async_registry.borrow().is_empty()
+    }
+
+    pub fn pending_async_task_count(&self) -> usize {
+        self.async_registry.borrow().len()
+    }
+
+    /// Cancels and drops all pending async tasks in the registry, firing cancel observers
+    /// and failing any associated VM task handles cleanly.
+    pub fn cancel_pending_async_tasks(&mut self) -> usize {
+        let mut drained = Vec::new();
+        {
+            let mut registry = self.async_registry.borrow_mut();
+            let keys: Vec<u64> = registry.pending.keys().copied().collect();
+            for id in keys {
+                if let Some(mut entry) = registry.pending.remove(&id) {
+                    entry.cancel();
+                    drained.push(entry);
+                }
+            }
+        }
+        let count = drained.len();
+        for entry in drained {
+            let err = LustError::RuntimeError {
+                message: "Cancelled".to_string(),
+            };
+            match entry.target {
+                AsyncTaskTarget::ScriptTask(handle) => {
+                    let _ = self.vm.fail_task_handle(handle, err);
+                }
+                AsyncTaskTarget::NativeTask(handle) => {
+                    let _ = self.vm.complete_native_future_task(handle, Err("Cancelled".to_string()));
+                }
+            }
+            drop(entry);
+        }
+        count
+    }
+
+    pub fn set_wake_notifier(
+        &mut self,
+        notifier: Option<std::sync::Arc<dyn crate::embed::async_runtime::AsyncWakeNotifier>>,
+    ) -> Option<std::sync::Arc<dyn crate::embed::async_runtime::AsyncWakeNotifier>> {
+        self.async_registry.borrow_mut().set_wake_notifier(notifier)
     }
 
     #[allow(dead_code)]
@@ -1584,8 +1866,14 @@ impl EmbeddedProgram {
             TypeKind::Union(_) => Err(PreflightError::type_error(
                 "Union schema is strictly rejected",
             )),
-            TypeKind::Never | TypeKind::Effect { .. } => Err(PreflightError::type_error(
-                "Effect/Never schema is not supported in embed parameters",
+            TypeKind::Never
+            | TypeKind::Effect { .. }
+            | TypeKind::Typeof(_)
+            | TypeKind::InferType(_)
+            | TypeKind::InferInput(_)
+            | TypeKind::InferOutput(_)
+            | TypeKind::Schema { .. } => Err(PreflightError::type_error(
+                "Effect/Never/Schema/Infer/Typeof schema is not supported in embed parameters",
             )),
         }
     }
@@ -2226,9 +2514,49 @@ pub(crate) fn compile_to_bytecode(
     overrides: HashMap<PathBuf, String>,
     config: LustConfig,
     extern_registry: ExternRegistry,
+    extern_exports: Vec<NativeExport>,
 ) -> Result<CompiledBytecode> {
+    for export in &extern_exports {
+        if config.prelude_mode() == &crate::config::PreludeMode::Pure {
+            if let Some(spec) = &export.effects {
+                if spec.purity == crate::vm::NativePurity::Effectful {
+                    return Err(LustError::CompileError(format!(
+                        "PurityViolation: effectful native function '{}' not allowed in PreludeMode::Pure",
+                        export.name()
+                    )));
+                }
+            }
+        }
+        if let Some(spec) = &export.effects {
+            if let Some(req_cap) = &spec.required_capability {
+                let caps = config.capability_mask();
+                let allowed = match req_cap.as_str() {
+                    "net" => caps.allow_net,
+                    "fs" => caps.allow_fs,
+                    "io" => caps.allow_io || caps.allow_fs,
+                    "os" => caps.allow_os,
+                    "task" => caps.allow_task,
+                    "test" => caps.allow_test,
+                    "ffi" => caps.allow_ffi,
+                    other => caps.custom_capabilities.contains(other) || config.is_std_module_allowed(other),
+                };
+                if !allowed {
+                    return Err(LustError::CompileError(format!(
+                        "CapabilityDenied: native function '{}' requires capability '{}'",
+                        export.name(),
+                        req_cap
+                    )));
+                }
+            }
+        }
+    }
+
+    let want_cranelift = config.cranelift_jit()
+        || std::env::var("LUST_JIT_BACKEND").as_deref() == Ok("cranelift")
+        || std::env::var("LUST_BACKEND").as_deref() == Ok("cranelift");
+
     #[cfg(feature = "std")]
-    let cache_key = if extern_registry.is_empty() {
+    let cache_key = if extern_registry.is_empty() && extern_exports.is_empty() {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         base_dir.hash(&mut hasher);
@@ -2240,6 +2568,8 @@ pub(crate) fn compile_to_bytecode(
             s.hash(&mut hasher);
         }
         config.jit_enabled().hash(&mut hasher);
+        want_cranelift.hash(&mut hasher);
+        config.use_mir().hash(&mut hasher);
         config.minimal_runtime_types().hash(&mut hasher);
         config.low_memory_mode().hash(&mut hasher);
         config.prelude_mode().hash(&mut hasher);
@@ -2267,6 +2597,28 @@ pub(crate) fn compile_to_bytecode(
         .ok_or_else(|| LustError::Unknown("Entry path contained invalid UTF-8".into()))?
         .to_string();
     let program = loader.load_program_from_entry(&entry_path_str)?;
+
+    let mut config = loader.config().clone();
+    for module in &program.modules {
+        for target in module.imports.module_aliases.values() {
+            if crate::builtins::is_virtual_std_module(target) {
+                let canon = crate::builtins::canonical_std_module_name(target);
+                if config.is_std_module_allowed(canon) {
+                    config.enable_module(canon);
+                }
+            }
+        }
+        for target in module.imports.function_aliases.values() {
+            if let Some((mod_part, _)) = target.split_once('.') {
+                if crate::builtins::is_virtual_std_module(mod_part) {
+                    let canon = crate::builtins::canonical_std_module_name(mod_part);
+                    if config.is_std_module_allowed(canon) {
+                        config.enable_module(canon);
+                    }
+                }
+            }
+        }
+    }
 
     // Build imports map (small: just alias/path strings, not AST)
     let mut imports_map: HashMap<String, ModuleImports> = HashMap::new();
@@ -2331,8 +2683,11 @@ pub(crate) fn compile_to_bytecode(
     compiler.set_imports_by_module(imports_map);
     compiler.set_entry_module(program_entry_module.clone());
     compiler.set_function_signatures(signatures);
+    compiler.set_struct_defs(struct_defs.clone());
     compiler.set_minimal_runtime_types(config.minimal_runtime_types());
+    compiler.set_collect_mir(want_cranelift || config.use_mir());
     let functions = compiler.compile_module(&wrapped_items)?;
+    let mir_functions = compiler.take_mir_functions();
     let trait_impls = compiler.get_trait_impls().to_vec();
     // Recover signatures from compiler (avoids keeping two copies alive simultaneously)
     let mut signatures = compiler.take_function_signatures();
@@ -2360,6 +2715,7 @@ pub(crate) fn compile_to_bytecode(
         entry_module: program_entry_module,
         entry_script,
         functions,
+        mir_functions,
         signatures,
         struct_defs,
         enum_defs,
@@ -2367,6 +2723,7 @@ pub(crate) fn compile_to_bytecode(
         init_funcs,
         config,
         extern_registry,
+        extern_exports,
     };
 
     #[cfg(feature = "std")]
@@ -2385,8 +2742,9 @@ fn compile_in_memory(
     overrides: HashMap<PathBuf, String>,
     config: LustConfig,
     extern_registry: ExternRegistry,
+    extern_exports: Vec<NativeExport>,
 ) -> Result<EmbeddedProgram> {
-    let bytecode = compile_to_bytecode(base_dir, entry_module, overrides, config, extern_registry)?;
+    let bytecode = compile_to_bytecode(base_dir, entry_module, overrides, config, extern_registry, extern_exports)?;
     EmbeddedProgram::from_compiled(&bytecode)
 }
 
@@ -2923,9 +3281,9 @@ mod tests {
         let err = program
             .call_preflight_spike(
                 "test_mod.array_fn",
-                vec![Value::Array(Rc::new(RefCell::new(vec![Value::String(
+                vec![Value::array(vec![Value::String(
                     Rc::new("bad".into()),
-                )])))],
+                )])],
                 &limits,
             )
             .expect_err("wrong nested type must fail");
@@ -2973,7 +3331,7 @@ mod tests {
             ))),
             Span::new(0, 0, 0, 0),
         );
-        let empty_array = Value::Array(Rc::new(RefCell::new(Vec::new())));
+        let empty_array = Value::array(Vec::new());
         let mut empty_budget = WorkBudget::new(limits.max_work, limits.max_depth);
         let err = program
             .validate_argument_value(&empty_array, &empty_bad_type, 0, &mut empty_budget)
@@ -2983,8 +3341,8 @@ mod tests {
 
         // Category 12: Depth limit exceeded
         // Array<Array<int>> has depth 2, while tight_limits allows max_depth: 1
-        let depth1 = Value::Array(Rc::new(RefCell::new(vec![Value::Int(1)])));
-        let depth2 = Value::Array(Rc::new(RefCell::new(vec![depth1])));
+        let depth1 = Value::array(vec![Value::Int(1)]);
+        let depth2 = Value::array(vec![depth1]);
         let tight_limits = PreflightLimits {
             max_depth: 1,
             max_work: 100,
@@ -2998,7 +3356,7 @@ mod tests {
         // Category 13: Work budget limit exceeded
         // Array with 30 items while max_work is 5
         let large_items: Vec<Value> = (0..30).map(Value::Int).collect();
-        let large_array = Value::Array(Rc::new(RefCell::new(large_items)));
+        let large_array = Value::array(large_items);
         let work_limits = PreflightLimits {
             max_depth: 64,
             max_work: 5,
@@ -3395,7 +3753,7 @@ mod tests {
         assert_eq!(valid_res, Value::Int(42));
 
         // Recursive schema rejection on empty containers via validate_argument_value
-        let empty_arr = Value::Array(Rc::new(RefCell::new(Vec::new())));
+        let empty_arr = Value::array(Vec::new());
         let empty_map = Value::Map(Rc::new(RefCell::new(crate::bytecode::LustMap::default())));
 
         // 1. Empty array with Option schema
@@ -3475,7 +3833,7 @@ mod tests {
             ))),
             Span::new(0, 0, 0, 0),
         );
-        let nested_empty = Value::Array(Rc::new(RefCell::new(vec![empty_arr])));
+        let nested_empty = Value::array(vec![empty_arr]);
         let mut budget = WorkBudget::new(limits.max_work, limits.max_depth);
         let err = program1
             .validate_argument_value(&nested_empty, &type_nested_empty, 0, &mut budget)
@@ -3846,7 +4204,7 @@ mod tests {
 
         let host_counter = Arc::new(AtomicUsize::new(0));
 
-        let shared_array = Rc::new(RefCell::new(vec![Value::Int(10), Value::Int(20)]));
+        let shared_array = Rc::new(crate::bytecode::LustArray::new(vec![Value::Int(10), Value::Int(20)]));
         let shared_array_cb = shared_array.clone();
 
         let mut base_map = LustMap::default();
@@ -3930,18 +4288,18 @@ mod tests {
         });
 
         program.register_native_fn("get_nested_array", move |_args: &[Value]| {
-            let inner1 = Rc::new(RefCell::new(vec![Value::Int(1), Value::Int(2)]));
-            let inner2 = Rc::new(RefCell::new(vec![Value::Int(3)]));
-            let outer = Rc::new(RefCell::new(vec![
+            let inner1 = Rc::new(crate::bytecode::LustArray::new(vec![Value::Int(1), Value::Int(2)]));
+            let inner2 = Rc::new(crate::bytecode::LustArray::new(vec![Value::Int(3)]));
+            let outer = Rc::new(crate::bytecode::LustArray::new(vec![
                 Value::Array(inner1),
                 Value::Array(inner2),
             ]));
             Ok(NativeCallResult::Return(Value::Array(outer)))
         });
         program.register_native_fn("borrow_pkg.get_nested_array", move |_args: &[Value]| {
-            let inner1 = Rc::new(RefCell::new(vec![Value::Int(1), Value::Int(2)]));
-            let inner2 = Rc::new(RefCell::new(vec![Value::Int(3)]));
-            let outer = Rc::new(RefCell::new(vec![
+            let inner1 = Rc::new(crate::bytecode::LustArray::new(vec![Value::Int(1), Value::Int(2)]));
+            let inner2 = Rc::new(crate::bytecode::LustArray::new(vec![Value::Int(3)]));
+            let outer = Rc::new(crate::bytecode::LustArray::new(vec![
                 Value::Array(inner1),
                 Value::Array(inner2),
             ]));
@@ -4163,21 +4521,21 @@ mod tests {
 
         // Shared containers for returning
         // Self-cyclic array: [cyclic_arr]
-        let cyclic_arr = Rc::new(RefCell::new(Vec::new()));
+        let cyclic_arr = Rc::new(crate::bytecode::LustArray::new(Vec::new()));
         cyclic_arr
             .borrow_mut()
             .push(Value::Array(Rc::clone(&cyclic_arr)));
 
         // Two-container cyclic array: A -> [B], B -> [A]
-        let two_node_a = Rc::new(RefCell::new(Vec::new()));
-        let two_node_b = Rc::new(RefCell::new(vec![Value::Array(Rc::clone(&two_node_a))]));
+        let two_node_a = Rc::new(crate::bytecode::LustArray::new(Vec::new()));
+        let two_node_b = Rc::new(crate::bytecode::LustArray::new(vec![Value::Array(Rc::clone(&two_node_a))]));
         two_node_a
             .borrow_mut()
             .push(Value::Array(Rc::clone(&two_node_b)));
 
-        let acyclic_leaf = Rc::new(RefCell::new(vec![Value::Int(42)]));
+        let acyclic_leaf = Rc::new(crate::bytecode::LustArray::new(vec![Value::Int(42)]));
         // Array containing two references to the same acyclic leaf (DAG / diamond alias)
-        let acyclic_diamond_arr = Rc::new(RefCell::new(vec![
+        let acyclic_diamond_arr = Rc::new(crate::bytecode::LustArray::new(vec![
             Value::Array(Rc::clone(&acyclic_leaf)),
             Value::Array(Rc::clone(&acyclic_leaf)),
         ]));

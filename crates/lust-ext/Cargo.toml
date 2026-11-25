@@ -1,0 +1,12 @@
+[package]
+name = "lust-ext"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Ergonomic SDK for writing Lust external native extensions"
+
+[dependencies]
+lust-ext-abi = { path = "../lust-ext-abi" }
+lust-macros = { path = "../lust-macros" }
+
+[workspace]

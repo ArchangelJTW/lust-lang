@@ -167,26 +167,30 @@ impl<'a> JsonParser<'a> {
 
     fn parse_string(&mut self) -> Result<String, JsonError> {
         self.consume_byte(b'"')?;
-        let mut out = String::new();
+        let mut bytes = Vec::new();
 
         while !self.is_eof() {
             let b = self.next_byte()?;
             match b {
-                b'"' => return Ok(out),
+                b'"' => {
+                    return String::from_utf8(bytes).map_err(|_| JsonError::InvalidUnicode(self.pos));
+                }
                 b'\\' => {
                     let esc = self.next_byte()?;
                     match esc {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\x08'),
-                        b'f' => out.push('\x0c'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
+                        b'"' => bytes.push(b'"'),
+                        b'\\' => bytes.push(b'\\'),
+                        b'/' => bytes.push(b'/'),
+                        b'b' => bytes.push(b'\x08'),
+                        b'f' => bytes.push(b'\x0c'),
+                        b'n' => bytes.push(b'\n'),
+                        b'r' => bytes.push(b'\r'),
+                        b't' => bytes.push(b'\t'),
                         b'u' => {
                             let ch = self.parse_unicode_hex()?;
-                            out.push(ch);
+                            let mut buf = [0u8; 4];
+                            let s = ch.encode_utf8(&mut buf);
+                            bytes.extend_from_slice(s.as_bytes());
                         }
                         _ => return Err(JsonError::InvalidEscape(self.pos - 1)),
                     }
@@ -196,7 +200,7 @@ impl<'a> JsonParser<'a> {
                     return Err(JsonError::UnexpectedChar(b as char, self.pos - 1));
                 }
                 _ => {
-                    out.push(b as char);
+                    bytes.push(b);
                 }
             }
         }

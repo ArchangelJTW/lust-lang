@@ -5,7 +5,69 @@ use crate::bytecode::{LustMap, ValueKey};
 use crate::vm::task::TaskKind;
 use alloc::{format, string::ToString};
 use core::{cell::RefCell, mem};
+
+pub static MUTATION_M2_SKIP_PANIC_FINALIZER: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub static MUTATION_M2_EXECUTION_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub struct MutationM2Guard;
+
+impl MutationM2Guard {
+    pub fn enable() -> Self {
+        MUTATION_M2_SKIP_PANIC_FINALIZER.store(true, core::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for MutationM2Guard {
+    fn drop(&mut self) {
+        MUTATION_M2_SKIP_PANIC_FINALIZER.store(false, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl VM {
+    pub fn park_task(&mut self, task_id: TaskId, key: crate::vm::task::WaitKey) -> bool {
+        self.task_manager.park(task_id, key)
+    }
+
+    pub fn park_current_task(&mut self, key: crate::vm::task::WaitKey) -> bool {
+        self.current_task.is_some_and(|id| self.task_manager.park(id, key))
+    }
+
+    pub fn wake_one(&mut self, key: crate::vm::task::WaitKey) -> Option<TaskId> {
+        self.task_manager.wake(key, false).into_iter().next()
+    }
+
+    pub fn wake_all(&mut self, key: crate::vm::task::WaitKey) -> Vec<TaskId> {
+        self.task_manager.wake(key, true)
+    }
+
+    pub fn next_wait_key(&mut self) -> crate::vm::task::WaitKey {
+        self.task_manager.next_wait_key()
+    }
+
+    pub fn is_task_waiting(&self, task_id: TaskId) -> bool {
+        self.task_manager.is_task_waiting(task_id)
+    }
+
+    pub fn cancel_task(&mut self, task_id: TaskId, reason: crate::effect_abi::InterruptReason) {
+        self.task_manager.cancel_task(task_id, reason);
+    }
+
+    pub fn set_current_task_id(&mut self, id: Option<TaskId>) {
+        self.current_task = id;
+        self.sync_slow_path_flags();
+    }
+
+    pub fn task_manager(&self) -> &crate::vm::task::TaskManager {
+        &self.task_manager
+    }
+
+    pub fn task_manager_mut(&mut self) -> &mut crate::vm::task::TaskManager {
+        &mut self.task_manager
+    }
+
     /// Associates a task with an open scope before it can execute.
     pub fn register_scope_task(
         &mut self,
@@ -38,8 +100,17 @@ impl VM {
         }
         let children = scope.begin_teardown();
         for id in &children {
-            if let Some(task) = self.task_manager.get_mut(TaskId(*id)) {
+            let task_id = TaskId(*id);
+            if let Some(task) = self.task_manager.get_mut(task_id) {
                 task.request_interrupt(InterruptReason::Cancelled);
+            }
+            if self.task_manager.get(task_id).is_some_and(|t| {
+                matches!(
+                    t.state,
+                    TaskState::Completed | TaskState::Failed | TaskState::Stopped
+                )
+            }) {
+                self.task_manager.unregister_task_from_waiters(task_id);
             }
         }
         scope.mark_joining();
@@ -53,7 +124,16 @@ impl VM {
         }) {
             return false;
         }
-        scope.finalize_resources();
+        let has_failed = children.iter().any(|id| {
+            self.task_manager
+                .get(TaskId(*id))
+                .map_or(false, |task| task.state == TaskState::Failed)
+        });
+        if has_failed && MUTATION_M2_SKIP_PANIC_FINALIZER.load(core::sync::atomic::Ordering::Relaxed) {
+            MUTATION_M2_EXECUTION_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        } else {
+            scope.finalize_resources();
+        }
         true
     }
 
@@ -100,12 +180,23 @@ impl VM {
             _ => {}
         }
 
-        task.last_yield = None;
+        let last_yield_fallback = task.last_yield.take();
         let mut resume_value_opt = resume_value;
         if let Some(dest) = task.yield_dest.take() {
-            let value = resume_value_opt.take().unwrap_or(Value::Nil);
+            let value = resume_value_opt.take().or(last_yield_fallback).unwrap_or(Value::Nil);
             if let Some(frame) = task.call_stack.last_mut() {
-                frame.registers[dest as usize] = value;
+                let idx = dest as usize;
+                let is_non_plain = !value.is_plain();
+                let regs = frame
+                    .saved_registers
+                    .get_or_insert_with(|| Box::new(vec![Value::Nil; (frame.reg_count as usize).max(idx + 1)]));
+                if idx >= regs.len() {
+                    regs.resize(idx + 1, Value::Nil);
+                }
+                regs[idx] = value;
+                if is_non_plain {
+                    frame.mark_non_plain(idx);
+                }
             }
         } else if resume_value_opt.is_some() {
             let message = format!(
@@ -118,7 +209,86 @@ impl VM {
 
         task.state = TaskState::Running;
         task.fiber_context.state = crate::effect_abi::FiberExecutionState::Running;
-        mem::swap(&mut self.call_stack, &mut task.call_stack);
+        let saved_parent_call_stack = mem::take(&mut self.call_stack);
+        let parent_reg_top = saved_parent_call_stack
+            .last()
+            .map(|f| f.base_reg + f.reg_count as usize)
+            .unwrap_or(0);
+        let mut cursor = parent_reg_top;
+        let mut pending_frames = mem::take(&mut task.call_stack);
+        let mut loaded_frames: Vec<CallFrame> = Vec::with_capacity(pending_frames.len());
+        let mut load_err: Option<LustError> = None;
+        let mut pending_iter = pending_frames.drain(..);
+        while let Some(mut boxed_frame) = pending_iter.next() {
+            let saved = boxed_frame.saved_registers.take();
+            let saved_len = saved.as_ref().map_or(0, |v| v.len());
+            let reg_count = if boxed_frame.reg_count > 0 {
+                boxed_frame.reg_count.max(saved_len as u16)
+            } else if saved_len > 0 {
+                saved_len as u16
+            } else {
+                self.effective_reg_count(boxed_frame.function_idx)
+            };
+            let end = cursor + reg_count as usize;
+            if self.vm_registers.len() < end {
+                let extra = end - self.vm_registers.len();
+                if self.vm_registers.try_reserve(extra).is_err() {
+                    boxed_frame.saved_registers = saved;
+                    task.call_stack.push(boxed_frame);
+                    load_err = Some(LustError::RuntimeError {
+                        message: "Out of memory restoring fiber register window".to_string(),
+                    });
+                    break;
+                }
+                self.vm_registers.resize(end, Value::Nil);
+            } else {
+                for slot in &mut self.vm_registers[cursor..end] {
+                    *slot = Value::Nil;
+                }
+            }
+            boxed_frame.base_reg = cursor;
+            boxed_frame.reg_count = reg_count;
+            boxed_frame.non_plain_mask = 0;
+            if let Some(saved_vec) = saved {
+                for (i, val) in saved_vec.into_iter().enumerate().take(reg_count as usize) {
+                    if !val.is_plain() {
+                        boxed_frame.mark_non_plain(i);
+                    }
+                    self.vm_registers[cursor + i] = val;
+                }
+            }
+            if let Some(meta) = self.call_meta.get_mut(boxed_frame.function_idx) {
+                meta.active_depth = meta.active_depth.saturating_add(1);
+            }
+            cursor = end;
+            loaded_frames.push(*boxed_frame);
+        }
+        if let Some(err) = load_err {
+            // Roll back already-loaded fiber frames cleanly before returning OOM error.
+            let remaining: Vec<Box<CallFrame>> = pending_iter.collect();
+            let mut restored_stack: Vec<Box<CallFrame>> =
+                Vec::with_capacity(loaded_frames.len() + task.call_stack.len() + remaining.len());
+            for mut frame in loaded_frames {
+                if let Some(meta) = self.call_meta.get_mut(frame.function_idx) {
+                    meta.active_depth = meta.active_depth.saturating_sub(1);
+                }
+                let start = frame.base_reg;
+                let end = (start + frame.reg_count as usize).min(self.vm_registers.len());
+                let saved = self.vm_registers[start..end].to_vec();
+                CallFrame::clear_non_plain_slots(&mut self.vm_registers[start..end], frame.non_plain_mask);
+                frame.saved_registers = Some(Box::new(saved));
+                restored_stack.push(Box::new(frame));
+            }
+            restored_stack.extend(task.call_stack.drain(..));
+            restored_stack.extend(remaining);
+            task.call_stack = restored_stack;
+            task.state = TaskState::Stopped;
+            self.call_stack = saved_parent_call_stack;
+            self.task_manager.attach(task);
+            return Err(err);
+        }
+        drop(pending_iter);
+        self.call_stack = loaded_frames;
         mem::swap(
             &mut self.pending_return_value,
             &mut task.pending_return_value,
@@ -128,10 +298,12 @@ impl VM {
         self.active_scope_tasks.push(task_id);
         self.task_manager.attach(task);
         self.last_task_signal = None;
+        self.sync_slow_path_flags();
         let run_result = self.run();
         let signal = self.last_task_signal.take();
         self.current_task = parent_task;
         self.active_scope_tasks.pop();
+        self.sync_slow_path_flags();
         let mut task = self
             .task_manager
             .detach(task_id)
@@ -145,19 +317,39 @@ impl VM {
                             dest,
                             value: yielded,
                         } => {
-                            task.state = TaskState::Yielded;
+                            task.state = TaskState::Yielded(YieldReason::Explicit);
                             task.last_yield = Some(yielded);
                             task.last_result = None;
                             task.yield_dest = Some(dest);
+                        }
+
+                        TaskSignal::YieldTimer {
+                            dest,
+                            value: yielded,
+                            timer_id,
+                        } => {
+                            task.state = TaskState::Yielded(YieldReason::Timer(timer_id));
+                            task.last_yield = Some(yielded);
+                            task.last_result = None;
+                            task.yield_dest = Some(dest);
+                            task.timer_id = Some(timer_id);
+                        }
+
+                        TaskSignal::QuantumExhausted => {
+                            task.state = TaskState::Yielded(YieldReason::QuantumExhausted);
+                            task.last_yield = None;
+                            task.last_result = None;
+                            task.yield_dest = None;
                         }
 
                         TaskSignal::Stop { value: stop_value } => {
                             task.state = TaskState::Stopped;
                             task.last_result = Some(stop_value);
                             task.last_yield = None;
-                            task.call_stack.clear();
-                            task.pending_return_value = None;
-                            task.pending_return_dest = None;
+                            self.truncate_call_stack(0);
+                            self.pending_return_value = None;
+                            self.pending_return_dest = None;
+                            self.sync_slow_path_flags();
                         }
                     }
                 } else {
@@ -169,7 +361,23 @@ impl VM {
 
             Err(err) => {
                 let annotated = self.annotate_runtime_error(err);
-                if task.fiber_context.state != crate::effect_abi::FiberExecutionState::Interrupted {
+                let is_gas = match &annotated {
+                    LustError::RuntimeError { message } => message.starts_with("Out of gas"),
+                    _ => false,
+                };
+                let is_mem = match &annotated {
+                    LustError::RuntimeError { message } => message.starts_with("Out of memory"),
+                    _ => false,
+                };
+                if is_gas {
+                    task.state = TaskState::Stopped;
+                    task.fiber_context.state = crate::effect_abi::FiberExecutionState::Interrupted;
+                    task.fiber_context.pending_interrupt = Some(crate::effect_abi::InterruptReason::OutOfGas);
+                } else if is_mem {
+                    task.state = TaskState::Stopped;
+                    task.fiber_context.state = crate::effect_abi::FiberExecutionState::Interrupted;
+                    task.fiber_context.pending_interrupt = Some(crate::effect_abi::InterruptReason::OutOfMemory);
+                } else if task.fiber_context.state != crate::effect_abi::FiberExecutionState::Interrupted {
                     task.state = TaskState::Failed;
                 }
                 task.error = Some(annotated.clone());
@@ -178,19 +386,47 @@ impl VM {
             }
         }
 
-        mem::swap(&mut self.call_stack, &mut task.call_stack);
+        // Suspend fiber register windows out of `vm_registers` into `task.call_stack`
+        // and restore parent's call stack untouched.
+        task.call_stack.clear();
+        for mut frame in self.call_stack.drain(..) {
+            if let Some(meta) = self.call_meta.get_mut(frame.function_idx) {
+                meta.active_depth = meta.active_depth.saturating_sub(1);
+            }
+            let start = frame.base_reg;
+            let end = (start + frame.reg_count as usize).min(self.vm_registers.len());
+            let saved = if start < end {
+                let slice = self.vm_registers[start..end].to_vec();
+                CallFrame::clear_non_plain_slots(&mut self.vm_registers[start..end], frame.non_plain_mask);
+                slice
+            } else {
+                Vec::new()
+            };
+            frame.saved_registers = Some(Box::new(saved));
+            task.call_stack.push(Box::new(frame));
+        }
+        self.call_stack = saved_parent_call_stack;
         mem::swap(
             &mut self.pending_return_value,
             &mut task.pending_return_value,
         );
         mem::swap(&mut self.pending_return_dest, &mut task.pending_return_dest);
+        self.sync_slow_path_flags();
         task.fiber_context.state = match task.state {
             TaskState::Completed => crate::effect_abi::FiberExecutionState::Completed,
             TaskState::Failed => crate::effect_abi::FiberExecutionState::Failed,
             TaskState::Stopped => crate::effect_abi::FiberExecutionState::Interrupted,
             _ => crate::effect_abi::FiberExecutionState::Suspended,
         };
+        if matches!(task.state, TaskState::Yielded(_)) {
+            task.capture_continuation();
+        }
         self.task_manager.attach(task);
+        if self.task_manager.get(task_id).is_some_and(|t| {
+            matches!(t.state, TaskState::Completed | TaskState::Failed | TaskState::Stopped)
+        }) {
+            self.task_manager.unregister_task_from_waiters(task_id);
+        }
         if let Some(err) = error_result {
             Err(err)
         } else {
@@ -215,11 +451,18 @@ impl VM {
         args: Vec<Value>,
     ) -> Result<Box<CallFrame>> {
         match func {
-            Value::Function(func_idx) => self.make_call_frame(func_idx, None, args, Vec::new()),
+            Value::Function(func_idx) => {
+                self.make_detached_task_frame(func_idx, args, Vec::new(), Vec::new())
+            }
 
             Value::Closure(closure) => {
                 let captured: Vec<Value> = closure.upvalues.iter().map(|uv| uv.get()).collect();
-                self.make_call_frame(closure.function_idx, None, args, captured)
+                self.make_detached_task_frame(
+                    closure.function_idx,
+                    args,
+                    captured,
+                    closure.upvalues.clone(),
+                )
             }
 
             other => Err(LustError::RuntimeError {
@@ -228,7 +471,7 @@ impl VM {
         }
     }
 
-    pub(super) fn create_task_value(
+    pub fn create_task_value(
         &mut self,
         func: Value,
         args: Vec<Value>,
@@ -365,6 +608,8 @@ impl VM {
 
                 let jump_idx = wrapper.chunk.emit(Instruction::Jump(0), 0);
                 wrapper.chunk.patch_jump(jump_idx, loop_start);
+                wrapper.chunk.compute_bb_gas_weights();
+                wrapper.chunk.build_packed_code();
 
                 let new_idx = self.functions.len();
                 self.call_meta.push(super::CallMeta::of(&wrapper));
@@ -382,7 +627,7 @@ impl VM {
         self.resume_task_handle(handle, Some(resume_value))?;
         let task = self.get_task_instance(handle)?;
         match task.state {
-            TaskState::Yielded => Ok(task.last_yield.clone().unwrap_or(Value::Nil)),
+            TaskState::Yielded(_) => Ok(task.last_yield.clone().unwrap_or(Value::Nil)),
             TaskState::Completed | TaskState::Stopped => {
                 Ok(task.last_result.clone().unwrap_or(Value::Nil))
             }
@@ -403,8 +648,72 @@ impl VM {
         handle: TaskHandle,
         resume_value: Option<Value>,
     ) -> Result<()> {
+        let _vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
         let task_id = self.task_id_from_handle(handle)?;
         self.run_task_internal(task_id, resume_value)
+    }
+
+    /// Resumes a fiber with an exact instruction quantum.
+    /// If quantum fuel is exhausted, the fiber is preempted with TaskState::Yielded(YieldReason::QuantumExhausted)
+    /// and its full FiberContinuation is preserved.
+    pub fn resume_task_handle_with_quantum(
+        &mut self,
+        handle: TaskHandle,
+        quantum: u64,
+        resume_value: Option<Value>,
+    ) -> Result<TaskState> {
+        let _vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
+        let task_id = self.task_id_from_handle(handle)?;
+        self.quantum_fuel = Some(quantum);
+        self.sync_slow_path_flags();
+        let res = self.run_task_internal(task_id, resume_value);
+        self.quantum_fuel = None;
+        self.sync_slow_path_flags();
+        match res {
+            Ok(()) => {
+                let task = self.get_task_instance(handle)?;
+                Ok(task.state.clone())
+            }
+            Err(e) => {
+                if let Ok(task) = self.get_task_instance(handle) {
+                    if task.state == TaskState::Failed {
+                        return Ok(TaskState::Failed);
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Restores a fiber's execution context from a FiberContinuation and resumes it.
+    pub fn resume_from_continuation(
+        &mut self,
+        handle: TaskHandle,
+        continuation: FiberContinuation,
+        resume_value: Option<Value>,
+    ) -> Result<()> {
+        let task_id = self.task_id_from_handle(handle)?;
+        if let Some(task) = self.task_manager.get_mut(task_id) {
+            task.restore_continuation(continuation);
+            task.state = TaskState::Ready;
+        }
+        self.resume_task_handle(handle, resume_value)
+    }
+
+    /// Restores a fiber's execution context from a FiberContinuation and executes it with an instruction quantum.
+    pub fn resume_from_continuation_with_quantum(
+        &mut self,
+        handle: TaskHandle,
+        continuation: FiberContinuation,
+        quantum: u64,
+        resume_value: Option<Value>,
+    ) -> Result<TaskState> {
+        let task_id = self.task_id_from_handle(handle)?;
+        if let Some(task) = self.task_manager.get_mut(task_id) {
+            task.restore_continuation(continuation);
+            task.state = TaskState::Ready;
+        }
+        self.resume_task_handle_with_quantum(handle, quantum, resume_value)
     }
 
     pub(super) fn stop_task_handle(&mut self, handle: TaskHandle) -> Result<()> {
@@ -434,12 +743,14 @@ impl VM {
         }
 
         task.state = TaskState::Stopped;
+        task.timer_id = None;
         task.call_stack.clear();
         task.pending_return_value = None;
         task.pending_return_dest = None;
         task.yield_dest = None;
         task.last_yield = None;
         self.task_manager.attach(task);
+        self.task_manager.unregister_task_from_waiters(task_id);
         Ok(())
     }
 
@@ -534,6 +845,11 @@ impl VM {
                 task.pending_return_dest = None;
                 task.yield_dest = None;
                 self.task_manager.attach(task);
+                if self.task_manager.get(task_id).is_some_and(|t| {
+                    matches!(t.state, TaskState::Completed | TaskState::Failed | TaskState::Stopped)
+                }) {
+                    self.task_manager.unregister_task_from_waiters(task_id);
+                }
                 Ok(())
             }
 
@@ -758,9 +1074,11 @@ impl VM {
                             .map_err(|e| LustError::RuntimeError { message: e })?
                         {
                             NativeCallResult::Return(value) => Ok(value),
-                            NativeCallResult::Yield(_) => Err(LustError::RuntimeError {
-                                message: "unpack() unexpectedly yielded".to_string(),
-                            }),
+                            NativeCallResult::Yield(_) | NativeCallResult::YieldTimer(..) => {
+                                Err(LustError::RuntimeError {
+                                    message: "unpack() unexpectedly yielded".to_string(),
+                                })
+                            }
                             NativeCallResult::Stop(_) => Err(LustError::RuntimeError {
                                 message: "unpack() unexpectedly stopped execution".to_string(),
                             }),
@@ -1210,7 +1528,7 @@ mod scope_fiber_tests {
         task.request_interrupt(InterruptReason::Timeout);
         assert_eq!(task.state, TaskState::Running);
         vm.task_manager.insert(task);
-        vm.current_task = Some(id);
+        vm.set_current_task_id(Some(id));
         assert!(vm.run().is_err());
         assert_eq!(vm.task_manager.get(id).unwrap().state, TaskState::Stopped);
     }

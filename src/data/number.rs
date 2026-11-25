@@ -55,6 +55,10 @@ impl ObjectId {
     pub fn timestamp(&self) -> u32 {
         u32::from_be_bytes([self.0[0], self.0[1], self.0[2], self.0[3]])
     }
+
+    pub const fn bytes(&self) -> &[u8; 12] {
+        &self.0
+    }
 }
 
 impl fmt::Display for ObjectId {
@@ -132,7 +136,7 @@ impl ExactNumber {
             ExactNumber::Int(i) => Some(*i),
             ExactNumber::UInt(u) => i64::try_from(*u).ok(),
             ExactNumber::Float(f) => {
-                if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
+                if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f < 9_223_372_036_854_775_808.0 {
                     Some(*f as i64)
                 } else {
                     None
@@ -153,7 +157,7 @@ impl ExactNumber {
                 }
             }
             ExactNumber::Float(f) => {
-                if f.fract() == 0.0 && *f >= 0.0 && *f <= u64::MAX as f64 {
+                if f.fract() == 0.0 && *f >= 0.0 && *f < 18_446_744_073_709_551_616.0 {
                     Some(*f as u64)
                 } else {
                     None

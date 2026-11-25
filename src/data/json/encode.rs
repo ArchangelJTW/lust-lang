@@ -2,19 +2,42 @@ use crate::data::json::events::JsonError;
 use crate::data::{DataValue, ExactNumber};
 use std::fmt::Write;
 
+pub const DEFAULT_MAX_DEPTH: usize = 256;
+
 pub fn to_string(value: &DataValue) -> Result<String, JsonError> {
+    to_string_with_limits(value, DEFAULT_MAX_DEPTH)
+}
+
+pub fn to_string_with_limits(value: &DataValue, max_depth: usize) -> Result<String, JsonError> {
     let mut out = String::new();
-    encode_value(value, &mut out)?;
+    encode_value_depth(value, &mut out, 0, max_depth)?;
     Ok(out)
 }
 
 pub fn to_string_pretty(value: &DataValue) -> Result<String, JsonError> {
+    to_string_pretty_with_limits(value, DEFAULT_MAX_DEPTH, 2)
+}
+
+pub fn to_string_pretty_with_limits(
+    value: &DataValue,
+    max_depth: usize,
+    indent_step: usize,
+) -> Result<String, JsonError> {
     let mut out = String::new();
-    encode_value_indent(value, &mut out, 0, 2)?;
+    encode_value_indent_depth(value, &mut out, 0, indent_step, 0, max_depth)?;
     Ok(out)
 }
 
-fn encode_value(value: &DataValue, out: &mut String) -> Result<(), JsonError> {
+fn encode_value_depth(
+    value: &DataValue,
+    out: &mut String,
+    depth: usize,
+    max_depth: usize,
+) -> Result<(), JsonError> {
+    if depth > max_depth {
+        return Err(JsonError::MaxDepthExceeded(max_depth));
+    }
+
     match value {
         DataValue::Null => out.push_str("null"),
         DataValue::Bool(true) => out.push_str("true"),
@@ -43,7 +66,7 @@ fn encode_value(value: &DataValue, out: &mut String) -> Result<(), JsonError> {
                 if i > 0 {
                     out.push(',');
                 }
-                encode_value(item, out)?;
+                encode_value_depth(item, out, depth + 1, max_depth)?;
             }
             out.push(']');
         }
@@ -55,12 +78,12 @@ fn encode_value(value: &DataValue, out: &mut String) -> Result<(), JsonError> {
                 }
                 encode_string(k, out);
                 out.push(':');
-                encode_value(v, out)?;
+                encode_value_depth(v, out, depth + 1, max_depth)?;
             }
             out.push('}');
         }
         DataValue::Binary(bytes) => {
-            // Encode binary as hex or byte array in standard json
+            // Encode binary as byte array in standard json
             out.push('[');
             for (i, b) in bytes.iter().enumerate() {
                 if i > 0 {
@@ -80,12 +103,18 @@ fn encode_value(value: &DataValue, out: &mut String) -> Result<(), JsonError> {
     Ok(())
 }
 
-fn encode_value_indent(
+fn encode_value_indent_depth(
     value: &DataValue,
     out: &mut String,
     current_indent: usize,
     indent_step: usize,
+    depth: usize,
+    max_depth: usize,
 ) -> Result<(), JsonError> {
+    if depth > max_depth {
+        return Err(JsonError::MaxDepthExceeded(max_depth));
+    }
+
     match value {
         DataValue::Array(items) if !items.is_empty() => {
             out.push_str("[\n");
@@ -97,7 +126,7 @@ fn encode_value_indent(
                 for _ in 0..next_indent {
                     out.push(' ');
                 }
-                encode_value_indent(item, out, next_indent, indent_step)?;
+                encode_value_indent_depth(item, out, next_indent, indent_step, depth + 1, max_depth)?;
             }
             out.push('\n');
             for _ in 0..current_indent {
@@ -117,7 +146,7 @@ fn encode_value_indent(
                 }
                 encode_string(k, out);
                 out.push_str(": ");
-                encode_value_indent(v, out, next_indent, indent_step)?;
+                encode_value_indent_depth(v, out, next_indent, indent_step, depth + 1, max_depth)?;
             }
             out.push('\n');
             for _ in 0..current_indent {
@@ -125,12 +154,12 @@ fn encode_value_indent(
             }
             out.push('}');
         }
-        _ => encode_value(value, out)?,
+        _ => encode_value_depth(value, out, depth, max_depth)?,
     }
     Ok(())
 }
 
-fn encode_string(s: &str, out: &mut String) {
+pub fn encode_string(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
         match c {

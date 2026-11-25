@@ -1,4 +1,4 @@
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 pub use jit_engine::{
     analyze_module_call_effects, clear_registered_struct_layouts, compute_default_module_roots,
     compute_reachable_native_functions, find_loop_backedges, find_loop_headers,
@@ -64,16 +64,16 @@ pub use jit_engine::{
     MIR_STATUS_ERR_OUT_OF_BOUNDS, MIR_STATUS_ERR_OUT_OF_GAS, MIR_STATUS_OK,
 };
 
-#[cfg(all(feature = "std", feature = "cranelift-aot"))]
+#[cfg(all(feature = "cranelift", feature = "cranelift-aot"))]
 pub use jit_engine::CraneliftObjectCompiler;
 
-#[cfg(all(feature = "std", feature = "test-deopt"))]
+#[cfg(all(feature = "cranelift", feature = "test-deopt"))]
 pub use jit_engine::{
     refine_locals_with_seam, refine_mir_function_with_seam, safepoint_request_deopt_on_poll,
     SLOW_FLAG_TEST_DEOPT,
 };
 
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 pub mod jit_engine {
     use crate::mir::ir::*;
     pub use crate::mir::runtime_helpers::*;

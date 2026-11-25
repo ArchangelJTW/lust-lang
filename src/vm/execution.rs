@@ -7928,6 +7928,17 @@ impl VM {
     /// Consumes a pending DeoptPayload from `take_deopt_payload()`, reconstructs the target CallFrame
     /// state (target IP and live registers) via `DeoptExitState::from_payload` / `apply_to_call_frame`,
     /// and resumes execution in the interpreter without duplicate execution.
+    #[cfg(not(feature = "cranelift"))]
+    pub fn resume_from_deopt(
+        &mut self,
+        _types: Option<&[(usize, crate::mir::ir::MirType)]>,
+    ) -> Result<Value> {
+        Err(LustError::RuntimeError {
+            message: "Cranelift deopt resume requires feature `cranelift`".to_string(),
+        })
+    }
+
+    #[cfg(feature = "cranelift")]
     pub fn resume_from_deopt(
         &mut self,
         types: Option<&[(usize, crate::mir::ir::MirType)]>,

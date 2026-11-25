@@ -2539,6 +2539,7 @@ pub extern "C" fn lust_mir_array_set(ptr: *mut i64, idx: i64, val: i64) {
                 crate::effect_abi::LUST_STATUS_ERR_GENERIC as i64,
                 Ordering::SeqCst,
             );
+            #[cfg(feature = "cranelift")]
             crate::mir::cranelift_backend::set_current_sticky_error(
                 "Attempted to mutate borrowed read-only array".into(),
             );
@@ -2577,6 +2578,7 @@ pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
                     crate::effect_abi::LUST_STATUS_ERR_GENERIC as i64,
                     Ordering::SeqCst,
                 );
+                #[cfg(feature = "cranelift")]
                 crate::mir::cranelift_backend::set_current_sticky_error(
                     "Attempted to mutate borrowed read-only array".into(),
                 );

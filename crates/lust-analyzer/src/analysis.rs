@@ -1686,6 +1686,7 @@ impl<'a> IndexerContext<'a> {
 
     fn walk_expr(&mut self, expr: &Expr) {
         match &expr.kind {
+            ExprKind::RegexLiteral { .. } => {}
             ExprKind::Identifier(name) => {
                 if let Some(sym) = self.lookup_local(name) {
                     if let Some((span, range)) =

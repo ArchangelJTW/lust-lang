@@ -18,6 +18,8 @@ pub mod regex;
 #[cfg(feature = "std")]
 pub mod rx;
 #[cfg(feature = "std")]
+pub mod codegen_c;
+#[cfg(feature = "std")]
 pub mod codegen_zig;
 pub mod effect_abi;
 #[cfg(feature = "std")]

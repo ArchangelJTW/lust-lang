@@ -2103,23 +2103,14 @@ impl TypeChecker {
             }) {
                 return Ok(Type::new(TypeKind::Unknown, span));
             }
-        if let TypeKind::Map(_, value_type) = &object_type.kind {
-            let val_ty = value_type.as_ref().clone();
-            return Ok(match borrow_mode {
-                Some(is_mut)
-                    if !matches!(
-                        val_ty.kind,
-                        TypeKind::Int | TypeKind::Float | TypeKind::Bool | TypeKind::Unit
-                    ) =>
-                {
-                    if is_mut {
-                        Type::new(TypeKind::MutRef(Box::new(val_ty)), span)
-                    } else {
-                        Type::new(TypeKind::Ref(Box::new(val_ty)), span)
-                    }
-                }
-                _ => val_ty,
-            });
+        if let TypeKind::Map(_, _) = &object_type.kind {
+            return Err(self.type_error_at(
+                format!(
+                    "Cannot access Map key '{}' with field syntax; use map.get(map, key) to handle missing keys",
+                    field
+                ),
+                span,
+            ));
         }
         let (type_name, type_bindings) = match &object_type.kind {
             TypeKind::Named(name) => (name.clone(), HashMap::new()),

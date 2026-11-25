@@ -18,13 +18,16 @@ exclude = ["examples/rust-extension/extensions/**", "tree-sitter-lust", "tests/c
 
 [package]
 name = "lust-rs"
-version = "3.5.8"
+version = "3.5.9"
 edition = "2024"
 include = [
   "/src/**",
   "/include/**",
   "/examples/embed.rs",
+  "/examples/effects/*.rs",
   "/benchmarks/numeric.rs",
+  "/benchmarks/effects_bench.rs",
+  "/benchmarks/test_framework_bench.rs",
   "/build.rs",
   "/Cargo.toml",
   "/README.md",
@@ -56,7 +59,7 @@ name = "lust"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["std", "packages", "bindgen", "net-services", "cli-mimalloc"]
+default = ["std", "cranelift", "packages", "bindgen", "net-services", "cli-mimalloc"]
 cli-mimalloc = ["dep:mimalloc"]
 bindgen = ["std"]
 net-services = [
@@ -68,7 +71,7 @@ net-services = [
   "dep:bytes",
   "dep:rusqlite",
 ]
-test-deopt = ["std"]
+test-deopt = ["std", "cranelift"]
 std = [
   "dep:toml",
   "serde/std",
@@ -77,14 +80,20 @@ std = [
   "dep:regex",
   "dep:regex-automata",
   "dep:rand",
+  "dep:serde_json",
+  "dep:tempfile",
+]
+# Optional Cranelift MIR JIT backend
+cranelift = [
+  "std",
   "dep:cranelift-codegen",
   "dep:cranelift-frontend",
   "dep:cranelift-jit",
   "dep:cranelift-module",
   "dep:cranelift-native",
-  "dep:serde_json",
-  "dep:tempfile",
 ]
+# Optional mimalloc global allocator for the CLI binary
+mimalloc = ["cli-mimalloc"]
 # JIT for riscv32 targets. Enables `std` because dynasmrt requires it
 # (memmap2, std::sync). Requires a std-capable runtime (e.g. Linux/RISC-V).
 # Floats require the RV32F extension.
@@ -112,8 +121,8 @@ wasi = ["std"]
 wasi-p2 = ["wasi"]
 
 # Wave 17 opt-in real-backend features (strictly opt-in; never in default/std/net-services)
-jit = ["std"]
-cranelift-aot = ["jit", "dep:cranelift-object", "cranelift-codegen/all-native-arch"]
+jit = ["std", "cranelift"]
+cranelift-aot = ["jit", "cranelift", "dep:cranelift-object", "cranelift-codegen/all-native-arch"]
 telemetry-exporters = [
   "std",
   "dep:metrics",
@@ -275,10 +284,10 @@ getrandom = { version = "0.4.3", features = ["wasm_js"] }
 getrandom = { version = "0.4.3" }
 
 [profile.release]
-strip = false
+strip = "symbols"
 lto = "fat"
 opt-level = 3
-debug = 1
+debug = 0
 overflow-checks = false
 panic = "abort"
 codegen-units = 1

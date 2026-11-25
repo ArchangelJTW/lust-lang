@@ -1,9 +1,10 @@
 #!/bin/bash
-# Cross-language suite: Native Rust, Lust AOT (--backend rust|zig|mir|mir-zig),
-# LuaJIT, Lust Cranelift JIT (--jit=cranelift), Lust Bytecode VM (--jit=off), Lua.
+# Cross-language suite: Native Rust, Lust C11 AOT (--backend c), Lust AOT
+# (--backend rust|zig|mir|mir-zig|c|mir-c), LuaJIT, Lust Cranelift JIT
+# (--jit=cranelift), Lust Bytecode VM (--jit=off), Lua.
 #
 # Usage:
-#   benchmarks/suite/run.sh [path/to/lust] [--backend rust|zig|mir|mir-zig] [--cache-dir <dir>]
+#   benchmarks/suite/run.sh [path/to/lust] [--backend rust|zig|c|mir-c|mir|mir-zig] [--cache-dir <dir>]
 #
 # Defaults:
 #   LUST        = target/release/lust
@@ -24,7 +25,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --backend)
             if [[ $# -lt 2 ]]; then
-                echo "Error: --backend requires an argument (rust, zig, mir, mir-zig)" >&2
+                echo "Error: --backend requires an argument (rust, zig, c, mir-c, mir, mir-zig)" >&2
                 exit 2
             fi
             AOT_BACKEND="$2"
@@ -47,7 +48,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            sed -n '2,15p' "$0"
+            sed -n '2,16p' "$0"
             exit 0
             ;;
         *)
@@ -132,6 +133,30 @@ with tempfile.TemporaryDirectory(dir="/tmp") as td:
         except FileNotFoundError:
             return None, "n/a", ""
 
+    c_bins = {}
+    print("Building Lust C11 AOT binaries (--backend c --release-fast)...", file=sys.stderr)
+    for prog in programs:
+        bin_path = td_path / f"{prog}_c"
+        res = subprocess.run(
+            [
+                str(lust_bin),
+                "build",
+                str(suite_dir / f"{prog}.lust"),
+                "--backend",
+                "c",
+                "-o",
+                str(bin_path),
+                "--release-fast",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0 and bin_path.exists():
+            c_bins[prog] = bin_path
+            subprocess.run([str(bin_path)], capture_output=True)
+        else:
+            print(f"Failed to build C11 AOT for {prog}: {res.stderr}", file=sys.stderr)
+
     aot_bins = {}
     print(
         f"Building Lust AOT binaries (--backend {aot_backend} --release-fast)...",
@@ -160,12 +185,16 @@ with tempfile.TemporaryDirectory(dir="/tmp") as td:
             print(f"Failed to build AOT ({aot_backend}) for {prog}: {res.stderr}", file=sys.stderr)
 
     print(
-        f"{'program':<10} {'rust':>9} {'lust-aot':>10} {'aot/rust':>8} {'luajit':>9} {'lust-jit':>10} {'lust-vm':>10} {'lua':>9}   outputs"
+        f"{'program':<10} {'rust':>9} {'lust-c':>10} {'lust-aot':>10} {'aot/rust':>8} {'luajit':>9} {'lust-jit':>10} {'lust-vm':>10} {'lua':>9}   outputs"
     )
 
     had_lust_mismatch = False
     for prog in programs:
         ms_rust, t_rust, o_rust = run_cmd([str(rust_bin), prog])
+        if prog in c_bins:
+            _, t_c, o_c = run_cmd([str(c_bins[prog])])
+        else:
+            t_c, o_c = "n/a", ""
         if prog in aot_bins:
             ms_aot, t_aot, o_aot = run_cmd([str(aot_bins[prog])])
         else:
@@ -192,6 +221,8 @@ with tempfile.TemporaryDirectory(dir="/tmp") as td:
             t_lua, o_lua = "n/a", ""
 
         lust_outputs = [("aot", o_aot), ("jit", o_jit), ("vm", o_vm)]
+        if t_c != "n/a":
+            lust_outputs.insert(0, ("c", o_c))
         ext_outputs = []
         if has_luajit:
             ext_outputs.append(("luajit", o_lj))
@@ -217,7 +248,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as td:
 
         status = "same" if not diff else "DIFF: rust!=" + ",".join(diff)
         print(
-            f"{prog:<10} {t_rust:>9} {t_aot:>10} {ratio_str:>8} {t_lj:>9} {t_jit:>10} {t_vm:>10} {t_lua:>9}   {status}"
+            f"{prog:<10} {t_rust:>9} {t_c:>10} {t_aot:>10} {ratio_str:>8} {t_lj:>9} {t_jit:>10} {t_vm:>10} {t_lua:>9}   {status}"
         )
 
     if had_lust_mismatch:

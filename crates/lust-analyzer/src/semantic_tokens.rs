@@ -556,7 +556,7 @@ fn collect_tokens_from_expr(
             collect_tokens_from_expr(end, text, line_offsets, tokens, seen);
         }
 
-        ExprKind::Literal(_) | ExprKind::Identifier(_) => {}
+        ExprKind::Literal(_) | ExprKind::Identifier(_) | ExprKind::RegexLiteral { .. } => {}
     }
 }
 
@@ -678,6 +678,17 @@ fn collect_tokens_from_type(
             }
         }
 
+        TypeKind::InferType(inner)
+        | TypeKind::InferInput(inner)
+        | TypeKind::InferOutput(inner) => {
+            collect_tokens_from_type(inner, text, line_offsets, tokens, seen);
+        }
+
+        TypeKind::Schema { input, output, .. } => {
+            collect_tokens_from_type(input, text, line_offsets, tokens, seen);
+            collect_tokens_from_type(output, text, line_offsets, tokens, seen);
+        }
+
         TypeKind::String
         | TypeKind::Int
         | TypeKind::Float
@@ -686,6 +697,7 @@ fn collect_tokens_from_type(
         | TypeKind::Infer
         | TypeKind::Unit
         | TypeKind::Never
+        | TypeKind::Typeof(_)
         | TypeKind::TraitBound(_) => {}
     }
 }

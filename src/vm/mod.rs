@@ -2,7 +2,7 @@ pub mod budget;
 pub mod channel;
 mod corelib;
 pub(crate) mod cycle;
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 pub mod osr;
 #[cfg(feature = "std")]
 pub mod stdlib;
@@ -42,6 +42,8 @@ use foldhash::fast::FixedState as DefaultHashBuilder;
 use hashbrown::HashMap;
 mod api;
 mod execution;
+#[cfg(feature = "std")]
+mod rng;
 mod tasks;
 mod tracing;
 // Used by the std-only extern stub writers (`externs`, `packages`).
@@ -459,7 +461,7 @@ impl TestDeoptSpikeHook {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 #[derive(Debug, Clone)]
 pub struct CompiledDeoptRecipe {
     pub func_name: String,
@@ -489,18 +491,18 @@ pub struct VM {
     pub(crate) cranelift_compiled_generation: u64,
     pub(super) mir_context_struct_gen: u64,
     pub(super) cranelift_compiled_struct_gen: u64,
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(crate) cranelift_jit: Option<crate::mir::cranelift_backend::jit_engine::CraneliftJitCompiler>,
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(crate) cranelift_recipes:
         HashMap<(String, usize, crate::mir::cranelift_backend::DeoptSiteKind), CompiledDeoptRecipe>,
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(super) cranelift_fn_cache: Vec<Option<Rc<CompiledFnEntry>>>,
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(super) osr_engine: Option<crate::vm::osr::OsrEngine>,
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(super) osr_backedge_counts: HashMap<(usize, usize), u32>,
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(super) osr_cold_sites: hashbrown::HashSet<(usize, usize, u64, u64)>,
     pub osr_compilation_count: u64,
     pub(super) osr_last_cranelift_gen: u64,
@@ -514,6 +516,10 @@ pub struct VM {
     /// the interned names: constructing one is a count bump.
     pub(crate) unit_enums: HashMap<(usize, usize), Rc<crate::bytecode::EnumObject>>,
     pub(super) budgets: BudgetState,
+    /// Per-VM random stream. It is lazily initialized from the host entropy
+    /// source and can be made deterministic through `set_random_seed` / `set_seed`.
+    #[cfg(feature = "std")]
+    random_rng: core::cell::RefCell<Option<rng::PortableRng>>,
     pub(super) functions: Vec<Function>,
     /// Per-function facts the call path needs, indexed like `functions`
     /// (see `CallMeta`).
@@ -1596,18 +1602,21 @@ impl VM {
         self.osr_compilation_count
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     #[inline]
     pub fn osr_cold_site_count(&self) -> usize {
         self.osr_cold_sites.len()
     }
 
     pub(super) fn invalidate_osr_state(&mut self) {
-        #[cfg(feature = "std")]
+        #[cfg(feature = "cranelift")]
         {
             self.osr_engine = None;
             self.osr_backedge_counts.clear();
             self.osr_cold_sites.clear();
+        }
+        #[cfg(feature = "std")]
+        {
             self.clear_cranelift_fallback_cache();
         }
     }
@@ -1685,7 +1694,7 @@ impl VM {
         true
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(super) fn record_cranelift_call_probe(&mut self, func_idx: usize) {
         #[cfg(feature = "test-deopt")]
         if self.test_deopt_spike_hook.is_some() {
@@ -1725,7 +1734,10 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", not(feature = "cranelift")))]
+    pub(super) fn record_cranelift_call_probe(&mut self, _func_idx: usize) {}
+
+    #[cfg(feature = "cranelift")]
     fn mark_osr_site_cold_and_check_exhausted(
         &mut self,
         func_idx: usize,
@@ -1774,7 +1786,7 @@ impl VM {
         self.cranelift_generation = self.cranelift_generation.wrapping_add(1).max(1);
         self.cranelift_compiled_struct_gen = 0;
         self.restore_all_ast_bytecode_backups();
-        #[cfg(feature = "std")]
+        #[cfg(feature = "cranelift")]
         {
             self.cranelift_jit = None;
             self.cranelift_compiled.clear();
@@ -1844,7 +1856,7 @@ impl VM {
         self.mir_functions.insert(name, mir_fn);
         self.cranelift_generation = self.cranelift_generation.wrapping_add(1).max(1);
         self.cranelift_compiled_struct_gen = 0;
-        #[cfg(feature = "std")]
+        #[cfg(feature = "cranelift")]
         {
             self.cranelift_jit = None;
             self.cranelift_compiled.clear();
@@ -1873,7 +1885,16 @@ impl VM {
     /// keyed by `(func_idx, target_block, cranelift_generation, struct_metadata_generation)`,
     /// reuses `self.mir_context` with synced gas/memory budgets, and deducts consumed budgets
     /// on every exit path (`Completed`, `Deoptimized`, or `Error`).
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", not(feature = "cranelift")))]
+    pub(super) fn try_enter_osr_at_backedge(
+        &mut self,
+        _func_idx: usize,
+        _loop_start_ip: usize,
+    ) -> Result<Option<OsrBackedgeOutcome>> {
+        Ok(None)
+    }
+
+    #[cfg(feature = "cranelift")]
     #[cold]
     #[inline(never)]
     pub(super) fn try_enter_osr_at_backedge(
@@ -2065,7 +2086,7 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn execute_osr_entry_scoped(
         &mut self,
         func_idx: usize,

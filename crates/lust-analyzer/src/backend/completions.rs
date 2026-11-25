@@ -434,6 +434,16 @@ pub(crate) fn identifier_completions(
                 }
             }
 
+            ItemKind::Schema(def) => {
+                let simple = simple_type_name(&def.name).to_string();
+                push_item(simple, CompletionItemKind::STRUCT, Some("schema".to_string()));
+            }
+
+            ItemKind::TypeAlias { name, .. } => {
+                let simple = simple_type_name(name).to_string();
+                push_item(simple, CompletionItemKind::TYPE_PARAMETER, Some("type".to_string()));
+            }
+
             ItemKind::Script(_)
             | ItemKind::Impl(_)
             | ItemKind::Use { .. }

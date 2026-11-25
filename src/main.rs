@@ -1668,7 +1668,7 @@ fn build_command(args: &[String]) {
             "--backend" => {
                 index += 1;
                 let Some(val) = args.get(index) else {
-                    eprintln!("Error: --backend requires a backend name (zig, rust, mir-zig, mir)");
+                    eprintln!("Error: --backend requires a backend name (c, mir-c, zig, rust, mir-zig, mir, cranelift-aot)");
                     process::exit(1);
                 };
                 backend = val.clone();
@@ -1705,6 +1705,9 @@ fn build_command(args: &[String]) {
             }
             "--emit-zig" => {
                 emit_zig = true;
+            }
+            "--emit-c" => {
+                emit_c = true;
             }
             "--release-fast" => opts.release_mode = "ReleaseFast".to_string(),
             "--release-safe" => opts.release_mode = "ReleaseSafe".to_string(),
@@ -1748,9 +1751,6 @@ fn build_command(args: &[String]) {
                     process::exit(1);
                 };
                 opts.cache_dir = Some(PathBuf::from(val));
-            }
-            "--emit-c" => {
-                emit_c = true;
             }
             "--emit-rs" => {
                 emit_rs = true;
@@ -1982,11 +1982,12 @@ fn build_command(args: &[String]) {
         backend = "rust".to_string();
     }
 
-    match backend.to_ascii_lowercase().as_str() {
-        "zig" | "rust" | "mir-zig" | "mir" | "cranelift-aot" => {}
+    let backend_lc = backend.to_ascii_lowercase();
+    match backend_lc.as_str() {
+        "c" | "mir-c" | "zig" | "rust" | "mir-zig" | "mir" | "cranelift-aot" => {}
         other => {
             eprintln!(
-                "Error: unknown backend '{}'. Supported backends for build: zig, rust, mir-zig, mir, cranelift-aot",
+                "Error: unknown backend '{}'. Supported backends for build: c, mir-c, zig, rust, mir-zig, mir, cranelift-aot",
                 other
             );
             process::exit(1);
@@ -2142,6 +2143,169 @@ fn build_command(args: &[String]) {
             lust::codegen_zig::BuildTargetKind::SharedLibrary
                 | lust::codegen_zig::BuildTargetKind::StaticLibrary
         );
+
+    if backend_lc == "c" && !is_library {
+        let filtered_items = if opts.tree_shake {
+            lust::codegen_zig::tree_shake_items(&all_items, false)
+        } else {
+            all_items.clone()
+        };
+        let mut codegen = lust::codegen_c::CCodegen::new();
+        let c_source = match codegen.generate_program(&filtered_items) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("C AOT codegen error: {}", e);
+                process::exit(1);
+            }
+        };
+        let c_file = entry_path.with_extension("c");
+        if let Err(e) = fs::write(&c_file, &c_source) {
+            eprintln!("Error writing {}: {}", c_file.display(), e);
+            process::exit(1);
+        }
+        if emit_c {
+            println!("Successfully emitted C source: {}", c_file.display());
+            return;
+        }
+        let stem = entry_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("lust_out");
+        let target_bin = output_bin.unwrap_or_else(|| {
+            let parent = entry_path.parent().unwrap_or_else(|| Path::new("."));
+            if cfg!(target_os = "windows") {
+                parent.join(format!("{stem}.exe"))
+            } else {
+                parent.join(stem)
+            }
+        });
+        match lust::codegen_c::compile_c_executable(&c_file, &target_bin, &opts.release_mode, opts.strip) {
+            Ok(bin) => {
+                let _ = fs::remove_file(&c_file);
+                println!("Successfully built C AOT artifact: {}", bin.display());
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if backend_lc == "c" || backend_lc == "mir-c" {
+        let stem = entry_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("lust_out");
+        let mut mir_module = lust::mir::ir::MirModule::new(stem.to_string());
+        for item in &all_items {
+            if let lust::ast::ItemKind::Function(f) = &item.kind {
+                let mut mir_fn = match lust::mir::lowering::AstLowering::lower_function(f) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("MIR lowering error: {}", e);
+                        process::exit(1);
+                    }
+                };
+                lust::mir::opt::MirOptimizer::optimize_function(&mut mir_fn);
+                if let Err(e) = lust::mir::verifier::MirVerifier::verify_fn(&mir_fn) {
+                    eprintln!("MIR verification error: {:?}", e);
+                    process::exit(1);
+                }
+                mir_module.add_function(mir_fn);
+            }
+        }
+
+        let artifact_kind = match opts.target_kind {
+            lust::codegen_zig::BuildTargetKind::Executable => {
+                lust::mir::c_backend::CArtifactKind::Executable
+            }
+            lust::codegen_zig::BuildTargetKind::SharedLibrary => {
+                lust::mir::c_backend::CArtifactKind::CDylib
+            }
+            lust::codegen_zig::BuildTargetKind::StaticLibrary => {
+                lust::mir::c_backend::CArtifactKind::StaticLib
+            }
+        };
+        let opt_level = match opts.release_mode.as_str() {
+            "Debug" => "-O0",
+            "ReleaseSmall" => "-Os",
+            "ReleaseSafe" => "-O2",
+            _ => "-O3",
+        }
+        .to_string();
+
+        let c_opts = lust::mir::c_backend::CCompileOptions {
+            artifact_kind,
+            emit_c_header: emit_header_requested,
+            max_memory_bytes: opts.max_memory_bytes,
+            opt_level,
+            entry_function: None,
+        };
+
+        if emit_c {
+            let c_source = match lust::mir::c_backend::MirToCCompiler::generate_module_source_with_options(
+                &mir_module,
+                &c_opts,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("C codegen error: {}", e);
+                    process::exit(1);
+                }
+            };
+            let c_file = entry_path.with_extension("c");
+            if let Err(e) = fs::write(&c_file, &c_source) {
+                eprintln!("Error writing {}: {}", c_file.display(), e);
+                process::exit(1);
+            }
+            println!("Successfully emitted C source: {}", c_file.display());
+            return;
+        }
+
+        let out_dir = output_bin
+            .as_ref()
+            .and_then(|p| p.parent())
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                entry_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+
+        match lust::mir::c_backend::MirToCCompiler::compile_module_with_options(
+            &mir_module,
+            &out_dir,
+            &c_opts,
+        ) {
+            Ok(built) => {
+                if let Some(target_bin) = output_bin {
+                    if target_bin != built {
+                        if let Err(e) = fs::rename(&built, &target_bin) {
+                            eprintln!(
+                                "Error moving {} to {}: {}",
+                                built.display(),
+                                target_bin.display(),
+                                e
+                            );
+                            process::exit(1);
+                        }
+                        println!("Successfully built C AOT artifact: {}", target_bin.display());
+                        return;
+                    }
+                }
+                println!("Successfully built C AOT artifact: {}", built.display());
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        }
+        return;
+    }
 
     let filtered_items = if opts.tree_shake {
         lust::codegen_zig::tree_shake_items(&all_items, is_library)
@@ -2603,7 +2767,7 @@ fn build_command(args: &[String]) {
         is_library,
         opts.max_memory_bytes,
     );
-    let link_libc = runtime_opts.needs_io || runtime_opts.needs_os;
+    let link_libc = runtime_opts.needs_print || runtime_opts.needs_io || runtime_opts.needs_os;
 
     let mut codegen = lust::codegen_zig::ZigCodegen::with_options(runtime_opts);
     let zig_source = match codegen.generate_program(&filtered_items) {
@@ -3161,7 +3325,7 @@ fn run_file_zig_aot(filename: &str) {
         is_library,
         None,
     );
-    let link_libc = runtime_opts.needs_io || runtime_opts.needs_os;
+    let link_libc = runtime_opts.needs_print || runtime_opts.needs_io || runtime_opts.needs_os;
 
     let mut codegen = lust::codegen_zig::ZigCodegen::with_options(runtime_opts);
     let zig_source = match codegen.generate_program(&filtered_items) {

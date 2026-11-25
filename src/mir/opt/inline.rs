@@ -1719,11 +1719,11 @@ fn patch_terminator_targets(term: &mut Terminator, remap: &hashbrown::HashMap<Bl
 }
 
 fn is_jit_effect_or_handler_callee(callee: &str) -> bool {
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     {
         crate::mir::cranelift_backend::is_effect_or_handler_callee(callee)
     }
-    #[cfg(not(feature = "std"))]
+    #[cfg(not(feature = "cranelift"))]
     {
         matches!(
             callee,

@@ -453,7 +453,7 @@ end
     // Soundness check: mutating a map entry must invalidate ModuleMapNative IC immediately.
     let mutation_src = r#"
 function test_map_ic_invalidation(): int
-    local m = {}
+    local m: unknown = {}
     m.f = string.len
     local a: int = m.f("abc")
     m.f = string.sub

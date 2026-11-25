@@ -456,6 +456,7 @@ fn test_pipe_strict_mir_zero_cost_pipeline() {
     assert_eq!(result, Value::Int(45));
 }
 
+#[cfg(feature = "cranelift")]
 #[test]
 fn test_pipe_cranelift_jit_lowered_call_execution() {
     use lust::ast::ItemKind;

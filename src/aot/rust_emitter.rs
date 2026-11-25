@@ -40,6 +40,7 @@ use hashbrown::{HashMap, HashSet};
 use crate::data::layout::{CanonicalTypeTag, LogicalLayoutV1};
 use crate::data::materialize::struct_def_to_layout;
 use crate::error::{LustError, Result};
+#[cfg(feature = "cranelift")]
 use crate::mir::cranelift_backend::jit_engine::{
     analyze_module_call_effects, apply_module_callee_return_types,
     refine_mir_function_with_layouts,
@@ -51,6 +52,7 @@ use crate::mir::ir::{
 };
 use crate::mir::opt::{EscapeAnalysis, MirOptimizer, ScalarReplacementOfAggregates};
 use crate::mir::verifier::MirVerifier;
+#[cfg(feature = "cranelift")]
 use crate::vm::cranelift_dispatch::compute_readonly_params;
 
 use super::cfg_structurer::{StructuredNode, structure_mir_function};
@@ -304,10 +306,13 @@ fn prepare_mir_module_for_rust_aot_with_extern_rets(
         })
         .collect();
 
+    #[cfg(feature = "cranelift")]
     for func in &mut opt_module.functions {
         apply_module_callee_return_types(func, &callee_rets);
         *func = refine_mir_function_with_layouts(func, &struct_layouts);
     }
+    #[cfg(not(feature = "cranelift"))]
+    let _ = (&callee_rets, &struct_layouts);
 
     if !extern_ret_types.is_empty() {
         apply_extern_callee_return_types(&mut opt_module, extern_ret_types);
@@ -2327,9 +2332,18 @@ impl<'m> ModuleEmitContext<'m> {
             .values()
             .any(|s| s.is_cyclic && !s.is_mutated_cyclic);
 
+        #[cfg(feature = "cranelift")]
         let readonly_params = compute_readonly_params(module);
+        #[cfg(not(feature = "cranelift"))]
+        let readonly_params: hashbrown::HashMap<String, Vec<bool>> = hashbrown::HashMap::new();
         let gas_active = opts.gas_metering != GasMetering::None;
+        #[cfg(feature = "cranelift")]
         let call_effects = analyze_module_call_effects(module, gas_active);
+        #[cfg(not(feature = "cranelift"))]
+        let call_effects: hashbrown::HashMap<String, (bool, bool)> = {
+            let _ = gas_active;
+            hashbrown::HashMap::new()
+        };
 
         let fn_name_set: HashSet<String> = module
             .functions

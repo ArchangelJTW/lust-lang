@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::error::{LustError, Result};
-#[cfg(not(feature = "cranelift-aot"))]
+#[cfg(all(feature = "cranelift", not(feature = "cranelift-aot")))]
 use crate::mir::cranelift_backend::CraneliftJitCompiler;
 #[cfg(feature = "cranelift-aot")]
 use crate::mir::cranelift_backend::CraneliftObjectCompiler;
@@ -425,7 +425,7 @@ pub fn validate_mir_module_clif(
         })
     }
 
-    #[cfg(not(feature = "cranelift-aot"))]
+    #[cfg(all(feature = "cranelift", not(feature = "cranelift-aot")))]
     {
         let mut opt_module = module.clone();
         canonicalize_module_callees(&mut opt_module);
@@ -460,6 +460,14 @@ pub fn validate_mir_module_clif(
             target_triple: target_triple.map(ToString::to_string),
             object_emission_status: CRANELIFT_OBJECT_BACKEND_STATUS,
         })
+    }
+
+    #[cfg(not(feature = "cranelift"))]
+    {
+        let _ = (module, target_triple);
+        Err(LustError::CompileError(
+            "Cranelift CLIF validation requires the `cranelift` feature".to_string(),
+        ))
     }
 }
 

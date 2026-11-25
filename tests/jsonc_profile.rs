@@ -170,7 +170,7 @@ fn test_jsonc_invalid_commas_fail_closed() {
 
 #[test]
 fn test_jsonc_comments_cannot_glue_tokens() {
-    // RFC §7.5: "комментарии не склеивают tokens: 1/*x*/2 — ошибка"
+    // RFC §7.5: comments cannot glue tokens together: `1/*x*/2` is an error
     assert!(jsonc::from_str("1/*x*/2").is_err());
     assert!(jsonc::from_str("true/*comment*/false").is_err());
     assert!(jsonc::from_str("[1/*x*/2]").is_err());

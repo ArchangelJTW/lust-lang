@@ -319,8 +319,8 @@ use lib.math.*
 - `error(message)`: Raises a runtime error with `message`.
 - `assert(cond [, message])`: Asserts that `cond` is truthy; raises error otherwise.
 - `select(index_or_hash, ...)`: Returns argument count for `"#"` or returns slice starting at 1-based index.
-- `random([m [, n]])`: Random float in `[0, 1)`, or integer in `[1, m]` or `[m, n]`.
-- `randomseed(seed)`: Seeds the random number generator.
+- `random([m [, n]])`: Random float in `[0, 1)`, or integer in `[1, m]` or `[m, n]`. RNG state belongs to the current VM; the deterministic generator is not cryptographically secure.
+- `randomseed(seed)`: Seeds the current VM's random stream. Equal seeds and call sequences produce portable results across supported targets.
 - `unpack(arr [, i [, j]])`: Unpacks array elements into multiple return values.
 - `pairs(map_or_table)`: Returns iterator over key/value pairs.
 - `ipairs(arr_or_table)`: Returns iterator over index/value pairs.
@@ -359,7 +359,7 @@ use lib.math.*
 - `array.remove<T>(arr: Array<T>, index: int): Option<T>`
 - `array.clear<T>(arr: Array<T>): ()`
 - `array.slice<T>(arr: Array<T>, start: int, end: int): Array<T>`
-- `array.concat<T>(arr: Array<T> [, sep: string]): string`
+- `array.concat<T>(arr: Array<T> [, sep: string]): string` — joins the elements' string representations; `sep` defaults to `""`.
 - `array.sort<T>(arr: Array<T> [, comp_fn]): ()`
 - `array.reverse<T>(arr: Array<T>): ()`
 - `array.contains<T>(arr: Array<T>, val: T): bool`

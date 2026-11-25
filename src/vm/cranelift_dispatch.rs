@@ -6,7 +6,7 @@ use crate::bytecode::{
     FlatArrayBuffer, FlatArrayElemTag, LustArray, LustMap, StructLayout, StructObject, Value,
 };
 use crate::error::{LustError, Result};
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 use crate::mir::cranelift_backend::{
     DeoptSiteKind, MIR_STATUS_DEOPT, MIR_STATUS_ERR_DIV_BY_ZERO, MIR_STATUS_ERR_NEG_EXPONENT,
     MIR_STATUS_ERR_OOM, MIR_STATUS_ERR_OUT_OF_BOUNDS, MIR_STATUS_ERR_OUT_OF_GAS, MIR_STATUS_OK,
@@ -15,11 +15,11 @@ use crate::mir::cranelift_backend::{
     is_effect_or_handler_callee, is_vm_effect_intrinsic_callee, lust_mir_alloc_array_typed,
     lust_mir_alloc_tuple_typed, mir_array_elem_tag,
 };
-#[cfg(all(feature = "std", test))]
+#[cfg(all(feature = "cranelift", test))]
 use crate::mir::cranelift_backend::lust_mir_alloc_struct_named;
 #[cfg(feature = "test-deopt")]
 use crate::vm::DeoptPayloadSource;
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 use crate::vm::CompiledDeoptRecipe;
 use crate::mir::ir::{
     MirConstant, MirFunction, MirType, MirUnaryOp, Operand, ResourceKind, Rvalue, Statement,
@@ -58,7 +58,7 @@ enum CraneliftOutcome {
     Return(Value),
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 struct PreparedCraneliftModule {
     module: crate::mir::ir::MirModule,
     eligible: hashbrown::HashSet<String>,
@@ -146,6 +146,7 @@ fn validate_owned_header(
     Ok((base_ptr, len))
 }
 
+#[cfg(feature = "cranelift")]
 pub fn validate_and_decode_array(
     mir_ctx: &crate::mir::runtime_helpers::MirContext,
     marshalled_arrays: &[MarshalledArray],
@@ -310,6 +311,7 @@ pub fn validate_and_decode_array(
     })
 }
 
+#[cfg(feature = "cranelift")]
 pub fn validate_and_decode_tuple(
     mir_ctx: &crate::mir::runtime_helpers::MirContext,
     raw_ptr_val: i64,
@@ -659,6 +661,7 @@ fn param_indices_need_writeback(param_indices: &[usize], readonly_params: &[bool
         .any(|&p| !readonly_params.get(p).copied().unwrap_or(false))
 }
 
+#[cfg(feature = "cranelift")]
 pub fn stage_input_writebacks_with_readonly(
     mir_ctx: &crate::mir::runtime_helpers::MirContext,
     marshalled_arrays: &[MarshalledArray],
@@ -676,6 +679,7 @@ pub fn stage_input_writebacks_with_readonly(
     Ok(staged)
 }
 
+#[cfg(feature = "cranelift")]
 pub fn stage_input_writebacks(
     mir_ctx: &crate::mir::runtime_helpers::MirContext,
     marshalled_arrays: &[MarshalledArray],
@@ -811,7 +815,7 @@ pub fn stage_struct_writebacks(
     stage_struct_writebacks_with_readonly(mir_ctx, marshalled_structs, &[])
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 #[derive(Default)]
 struct CraneliftDispatchSideCache {
     last_used_seq: u64,
@@ -826,7 +830,7 @@ struct CraneliftDispatchSideCache {
     trivial_leaf_scan_count: u64,
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 thread_local! {
     static CRANELIFT_WRITEBACK_COMMIT_COUNT: core::cell::Cell<u64> =
         const { core::cell::Cell::new(0) };
@@ -837,12 +841,12 @@ thread_local! {
     > = core::cell::RefCell::new(hashbrown::HashMap::new());
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 pub fn cranelift_writeback_commit_count() -> u64 {
     CRANELIFT_WRITEBACK_COMMIT_COUNT.with(|c| c.get())
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 pub fn reset_cranelift_writeback_commit_count() {
     CRANELIFT_WRITEBACK_COMMIT_COUNT.with(|c| c.set(0));
 }
@@ -907,7 +911,7 @@ pub fn commit_staged_writebacks_and_structs(
         crate::bytecode::value::invalidate_specialized_array_cache(rc);
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     CRANELIFT_WRITEBACK_COMMIT_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
 
     Ok(())
@@ -919,6 +923,7 @@ pub fn commit_staged_writebacks(
     commit_staged_writebacks_and_structs(staged, Vec::new())
 }
 
+#[cfg(feature = "cranelift")]
 fn stage_and_commit_all_writebacks_with_readonly(
     mir_ctx: &crate::mir::runtime_helpers::MirContext,
     marshalled_arrays: &[MarshalledArray],
@@ -937,7 +942,7 @@ fn stage_and_commit_all_writebacks_with_readonly(
     commit_staged_writebacks_and_structs(staged_arrays, staged_structs)
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 #[inline]
 fn is_proven_immutable_scalar(ty: &MirType) -> bool {
     matches!(
@@ -946,7 +951,7 @@ fn is_proven_immutable_scalar(ty: &MirType) -> bool {
     )
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 #[inline]
 fn is_readonly_cranelift_builtin(callee: &str) -> bool {
     matches!(
@@ -982,7 +987,7 @@ fn is_readonly_cranelift_builtin(callee: &str) -> bool {
     )
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 fn operand_alias_source_local(
     op: &Operand,
     locals: &[crate::mir::ir::LocalDecl],
@@ -1006,7 +1011,7 @@ fn operand_alias_source_local(
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 #[inline]
 fn union_bool_row(dst: &mut [bool], src: &[bool]) -> bool {
     let mut changed = false;
@@ -1021,14 +1026,14 @@ fn union_bool_row(dst: &mut [bool], src: &[bool]) -> bool {
 
 /// Computes per-function proven read-only parameter masks over the final post-inline
 /// compiled `MirModule` via monotone fixed-point alias and mutation propagation.
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 pub fn compute_readonly_params(
     module: &crate::mir::ir::MirModule,
 ) -> hashbrown::HashMap<String, Vec<bool>> {
     compute_readonly_params_with_structs(module, None)
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 fn compute_readonly_params_with_structs(
     module: &crate::mir::ir::MirModule,
     struct_meta: Option<&hashbrown::HashMap<String, crate::vm::RuntimeStructInfo>>,
@@ -1353,7 +1358,7 @@ fn compute_readonly_params_with_structs(
 
 /// Pure Cranelift runtime builtins guaranteed to NEVER invoke host/user Rust callbacks (`PERF-T4-3`).
 /// Conservatively excludes `print`/`println` (console sink) and all effect/handler/unknown callees.
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 #[inline]
 fn is_host_callback_free_cranelift_builtin(callee: &str) -> bool {
     matches!(
@@ -1400,7 +1405,7 @@ fn is_host_callback_free_cranelift_builtin(callee: &str) -> bool {
 
 /// Infers the exact `MirType` of a call argument operand in `func` for fail-closed
 /// signature compatibility checking in `compute_has_external_or_host_calls` (`PERF-T4-3`).
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 fn call_arg_mir_type(func: &MirFunction, op: &Operand) -> MirType {
     use crate::mir::ir::Place;
     match op {
@@ -1433,7 +1438,7 @@ fn call_arg_mir_type(func: &MirFunction, op: &Operand) -> MirType {
 /// call graph targets either another compiled module function (with matching arity, matching
 /// known parameter/argument types, and recursively `false`) or a pure callback-free Cranelift
 /// builtin, and zero `Terminator::Raise` or effect/handler/external/unknown calls are present.
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 pub fn compute_has_external_or_host_calls(
     module: &crate::mir::ir::MirModule,
 ) -> hashbrown::HashMap<String, bool> {
@@ -1511,7 +1516,7 @@ pub fn compute_has_external_or_host_calls(
     out
 }
 
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 #[inline]
 fn flat_array_elem_tag(elem_ty: &MirType) -> Option<FlatArrayElemTag> {
     match elem_ty {
@@ -1536,7 +1541,7 @@ fn flat_array_elem_tag(elem_ty: &MirType) -> Option<FlatArrayElemTag> {
 /// - `Ok(Some((buf, false)))`: cache miss built and published atomically.
 /// - `Ok(None)`: homogeneous element type mismatch (reserved bytes refunded, cache untouched).
 /// - `Err(err)`: OOM or checked arithmetic overflow (status set to `MIR_STATUS_ERR_OOM`, cache untouched).
-#[cfg(feature = "std")]
+#[cfg(feature = "cranelift")]
 pub fn build_or_get_cached_flat_array(
     mir_ctx: &crate::mir::runtime_helpers::MirContext,
     rc: &Rc<LustArray>,
@@ -1745,7 +1750,7 @@ pub fn build_or_get_cached_flat_array(
 }
 
 impl VM {
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(crate) fn is_cranelift_supported_primitive_elem_type(ty: &MirType) -> bool {
         matches!(
             ty,
@@ -1753,19 +1758,19 @@ impl VM {
         )
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(crate) fn is_cranelift_supported_array_elem_type(ty: &MirType) -> bool {
         Self::is_cranelift_supported_primitive_elem_type(ty)
             || matches!(ty, MirType::Struct(name) if !name.is_empty())
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     #[inline]
     fn is_synthetic_scalar_enum_struct_name(name: &str) -> bool {
         name.starts_with("__Enum_") && name.len() > "__Enum_".len()
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(crate) fn type_contains_unknown(ty: &MirType) -> bool {
         match ty {
             MirType::Unknown => true,
@@ -1790,7 +1795,7 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(crate) fn is_cranelift_supported_type(ty: &MirType) -> bool {
         match ty {
             MirType::Int | MirType::Bool | MirType::Unit | MirType::Float | MirType::String | MirType::Unknown => true,
@@ -1823,7 +1828,7 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(crate) fn is_cranelift_eligible_operand(op: &Operand) -> bool {
         match op {
             Operand::Copy(_) | Operand::Move(_) => true,
@@ -1837,7 +1842,7 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(crate) fn is_cranelift_eligible_rvalue(rval: &Rvalue) -> bool {
         match rval {
             Rvalue::Use(op) | Rvalue::UnaryOp(_, op) => Self::is_cranelift_eligible_operand(op),
@@ -1862,7 +1867,7 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn resolve_struct_field_mir_type_in_map(
         owner_struct_name: &str,
         field_ty: &crate::ast::Type,
@@ -1882,13 +1887,13 @@ impl VM {
         ty
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn is_cranelift_supported_struct(&self, name: &str) -> bool {
         let mut visiting = hashbrown::HashSet::new();
         self.is_cranelift_supported_struct_inner(name, &mut visiting)
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn is_cranelift_supported_struct_inner(
         &self,
         name: &str,
@@ -1935,7 +1940,7 @@ impl VM {
         ok
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn is_cranelift_supported_type_in_vm(&self, ty: &MirType) -> bool {
         match ty {
             MirType::Struct(name) => self.is_cranelift_supported_struct(name),
@@ -1967,7 +1972,7 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn mir_place_type_in_vm(
         place: &crate::mir::ir::Place,
         locals: &[crate::mir::ir::LocalDecl],
@@ -2008,7 +2013,7 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn mir_operand_type_in_vm(
         op: &Operand,
         locals: &[crate::mir::ir::LocalDecl],
@@ -2028,7 +2033,7 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn check_refined_type(ty: &MirType, check_struct: &dyn Fn(&str) -> bool) -> bool {
         if !Self::is_cranelift_supported_type(ty) {
             return false;
@@ -2070,7 +2075,7 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn check_refined_place(
         place: &crate::mir::ir::Place,
         locals: &[crate::mir::ir::LocalDecl],
@@ -2165,7 +2170,7 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn check_refined_operand(
         op: &Operand,
         locals: &[crate::mir::ir::LocalDecl],
@@ -2180,7 +2185,7 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn check_refined_cranelift_eligibility(
         refined: &MirFunction,
         struct_meta: Option<&hashbrown::HashMap<String, crate::vm::RuntimeStructInfo>>,
@@ -2717,7 +2722,7 @@ impl VM {
         true
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn is_cranelift_eligible_precheck(mir_fn: &MirFunction) -> bool {
         if mir_fn.params.len() > 6
             || !Self::is_cranelift_supported_type(&mir_fn.signature.return_type)
@@ -2784,7 +2789,7 @@ impl VM {
         true
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     #[allow(dead_code)]
     pub(crate) fn is_cranelift_eligible_signature(mir_fn: &MirFunction) -> bool {
         if !Self::is_cranelift_eligible_precheck(mir_fn) {
@@ -2794,7 +2799,7 @@ impl VM {
         Self::check_refined_cranelift_eligibility(&refined, None, &|_| true)
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn refine_mir_function_in_vm(&self, mir_fn: &MirFunction) -> MirFunction {
         let mut f = mir_fn.clone();
         let callee_rets: hashbrown::HashMap<String, MirType> = self
@@ -2806,7 +2811,7 @@ impl VM {
         crate::mir::cranelift_backend::jit_engine::refine_mir_function(&f)
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn is_cranelift_eligible_in_vm(&self, mir_fn: &MirFunction) -> bool {
         if !Self::is_cranelift_eligible_precheck(mir_fn) {
             return false;
@@ -2831,7 +2836,7 @@ impl VM {
         )
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn is_cranelift_builtin_callee(callee: &str) -> bool {
         matches!(
             callee,
@@ -2881,7 +2886,7 @@ impl VM {
         )
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn is_supported_deopt_recipe_type(&self, ty: &MirType) -> bool {
         match ty {
             MirType::Int
@@ -2922,7 +2927,7 @@ impl VM {
     /// `NewArray` / `GetIndex` / `SetIndex` to `NewStruct` / `GetField` / `SetField` 1-for-1
     /// in place (preserving exact instruction PCs, `block_entry_pcs`, `terminator_pcs`, and
     /// jump offsets) so post-deopt interpreter resumption operates directly on `Value::Struct`.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn rewrite_continuation_struct_ops(
         &self,
         candidate: &MirFunction,
@@ -3121,7 +3126,7 @@ impl VM {
         Ok(())
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn build_function_deopt_recipes(
         &self,
         func_name: &str,
@@ -3244,7 +3249,7 @@ impl VM {
 
     /// Syncs `self.struct_metadata` into `self.mir_context.struct_fields` ONLY when
     /// `self.mir_context_struct_gen != self.struct_metadata.generation()`.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(super) fn sync_mir_context_struct_metadata(&mut self) {
         let current_gen = self.struct_metadata.generation();
         if self.mir_context_struct_gen == current_gen {
@@ -3277,7 +3282,7 @@ impl VM {
 
     /// Invalidates all Cranelift compiled artifacts, deopt recipes, and metadata cache entries
     /// after a `struct_metadata` generation change so stale struct layouts can never execute.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(super) fn invalidate_cranelift_for_struct_change(&mut self) {
         self.restore_all_ast_bytecode_backups();
         self.cranelift_jit = None;
@@ -3292,7 +3297,7 @@ impl VM {
     /// Collects all VM function names referenced by non-Cranelift bytecode functions (indirect calls,
     /// closures, globals, `CallMethod`), runtime global closures, or MIR `Rvalue::Closure` nodes so
     /// dead-helper DCE never prunes an indirectly-callable or closure-captured helper.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn collect_bytecode_referenced_functions(
         &self,
         eligible_names: &hashbrown::HashSet<String>,
@@ -3403,7 +3408,7 @@ impl VM {
         referenced
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn refine_mir_function_with_callee_rets(
         mir_fn: &MirFunction,
         callee_rets: &hashbrown::HashMap<String, MirType>,
@@ -3416,7 +3421,7 @@ impl VM {
     /// Lightweight compile-time fail-closed deopt eligibility validation without compiling
     /// continuation bytecode or allocating `CompiledDeoptRecipe` entries (`NG-W14-7`).
     /// Returns `Ok((has_effect_site, has_loop_header))`.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn validate_function_deopt_eligibility(
         &self,
         func_name: &str,
@@ -3504,7 +3509,7 @@ impl VM {
         Ok((has_effect_site, has_loop_header))
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn compile_continuation_bytecode_for_mir(
         &self,
         name: &str,
@@ -3556,7 +3561,7 @@ impl VM {
     /// - Lazy Deopt Preparation (`NG-W14-7`): validates fail-closed deopt eligibility while
     ///   deferring `CompiledDeoptRecipe` materialization (and script/non-entry continuation
     ///   bytecode compilation) until first actual deopt event.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn prepare_cranelift_module(
         &self,
         requested_roots: Option<&hashbrown::HashSet<String>>,
@@ -3960,7 +3965,7 @@ impl VM {
 
     /// Read-only inspection helper returning the exact post-inline compiled `MirFunction`
     /// for a function currently compiled in Cranelift JIT (zero runtime dispatch overhead).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_compiled_mir(&self, func_name: &str) -> Option<MirFunction> {
         if !self.cranelift_compiled.contains_key(func_name) {
             return None;
@@ -3982,7 +3987,7 @@ impl VM {
 
     /// Read-only inspection helper returning the number of dead inlined helpers skipped from
     /// Cranelift codegen during the most recent compilation (`NG-W14-7`).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_skipped_dead_helper_count(&self) -> usize {
         self.cranelift_jit
             .as_ref()
@@ -3991,7 +3996,7 @@ impl VM {
 
     /// Read-only inspection helper returning the number of on-demand lazy deopt materializations
     /// performed for the current Cranelift compilation (`NG-W14-7`).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_lazy_deopt_materialization_count(&self) -> u64 {
         self.cranelift_jit
             .as_ref()
@@ -4000,14 +4005,14 @@ impl VM {
 
     /// Read-only inspection helper returning the number of currently materialized deopt recipes
     /// in `self.cranelift_recipes` (`NG-W14-7`).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_materialized_recipe_count(&self) -> usize {
         self.cranelift_recipes.len()
     }
 
     /// Read-only inspection helper returning whether `func_name` currently has deferred
     /// continuation bytecode awaiting first actual deopt (`NG-W14-7`).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_has_deferred_continuation(&self, func_name: &str) -> bool {
         self.cranelift_jit
             .as_ref()
@@ -4016,7 +4021,7 @@ impl VM {
 
     /// Read-only inspection helper returning whether `func_name` was pruned as a dead inlined helper
     /// for the active compilation root set (`NG-W14-7`).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_is_deferred_dead_helper(&self, func_name: &str) -> bool {
         self.cranelift_jit
             .as_ref()
@@ -4024,21 +4029,21 @@ impl VM {
     }
 
     /// Read-only inspection helper returning the current compiled Cranelift generation.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_compiled_generation(&self) -> u64 {
         self.cranelift_compiled_generation
     }
 
     /// Read-only inspection helper returning the per-thread count of non-empty Cranelift
     /// array/struct writeback commits.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_writeback_commit_count(&self) -> u64 {
         cranelift_writeback_commit_count()
     }
 
     /// Read-only inspection helper returning the proven `readonly_params` flags for a compiled
     /// Cranelift function.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_readonly_params(&self, func_name: &str) -> Option<Vec<bool>> {
         let func_idx = self.functions.iter().position(|f| f.name == func_name)?;
         self.cranelift_fn_cache
@@ -4049,7 +4054,7 @@ impl VM {
 
     /// Read-only inspection helper returning the compile-time `has_external_or_host_calls` flag
     /// for a compiled Cranelift function (`PERF-T4-3`).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_has_external_or_host_calls(&self, func_name: &str) -> Option<bool> {
         let func_idx = self.functions.iter().position(|f| f.name == func_name)?;
         self.cranelift_fn_cache
@@ -4060,7 +4065,7 @@ impl VM {
 
     /// Builds scalar-only `MirStructLayout` descriptors from VM `struct_metadata` for MIR SROA
     /// (`NG-W11-1`) without polluting `MirModule::struct_layouts` (which controls C-flat codegen).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn build_sroa_struct_layouts(
         &self,
     ) -> hashbrown::HashMap<String, crate::mir::ir::MirStructLayout> {
@@ -4100,7 +4105,7 @@ impl VM {
 
     /// Read-only inspection helper returning the SROA struct recipes for a compiled Cranelift
     /// function (`NG-W11-1`).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_sroa_recipes(
         &self,
         func_name: &str,
@@ -4114,7 +4119,7 @@ impl VM {
 
     /// Read-only inspection helper returning whether a compiled Cranelift function qualifies for
     /// the 0..=6-arg direct scalar C-ABI fast path (`NG-W10-3` + `NG-W15-7`).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_is_pure_scalar_abi_6(&self, func_name: &str) -> Option<bool> {
         let func_idx = self.functions.iter().position(|f| f.name == func_name)?;
         self.cranelift_fn_cache
@@ -4126,7 +4131,7 @@ impl VM {
             })
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     #[inline]
     fn entry_is_5_or_6_uniform_scalar_abi(entry: &crate::vm::CompiledFnEntry) -> bool {
         !entry.has_external_or_host_calls
@@ -4139,7 +4144,13 @@ impl VM {
     /// Returns true when `func_idx` can use the 5- or 6-arg direct scalar Cranelift C-ABI fast
     /// path (`NG-W15-7`), mirroring `VM::has_native_entry` without changing `is_pure_scalar_abi`
     /// (`<= 4` args contract tested by `ng_w10_3_direct_scalar_call_abi`).
-    #[cfg(feature = "std")]
+    #[cfg(not(feature = "cranelift"))]
+    #[inline]
+    pub(crate) fn has_cranelift_direct_scalar_entry_5_6(&self, _func_idx: usize) -> bool {
+        false
+    }
+
+    #[cfg(feature = "cranelift")]
     #[inline]
     pub(crate) fn has_cranelift_direct_scalar_entry_5_6(&self, func_idx: usize) -> bool {
         if self.backend != crate::vm::VmBackend::Cranelift
@@ -4185,7 +4196,7 @@ impl VM {
 
     /// Read-only inspection helper returning the compile-time `is_pure_scalar_abi` flag
     /// for a compiled Cranelift function (`NG-W10-3`).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_is_pure_scalar_abi(&self, func_name: &str) -> Option<bool> {
         let func_idx = self.functions.iter().position(|f| f.name == func_name)?;
         self.cranelift_fn_cache
@@ -4194,7 +4205,7 @@ impl VM {
             .map(|entry| entry.is_pure_scalar_abi)
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn is_indirect_function_local_callee(mir_fn: &MirFunction, callee: &str) -> bool {
         mir_fn.locals.iter().any(|l| {
             l.name.as_deref() == Some(callee)
@@ -4205,7 +4216,7 @@ impl VM {
     /// Registers synthetic 3-slot (or max observed slot count) scalar `__Enum_*` layouts
     /// into `self.struct_metadata` on demand whenever a registered MIR function references
     /// an unregistered synthetic scalar enum (`W16-JIT-ENUM`).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn ensure_synthetic_enum_struct_metadata(&mut self) {
         use crate::ast::{Span, Type};
         use crate::bytecode::value::FieldStorage;
@@ -4289,7 +4300,7 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn with_dispatch_side_cache<R>(&self, f: impl FnOnce(&mut CraneliftDispatchSideCache) -> R) -> R {
         let vm_id = self.id;
         let cur_cl_gen = self.cranelift_generation;
@@ -4340,7 +4351,7 @@ impl VM {
         })
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn invalidate_cranelift_dispatch_side_cache(&self) {
         let vm_id = self.id;
         CRANELIFT_DISPATCH_SIDE_CACHES.with(|map_cell| {
@@ -4356,7 +4367,7 @@ impl VM {
         });
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     #[inline]
     fn is_cranelift_negative_probed(&self, func_idx: usize) -> bool {
         if self.cranelift_fn_cache.is_empty() {
@@ -4367,7 +4378,7 @@ impl VM {
         })
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     #[inline]
     fn mark_cranelift_negative_probed(&self, func_idx: usize) {
         self.with_dispatch_side_cache(|cache| {
@@ -4377,7 +4388,7 @@ impl VM {
         });
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     #[inline]
     fn is_trivial_leaf_method_for_vm_subframe_cached(&self, func_idx: usize) -> bool {
         if let Some(cached) = self.with_dispatch_side_cache(|cache| {
@@ -4400,7 +4411,7 @@ impl VM {
 
     /// Read-only inspection helper returning the number of times
     /// `resolve_cranelift_fn_entry_slow` was entered on this VM (`NG-W16-6`).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_slow_resolve_count(&self) -> u64 {
         let vm_id = self.id;
         CRANELIFT_DISPATCH_SIDE_CACHES.with(|map_cell| {
@@ -4412,14 +4423,14 @@ impl VM {
     }
 
     /// Read-only inspection helper returning `self.cranelift_fn_cache.len()` (`NG-W16-6`).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_fn_cache_len(&self) -> usize {
         self.cranelift_fn_cache.len()
     }
 
     /// Read-only inspection helper returning the number of instruction scans performed by
     /// `is_trivial_leaf_method_for_vm_subframe` on this VM (`NG-W16-6`).
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_trivial_leaf_scan_count(&self) -> u64 {
         let vm_id = self.id;
         CRANELIFT_DISPATCH_SIDE_CACHES.with(|map_cell| {
@@ -4433,7 +4444,7 @@ impl VM {
     /// Zero-allocation fast check for `'frame_fast` in-loop call guards (`NG-W16-4` / `NG-W16-6`):
     /// returns `true` only if `func_idx` either has a valid compiled Cranelift native entry
     /// (excluding trivial leaf methods) or is an unprobed eligible candidate awaiting compilation.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn has_compiled_cranelift_entry_fast(&mut self, func_idx: usize) -> bool {
@@ -4477,7 +4488,7 @@ impl VM {
         !self.is_trivial_leaf_method_for_vm_subframe_cached(func_idx)
     }
 
-    #[cfg(not(feature = "std"))]
+    #[cfg(not(feature = "cranelift"))]
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn has_compiled_cranelift_entry_fast(&mut self, _func_idx: usize) -> bool {
@@ -4485,26 +4496,26 @@ impl VM {
     }
 
     /// Read-only inspection helper returning the total Cranelift native entry count.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_entry_count(&self) -> u64 {
         self.cranelift_entry_count
     }
 
     /// Read-only inspection helper returning the number of borrowed read-only flat-array cache hits.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_array_cache_hits(&self) -> u64 {
         self.cranelift_array_cache_hits
     }
 
     /// Read-only inspection helper returning the number of borrowed read-only flat-array cache builds.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_array_cache_builds(&self) -> u64 {
         self.cranelift_array_cache_builds
     }
 
     /// Read-only inspection helper returning the cached `local_types.len()` for a compiled
     /// Cranelift function.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_compiled_local_count(&self, func_name: &str) -> Option<usize> {
         let func_idx = self.functions.iter().position(|f| f.name == func_name)?;
         self.cranelift_fn_cache
@@ -4517,7 +4528,7 @@ impl VM {
     /// `(block_id, site_kind, precise_pc)` for `func_name`.
     /// When recipes are lazily deferred (`NG-W14-7`), derives the sites read-only from the stored
     /// post-inline MIR snapshot without mutating VM state.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn cranelift_deopt_recipe_sites(&self, func_name: &str) -> Vec<(usize, DeoptSiteKind, usize)> {
         let mut sites: Vec<(usize, DeoptSiteKind, usize)> = self
             .cranelift_recipes
@@ -4584,12 +4595,12 @@ impl VM {
     }
 
     /// Compiles all uncompiled reachable eligible registered MIR functions using CraneliftJitCompiler.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn compile_cranelift(&mut self) -> Result<()> {
         self.compile_cranelift_internal(None)
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn compile_cranelift_internal(&mut self, requested_root: Option<&str>) -> Result<()> {
         let _guard = self.mir_context.enter();
         self.ensure_synthetic_enum_struct_metadata();
@@ -4860,14 +4871,14 @@ impl VM {
         Ok(())
     }
 
-    #[cfg(not(feature = "std"))]
+    #[cfg(not(feature = "cranelift"))]
     pub fn compile_cranelift(&mut self) -> Result<()> {
         Ok(())
     }
 
     /// Sub-frame guard (`NG-W15-7`): detects trivial loop-free leaf methods whose VM<->Cranelift
     /// struct-marshaling cost far exceeds running the few bytecode instructions in `'frame_fast`.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     #[inline]
     fn is_trivial_leaf_method_for_vm_subframe(func: &crate::bytecode::Function) -> bool {
         use crate::bytecode::Instruction;
@@ -4895,7 +4906,7 @@ impl VM {
     }
 
     /// Attempts to execute the top call frame natively using Cranelift JIT.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub(crate) fn try_run_cranelift_top_frame(&mut self) -> Result<Option<Option<Value>>> {
         let (func_idx, param_count, has_upvalues) = match self.call_stack.last() {
             Some(f) => {
@@ -5035,7 +5046,7 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn resolve_cranelift_fn_entry_slow(
         &mut self,
         func_idx: usize,
@@ -5146,7 +5157,7 @@ impl VM {
         Ok(entry)
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     #[allow(clippy::too_many_arguments)]
     fn marshal_struct_recursive(
         &self,
@@ -5315,7 +5326,7 @@ impl VM {
         Ok(Some(ptr))
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn collect_readonly_borrowable_array_rcs(
         &self,
         param_types: &[MirType],
@@ -5366,7 +5377,7 @@ impl VM {
         (rcs, index_by_ptr)
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     #[allow(clippy::too_many_arguments)]
     fn try_run_cranelift_top_frame_scoped(
         &mut self,
@@ -5864,7 +5875,7 @@ impl VM {
         )
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn invoke_cranelift_raw_code_ptr(
         code_ptr: *const u8,
         raw_args: &[RawArg],
@@ -6122,7 +6133,16 @@ impl VM {
 
     /// Direct 5- and 6-argument scalar C-ABI fast path into Cranelift JIT without allocating a VM
     /// `CallFrame` (`NG-W15-7`, `BENCH-NG-15`), preserving `SEC-01` gas enforcement.
-    #[cfg(feature = "std")]
+    #[cfg(not(feature = "cranelift"))]
+    pub(crate) fn try_call_cranelift_scalar_direct_5_6(
+        &mut self,
+        _func_idx: usize,
+        _args: &[Value],
+    ) -> Option<Result<Value>> {
+        None
+    }
+
+    #[cfg(feature = "cranelift")]
     pub(crate) fn try_call_cranelift_scalar_direct_5_6(
         &mut self,
         func_idx: usize,
@@ -6304,7 +6324,7 @@ impl VM {
         }
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     #[allow(clippy::too_many_arguments)]
     fn finish_cranelift_top_frame_scoped(
         &mut self,
@@ -6654,12 +6674,12 @@ impl VM {
         Ok(CraneliftOutcome::Return(result_val))
     }
 
-    #[cfg(not(feature = "std"))]
+    #[cfg(not(feature = "cranelift"))]
     pub(crate) fn try_run_cranelift_top_frame(&mut self) -> Result<Option<Option<Value>>> {
         Ok(None)
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     #[allow(clippy::too_many_arguments)]
     fn restore_deopt_top_frame(
         &mut self,
@@ -7344,7 +7364,7 @@ impl VM {
     /// Test helper under `--features test-deopt` that exercises `restore_deopt_top_frame`
     /// end-to-end for handle-backed `MirType::Function`, `MirType::Unknown`, and `LuaValue`
     /// deopt slots, returning `(restored_ip, restored_regs)` while restoring the VM call stack.
-    #[cfg(all(feature = "std", feature = "test-deopt"))]
+    #[cfg(all(feature = "cranelift", feature = "test-deopt"))]
     #[allow(clippy::too_many_arguments)]
     pub fn test_restore_deopt_top_frame_for_handles(
         &mut self,
@@ -7410,7 +7430,7 @@ impl VM {
     }
 
     /// Executes the active call frame using the native Cranelift JIT compiler backend.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     pub fn run_cranelift(&mut self) -> Result<Value> {
         if let Some(finished) = self.try_run_cranelift_top_frame()? {
             if let Some(val) = finished {
@@ -7435,13 +7455,13 @@ impl VM {
     }
 
     /// In no_std mode, fall back to interpreter dispatch.
-    #[cfg(not(feature = "std"))]
+    #[cfg(not(feature = "cranelift"))]
     pub fn run_cranelift(&mut self) -> Result<Value> {
         self.run_inner::<false>()
     }
 }
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(all(test, feature = "cranelift"))]
 mod eligibility_walker_tests {
     use super::*;
     use crate::ast::{Span, Type, TypeKind};

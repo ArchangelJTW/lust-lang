@@ -240,17 +240,17 @@ impl VM {
             cranelift_compiled_generation: 0,
             mir_context_struct_gen: 0,
             cranelift_compiled_struct_gen: 0,
-            #[cfg(feature = "std")]
+            #[cfg(feature = "cranelift")]
             cranelift_jit: None,
-            #[cfg(feature = "std")]
+            #[cfg(feature = "cranelift")]
             cranelift_recipes: HashMap::new(),
-            #[cfg(feature = "std")]
+            #[cfg(feature = "cranelift")]
             cranelift_fn_cache: Vec::new(),
-            #[cfg(feature = "std")]
+            #[cfg(feature = "cranelift")]
             osr_engine: None,
-            #[cfg(feature = "std")]
+            #[cfg(feature = "cranelift")]
             osr_backedge_counts: HashMap::new(),
-            #[cfg(feature = "std")]
+            #[cfg(feature = "cranelift")]
             osr_cold_sites: hashbrown::HashSet::new(),
             osr_compilation_count: 0,
             osr_last_cranelift_gen: 0,
@@ -259,6 +259,8 @@ impl VM {
             cranelift_compiled: HashMap::new(),
             jit: JitState::new(),
             budgets: BudgetState::default(),
+            #[cfg(feature = "std")]
+            random_rng: core::cell::RefCell::new(None),
             functions: Vec::new(),
             call_meta: Vec::new(),
             ast_bytecode_backup: HashMap::new(),
@@ -444,6 +446,7 @@ impl VM {
         {
             use rand::SeedableRng;
             *self.rng.borrow_mut() = Box::new(rand::rngs::StdRng::seed_from_u64(seed));
+            *self.random_rng.borrow_mut() = Some(super::rng::PortableRng::from_seed(seed));
         }
         #[cfg(not(feature = "std"))]
         {
@@ -631,7 +634,7 @@ impl VM {
         self.functions = functions;
         self.method_cache.clear();
         self.ast_bytecode_backup.clear();
-        #[cfg(feature = "std")]
+        #[cfg(feature = "cranelift")]
         {
             self.cranelift_fn_cache.clear();
         }
@@ -687,7 +690,7 @@ impl VM {
                 );
             }
         }
-        #[cfg(feature = "std")]
+        #[cfg(feature = "cranelift")]
         if !defs.is_empty()
             && self.cranelift_compiled_struct_gen != self.struct_metadata.generation()
             && (!self.cranelift_compiled.is_empty()
@@ -1356,7 +1359,7 @@ impl VM {
 
     #[inline]
     pub(crate) fn has_native_entry(&self, func_idx: usize) -> bool {
-        #[cfg(feature = "std")]
+        #[cfg(feature = "cranelift")]
         {
             if self.backend == VmBackend::Cranelift
                 && (self.slow_path_flags & !crate::vm::SLOW_PATH_GAS_LIMIT) == 0
@@ -1418,12 +1421,12 @@ impl VM {
         func_idx: usize,
         args: &[Value],
     ) -> Option<Result<Value>> {
-        #[cfg(not(feature = "std"))]
+        #[cfg(not(feature = "cranelift"))]
         {
             let _ = (func_idx, args);
             None
         }
-        #[cfg(feature = "std")]
+        #[cfg(feature = "cranelift")]
         {
             use crate::mir::cranelift_backend::{
                 MIR_STATUS_ERR_DIV_BY_ZERO, MIR_STATUS_ERR_NEG_EXPONENT, MIR_STATUS_ERR_OOM,

@@ -8,6 +8,7 @@ pub mod host_call;
 pub mod invariants;
 pub mod replay;
 pub mod scheduler;
+#[cfg(feature = "cranelift")]
 pub mod tier2;
 
 pub use clock::{
@@ -30,6 +31,7 @@ pub use replay::{
     ReplayManifest, ReplayResult, Shrinker, ShrunkReplay,
 };
 pub use scheduler::PreemptiveExplorationScheduler;
+#[cfg(feature = "cranelift")]
 pub use tier2::{
     Tier2InterruptSchedule, Tier2ReplayEngine, Tier2SafepointController, Tier2SimAction,
     Tier2SimSession,

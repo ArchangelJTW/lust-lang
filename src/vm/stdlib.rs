@@ -7,8 +7,6 @@ use crate::bytecode::{NativeCallResult, Value, native_fn};
 use crate::config::LustConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::lua_compat::register_lust_function;
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng, make_rng};
 use regex::Regex;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -351,11 +349,7 @@ fn create_type_fn() -> Value {
             Value::Iterator(_) => "iterator",
             Value::Task(_) => "task",
         };
-        Ok(NativeCallResult::Return(Value::enum_variant(
-            "LuaValue",
-            "String",
-            vec![Value::string(type_name)],
-        )))
+        Ok(NativeCallResult::Return(Value::string(type_name)))
     }))
 }
 
@@ -4388,26 +4382,9 @@ fn create_math_random_fn() -> Value {
             .get(1)
             .map(|v| unwrap_lua_value(v.clone()))
             .filter(|v| !matches!(v, Value::Nil));
-        let value = with_rng_mut(|rng| match (lower.as_ref(), upper.as_ref()) {
-            (None, _) => Value::Float(rng.random::<f64>()),
-            (Some(max), None) => {
-                let hi = coerce_int(max).unwrap_or(1);
-                let upper_bound = if hi < 1 { 1 } else { hi };
-                Value::Int(rng.random_range(1..=upper_bound))
-            }
-            (Some(min), Some(max)) => {
-                let lo = coerce_int(min).unwrap_or(1);
-                let hi = coerce_int(max).unwrap_or(lo);
-                let (start, end) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-                Value::Int(rng.random_range(start..=end))
-            }
-        })?;
+        let value = VM::with_current(|vm| vm.random_value(lower.as_ref(), upper.as_ref()))?;
         Ok(NativeCallResult::Return(value))
     }))
-}
-
-thread_local! {
-    static FALLBACK_RNG: std::cell::RefCell<StdRng> = std::cell::RefCell::new(make_rng());
 }
 
 fn create_math_randomseed_fn() -> Value {
@@ -4417,14 +4394,10 @@ fn create_math_randomseed_fn() -> Value {
             .map(|v| unwrap_lua_value(v.clone()))
             .unwrap_or(Value::Int(0));
         let seed = coerce_int(&seed_val).unwrap_or(0) as u64;
-        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
-            let vm = unsafe { &*vm_ptr };
-            vm.set_seed(seed);
-        } else {
-            FALLBACK_RNG.with(|rng| {
-                *rng.borrow_mut() = StdRng::seed_from_u64(seed);
-            });
-        }
+        VM::with_current(|vm| {
+            vm.set_random_seed(seed);
+            Ok(())
+        })?;
         Ok(NativeCallResult::Return(Value::Nil))
     }))
 }
@@ -4435,19 +4408,6 @@ fn coerce_int(value: &Value) -> Option<LustInt> {
         Value::Float(f) => Some(*f as LustInt),
         Value::Bool(b) => Some(if *b { 1 } else { 0 }),
         _ => None,
-    }
-}
-
-fn with_rng_mut<F, R>(f: F) -> Result<R, String>
-where
-    F: FnOnce(&mut dyn rand::Rng) -> R,
-{
-    if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
-        let vm = unsafe { &*vm_ptr };
-        let mut rng = vm.rng.borrow_mut();
-        Ok(f(&mut **rng))
-    } else {
-        FALLBACK_RNG.with(|rng| Ok(f(&mut *rng.borrow_mut())))
     }
 }
 

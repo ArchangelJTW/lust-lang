@@ -4,8 +4,10 @@ pub mod opt;
 pub mod verifier;
 pub mod vm_backend;
 #[cfg(feature = "std")]
-pub mod c_header_gen;
+pub mod c_backend;
 #[cfg(feature = "std")]
+pub mod c_header_gen;
+#[cfg(feature = "cranelift")]
 pub mod cranelift_backend;
 #[cfg(feature = "std")]
 pub mod runtime_helpers;
@@ -18,8 +20,10 @@ pub use opt::*;
 pub use verifier::*;
 pub use vm_backend::*;
 #[cfg(feature = "std")]
-pub use c_header_gen::*;
+pub use c_backend::*;
 #[cfg(feature = "std")]
+pub use c_header_gen::*;
+#[cfg(feature = "cranelift")]
 pub use cranelift_backend::*;
 #[cfg(feature = "std")]
 pub use runtime_helpers::*;
@@ -250,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn test_mir_to_cranelift_jit_execution() {
         use crate::ast::ItemKind;
         use crate::intern::Interner;
@@ -350,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn test_gate2_for_numeric_break_continue_parity_across_all_backends() {
         use crate::ast::ItemKind;
         use crate::bytecode::Value;
@@ -423,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn test_gate2_constant_folding_dce_and_execution() {
         use crate::ast::ItemKind;
         use crate::bytecode::Value;
@@ -499,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn test_gate2_short_circuit_protection_across_all_backends() {
         use crate::ast::ItemKind;
         use crate::bytecode::Value;
@@ -577,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn test_gate3_arrays_and_aggregates_parity_across_all_backends() {
         use crate::ast::ItemKind;
         use crate::bytecode::Value;
@@ -647,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn test_gate4_gas_resource_limits_parity_across_all_backends() {
         use crate::ast::ItemKind;
         use crate::bytecode::Value;
@@ -869,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn test_unsupported_mir_binop_returns_error_in_cranelift_backend() {
         use crate::mir::cranelift_backend::jit_engine::CraneliftJitCompiler;
 
@@ -945,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn test_sprint1b_mir_math_and_bitwise_parity_clif_and_zig() {
         use crate::ast::ItemKind;
         use crate::intern::Interner;
@@ -1231,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn test_unsupported_mir_constant_returns_error_in_zig_and_cranelift_backends() {
         use crate::mir::cranelift_backend::jit_engine::CraneliftJitCompiler;
         use crate::mir::zig_backend::zig_engine::MirToZigCompiler;
@@ -1291,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn test_mir_for_in_array_and_ipairs_parity() {
         use crate::ast::ItemKind;
         use crate::bytecode::Value;
@@ -1363,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn test_mir_struct_and_tuple_field_access_and_mutation_parity() {
         use crate::ast::ItemKind;
         use crate::bytecode::Value;
@@ -1430,7 +1434,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn test_mir_switch_terminator_and_try_operator_parity() {
         use crate::ast::ItemKind;
         use crate::bytecode::Value;
@@ -1562,7 +1566,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "cranelift")]
     fn test_mir_multi_function_call_and_recursion_parity() {
         use crate::ast::ItemKind;
         use crate::bytecode::Value;
